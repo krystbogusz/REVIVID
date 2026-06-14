@@ -96,7 +96,6 @@ class ConditioningBackbone(nn.Module):
         embed_dim: int = 64,
         d_state: int = 16,
         ssm_expand: int = 2,
-        finetune_flow: bool = False,
         sr_scale: int = 1,
     ):
         super().__init__()
@@ -104,7 +103,7 @@ class ConditioningBackbone(nn.Module):
         self.cond_dim = cond_dim
         self.sr_scale = sr_scale
 
-        self.flow_net = build_flow_estimator(finetune=finetune_flow)
+        self.flow_net = build_flow_estimator()
 
         self.backward_agg = GatedAggregation(num_feat)
         self.forward_agg = GatedAggregation(num_feat)

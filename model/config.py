@@ -20,7 +20,6 @@ class ModelConfig:
     cond_dim: int = 64
     d_state: int = 16
     ssm_expand: int = 2
-    finetune_flow: bool = False
     sr_scale: int = 1
 
     # Diffusion U-Net (single unified denoiser)

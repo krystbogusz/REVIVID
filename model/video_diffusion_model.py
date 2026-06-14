@@ -67,7 +67,6 @@ class Video_Backbone(nn.Module):
             embed_dim=config.embed_dim,
             d_state=config.d_state,
             ssm_expand=config.ssm_expand,
-            finetune_flow=config.finetune_flow,
             sr_scale=config.sr_scale,
         )
 

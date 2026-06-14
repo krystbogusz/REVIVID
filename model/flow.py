@@ -1,9 +1,8 @@
 """Optical-flow estimation and warping.
 
 REVIVID uses a single, real optical-flow estimator: torchvision's RAFT
-(``raft_small``) with pretrained weights. The estimator is frozen by default
-(``finetune_flow: false``) and run under ``no_grad`` for speed / memory, mirroring
-how the reference MambaOFR keeps its flow network fixed.
+(``raft_small``) with pretrained weights. The estimator is always frozen
+and run under ``no_grad`` for speed and memory efficiency.
 """
 
 from __future__ import annotations
@@ -38,23 +37,25 @@ def flow_warp(
 
 
 class RAFTFlow(nn.Module):
-    """torchvision RAFT wrapper returning flow_{a->b} as (n, 2, h, w)."""
+    """torchvision RAFT wrapper returning flow_{a->b} as (n, 2, h, w).
 
-    def __init__(self, finetune: bool = False):
+    Always frozen — weights are never updated during training.
+    """
+
+    def __init__(self):
         super().__init__()
         from torchvision.models.optical_flow import raft_small
 
         try:
             from torchvision.models.optical_flow import Raft_Small_Weights
-
             self.raft = raft_small(weights=Raft_Small_Weights.DEFAULT)
         except Exception:  # offline: build with random weights
             self.raft = raft_small(weights=None)
 
-        self.finetune = finetune
-        if not finetune:
-            for p in self.raft.parameters():
-                p.requires_grad_(False)
+        # Freeze all RAFT parameters — never fine-tuned.
+        for p in self.raft.parameters():
+            p.requires_grad_(False)
+        self.eval()
 
     # RAFT downsamples by 8 and the correlation pyramid needs feature maps >= 16,
     # so inputs must be at least 128 px and a multiple of 8 on each side.
@@ -62,7 +63,6 @@ class RAFTFlow(nn.Module):
 
     def _work_size(self, h: int, w: int):
         import math
-
         H = max(self._MIN_SIZE, math.ceil(h / 8) * 8)
         W = max(self._MIN_SIZE, math.ceil(w / 8) * 8)
         return H, W
@@ -75,8 +75,7 @@ class RAFTFlow(nn.Module):
             a = F.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
-        ctx = torch.enable_grad() if (self.finetune and self.training) else torch.no_grad()
-        with ctx:
+        with torch.no_grad():
             flow = self.raft(a.contiguous(), b.contiguous())[-1]  # (n, 2, H, W)
 
         if (H, W) != (h, w):
@@ -87,5 +86,5 @@ class RAFTFlow(nn.Module):
         return flow
 
 
-def build_flow_estimator(finetune: bool = False) -> nn.Module:
-    return RAFTFlow(finetune=finetune)
+def build_flow_estimator() -> nn.Module:
+    return RAFTFlow()

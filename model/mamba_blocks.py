@@ -56,7 +56,7 @@ class SS2D(nn.Module):
         self.A_logs = nn.Parameter(torch.log(A).unsqueeze(0).repeat(self.K, 1, 1).contiguous())
         self.Ds = nn.Parameter(torch.ones(self.K, self.d_inner))
 
-        self.out_norm = nn.LayerNorm(self.d_inner)
+        self.out_norm = nn.LayerNorm(self.d_inner, eps=1e-4)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     def _scan_sequences(self, x: torch.Tensor) -> torch.Tensor:
@@ -88,7 +88,11 @@ class SS2D(nn.Module):
             dt = self.dt_proj[k](dt).transpose(1, 2).contiguous()  # (b, d_inner, l)
             Bk = Bk.transpose(1, 2).contiguous()  # (b, N, l)
             Ck = Ck.transpose(1, 2).contiguous()  # (b, N, l)
-            A = -torch.exp(self.A_logs[k].float())  # (d_inner, N)
+            # Clamp A_logs before exp() — without this, A_logs can grow unboundedly
+            # over 70k+ iters causing exp(large) = Inf in the selective_scan kernel.
+            # exp(8) ≈ 2981 is already extreme SSM decay (state vanishes in one step),
+            # so clamping at 8.0 is safe and has no effect on a well-trained model.
+            A = -torch.exp(self.A_logs[k].float().clamp(max=8.0))  # (d_inner, N)
             y = _selective_scan(
                 u, dt, A, Bk, Ck, self.Ds[k].float(), self.dt_proj[k].bias.float()
             )  # (b, d_inner, l)
@@ -111,9 +115,9 @@ class SSBlock(nn.Module):
 
     def __init__(self, dim: int, d_state: int = 16, expand: int = 2, mlp_ratio: float = 2.0):
         super().__init__()
-        self.norm1 = nn.GroupNorm(min(8, dim), dim)
+        self.norm1 = nn.GroupNorm(min(8, dim), dim, eps=1e-4)
         self.ss2d = SS2D(dim, d_state=d_state, expand=expand)
-        self.norm2 = nn.GroupNorm(min(8, dim), dim)
+        self.norm2 = nn.GroupNorm(min(8, dim), dim, eps=1e-4)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Conv2d(dim, hidden, 1), nn.GELU(), nn.Conv2d(hidden, dim, 1)

@@ -77,18 +77,7 @@ class Trainer:
         self.best_epoch = 0
 
     def _param_groups(self, lr: float):
-        if not self.model_cfg.finetune_flow:
-            return [p for p in self.net.parameters() if p.requires_grad]
-        flow_mul = float(self.train_cfg.get("flow_lr_mul", 0.125))
-        flow_params, other_params = [], []
-        for name, p in self.net.named_parameters():
-            if not p.requires_grad:
-                continue
-            (flow_params if "flow_net" in name else other_params).append(p)
-        return [
-            {"params": other_params, "lr": lr},
-            {"params": flow_params, "lr": lr * flow_mul},
-        ]
+        return [p for p in self.net.parameters() if p.requires_grad]
 
     # ------------------------------------------------------------------ #
     def _coarse_perceptual(self, coarse: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
@@ -103,9 +92,23 @@ class Trainer:
         frame_mask = frame_mask.to(self.device, non_blocking=True) if frame_mask is not None else None
         w = self.weights
 
+        # --- Guard: skip batches with corrupt input data ---
+        if not (torch.isfinite(lq).all() and torch.isfinite(gt).all()):
+            print(f"[iter {self.iteration}] SKIPPED: NaN/Inf in input batch (lq={lq.isnan().any()}, gt={gt.isnan().any()})")
+            self.iteration += 1
+            return {"loss_total": float("nan"), "skipped": 1.0}
+
+        # --- Guard: reset AMP scaler if it has collapsed to near-zero ---
+        # A scale < 1.0 means backward gradients are SMALLER than original — AMP is
+        # working against us. Reset to a safe starting value so training can continue.
+        if self.use_amp and self.scaler.get_scale() < 1.0:
+            self.scaler._scale.fill_(128.0)  # noqa: SLF001
+            print(f"[iter {self.iteration}] AMP scaler reset to 128.0 (was stuck at ~{self.scaler.get_scale():.2e})")
+
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             losses = self.net.compute_losses(lq, gt, frame_mask)
             coarse = losses["coarse"]
+
 
             loss_pix = charbonnier_loss(coarse, gt)
             total = w["pix"] * loss_pix + w["detect"] * losses["detect"] + w["v"] * losses["v"]
@@ -126,19 +129,29 @@ class Trainer:
         self.scaler.unscale_(self.optimizer_g)
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=self.grad_clip)
+        scale_before = self.scaler.get_scale()
         self.scaler.step(self.optimizer_g)
         self.scaler.update()
+        scale_after = self.scaler.get_scale()
 
         self.iteration += 1
         log["loss_total"] = float(total.detach())
 
-        # Detect NaN / Inf in loss and warn early
+        # Detailed NaN/Inf diagnostics — prints which component is the culprit
         if not torch.isfinite(total):
-            import warnings
-            warnings.warn(
-                f"[iter {self.iteration}] Non-finite loss detected: "
-                f"{log['loss_total']:.4f}. Check input data or reduce lr.",
-                RuntimeWarning, stacklevel=2,
+            bad = {k: v for k, v in log.items()
+                   if not (isinstance(v, float) and v == v and v < float("inf"))}
+            print(
+                f"\n[WARN iter {self.iteration}] NaN/Inf loss detected! "
+                f"Culprits: {bad} | "
+                f"AMP scale: {scale_before:.3g} -> {scale_after:.3g}"
+            )
+
+        # Log AMP scale drops (overflow in backward pass, step was skipped)
+        elif scale_after < scale_before:
+            print(
+                f"[iter {self.iteration}] AMP scale dropped "
+                f"{scale_before:.3g} -> {scale_after:.3g} (overflow, step skipped)"
             )
 
         return log
