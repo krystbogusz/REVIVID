@@ -1,0 +1,50 @@
+seed: 2026
+model:
+  num_feat: 16
+  num_block: 6
+  embed_dim: 64
+  cond_dim: 64
+  d_state: 16
+  ssm_expand: 2
+  finetune_flow: false
+  sr_scale: 4
+  refiner_base: 64
+  channel_mult:
+  - 1
+  - 2
+  - 4
+  num_res_blocks: 2
+  mask_embed_dim: 16
+  num_timesteps: 1000
+  schedule: cosine
+  refine_steps: 8
+  hole_threshold: 0.5
+  vfi_prob: 0.5
+  vfi_mask_ratio: 0.3
+training:
+  epochs: 2
+  batch_size: 2
+  num_frame: 7
+  patch_size: 256
+  lr: 0.0002
+  flow_lr_mul: 0.125
+  beta1: 0.9
+  beta2: 0.99
+  use_perceptual: true
+  use_amp: true
+  loss_weights:
+    pix: 1.0
+    perceptual: 1.0
+    detect: 0.5
+    v: 1.0
+  num_workers: 4
+  use_flip: true
+  use_rot: true
+validation:
+  val_every: 1
+  max_clips: 10
+  patch_size: 256
+logging:
+  log_every: 50
+  exp_dir: ./experiments/revivid
+  save_checkpoint_every: 50

@@ -1,0 +1,20 @@
+REDS:
+  - "https://huggingface.co/datasets/snah/REDS/resolve/main/train_sharp.zip"
+  - "https://huggingface.co/datasets/snah/REDS/resolve/main/val_sharp.zip"
+
+NOISE_DATA:
+  - "http://iizuka.cs.tsukuba.ac.jp/projects/remastering/data/noise_data.zip"
+
+OLD_FILMS:
+  - "https://dn711202.ca.archive.org/0/items/Imigrant1917Re.CharlieChaplin/Imigrant%20%281917%29%20-%20re%C5%BC.%20Charlie%20Chaplin.mp4"
+  - "https://dn710308.ca.archive.org/0/items/ShortComedyClips_135/LaurelHardy-TheMusicBox.mp4"
+  - "https://www.youtube.com/watch?v=hmzO--ox7X0"
+  - "https://dn710808.ca.archive.org/0/items/the-skeleton-dance_1929/the-skeleton-dance_1929.mp4"
+  - "https://drive.google.com/uc?export=download&id=1Ob7efeBKaVY0cQ79O_dI-BLe4152kDUz"
+
+YOUTUBE_VIDEOS:
+  - "https://www.youtube.com/watch?v=X4EcUcoo0r4"
+  - "https://www.youtube.com/watch?v=oLZrqC1SErA"
+  - "https://www.youtube.com/watch?v=iH4zvG_Xkac"
+  - "https://www.youtube.com/watch?v=vLRK63m0m7Y"
+  - "https://www.youtube.com/watch?v=HPONVxnqhyI"

@@ -1,0 +1,99 @@
+# REVIVID configuration — Unified Masked Frame Prediction model.
+#
+# One diffusion network handles all three tasks simultaneously:
+#   1. Restoration  — remove degradations (scratches, noise, blur, compression)
+#   2. SR           — 2× super-resolution via PixelShuffle in the backbone
+#   3. VFI          — generate masked intermediate frames (temporal inpainting)
+#
+# Persistent spatial holes (baked by DatasetCreator for test clips and a fraction
+# of train clips) are detected on-the-fly from the LQ fill value (-1.0) and fed
+# as an explicit conditioning channel to the single refine UNet.
+#
+# Data locations are fixed by the pipeline and NOT configured here:
+#   sources.yaml → downloader → data/raw/
+#   data/raw/    → dataset_creator → data/training/{train,valid,test}/{degraded,gt}
+
+seed: 2026
+
+# --------------------------------------------------------------------------- #
+# Model architecture
+# --------------------------------------------------------------------------- #
+model:
+  # Recurrent conditioning backbone (MambaOFR-inspired)
+  num_feat: 16            # propagation feature channels
+  num_block: 6            # SSM blocks per propagation branch
+  embed_dim: 64           # internal width of SSM blocks
+  cond_dim: 64            # conditioning features fed to the diffusion head
+  d_state: 16             # SSM state dimension
+  ssm_expand: 2           # SSM inner expansion factor
+  finetune_flow: false    # if true, RAFT is trained jointly
+
+  # Super-resolution upscale factor in the backbone (PixelShuffle)
+  # and LR downscale factor for dataset generation.
+  # Powers of two only: 1 (no SR), 2 (2×), 4 (4×).
+  sr_scale: 4
+
+  # Single unified diffusion UNet (no attn — Mamba backbone provides global context)
+  refiner_base: 64
+  channel_mult: [1, 2, 4]
+  num_res_blocks: 2
+  mask_embed_dim: 16      # dim of temporal frame-mask embedding fed to UNet
+
+  # Diffusion process
+  num_timesteps: 1000
+  schedule: cosine
+  refine_steps: 8         # DDIM steps at inference
+
+  # Spatial hole detection (inference only — training uses on-the-fly threshold)
+  hole_threshold: 0.5
+
+  # VFI — temporal masked frame prediction (on-the-fly in DataLoader)
+  vfi_prob: 0.5           # probability a training clip has ≥1 masked frames
+  vfi_mask_ratio: 0.3     # max fraction of inner frames that may be masked
+
+# --------------------------------------------------------------------------- #
+# Training
+# --------------------------------------------------------------------------- #
+training:
+  epochs: 4000
+  batch_size: 2
+  num_frame: 7
+
+  # Random GT crop for training (LR crop = patch_size / sr_scale).
+  patch_size: 256
+
+  lr: 0.0002
+  flow_lr_mul: 0.125
+  beta1: 0.9
+  beta2: 0.99
+
+  use_perceptual: true
+  use_amp: true
+
+  loss_weights:
+    pix: 1.0
+    perceptual: 1.0
+    detect: 0.5           # BCE on spatial hole_head (lighter weight)
+    v: 1.0                # single v-prediction loss (restoration + VFI + inpainting)
+
+  num_workers: 4
+
+  # On-the-fly degradation (textures cached once per DataLoader worker).
+  # Default directory: data/raw/noise_data
+  use_flip: true
+  use_rot: true
+
+# --------------------------------------------------------------------------- #
+# Validation / logging
+# --------------------------------------------------------------------------- #
+validation:
+  val_every: 1
+  max_clips: 10
+  # HR crop for validation (center crop). 0 = full frames — DDIM at native
+  # REDS resolution (~1280×720) will OOM on most GPUs. Defaults to training patch_size.
+  patch_size: 256
+
+logging:
+  log_every: 50
+  exp_dir: ./experiments/revivid
+  save_checkpoint_every: 50   # numbered + latest checkpoints (not every epoch)
