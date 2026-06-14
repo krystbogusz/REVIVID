@@ -67,7 +67,7 @@ training:
   beta2: 0.99
 
   use_perceptual: true
-  use_amp: true
+  use_amp: false
 
   loss_weights:
     pix: 1.0
