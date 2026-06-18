@@ -3,6 +3,11 @@
 All functions operate on single frames (torch tensors in [0, 1] or [0, 255]
 depending on convention — see each function's docstring). They are called by
 ``pipeline.process_video_frames`` which handles batching and normalisation.
+
+Conventions that match MambaOFR (degradation_video_list_5):
+  - ``random_scaling`` supports bilinear / bicubic / lanczos (OpenCV for lanczos).
+  - ``apply_jpeg_artifact`` receives and returns a **greyscale uint8 ndarray** (H, W),
+    matching MambaOFR's PIL.convert("L") → BytesIO JPEG path.
 """
 
 from __future__ import annotations
@@ -17,9 +22,26 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 
 def random_scaling(img_tensor, target_w, target_h):
-    modes = ['bilinear', 'bicubic']
-    selected_mode = random.choice(modes)
-    return F.interpolate(img_tensor, size=(target_h, target_w), mode=selected_mode, align_corners=False)
+    """Resize a (1, C, H, W) tensor to (target_h, target_w).
+
+    Randomly selects bilinear, bicubic, or lanczos — matching MambaOFR's
+    random_scaling which draws from the same three methods.
+    Lanczos is not natively supported by torch.nn.functional.interpolate, so
+    we drop to OpenCV for that mode and convert back to tensor.
+    """
+    mode_choice = random.randint(0, 2)  # 0=bilinear, 1=bicubic, 2=lanczos
+    if mode_choice == 2:  # lanczos — use OpenCV
+        import numpy as np
+        # img_tensor shape: (1, C, H, W), values in [0, 1]
+        arr = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, C)
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        resized = cv2.resize(arr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        if resized.ndim == 2:  # greyscale edge case
+            resized = resized[:, :, None]
+        resized_tensor = torch.from_numpy(resized).float().to(img_tensor.device) / 255.0
+        return resized_tensor.permute(2, 0, 1).unsqueeze(0)
+    torch_mode = 'bilinear' if mode_choice == 0 else 'bicubic'
+    return F.interpolate(img_tensor, size=(target_h, target_w), mode=torch_mode, align_corners=False)
 
 def apply_downsampling(img_tensor, params):
     _, _, img_h, img_w = img_tensor.shape
@@ -39,15 +61,27 @@ def apply_downsampling(img_tensor, params):
         return random_scaling(img_tensor, new_w, new_h)
     return img_tensor
 
-def apply_jpeg_artifact(img, quality):
+def apply_jpeg_artifact(img_gray: np.ndarray, quality: int) -> np.ndarray:
+    """Apply JPEG compression artefacts to a **greyscale uint8** frame (H, W).
+
+    Matches MambaOFR's ``jpeg_artifact_v2`` which encodes a PIL grayscale image
+    via BytesIO and decodes back — both paths yield equivalent blocking/ringing
+    artefacts on a single-channel signal.
+
+    Args:
+        img_gray: uint8 ndarray of shape (H, W) — greyscale frame.
+        quality:  base JPEG quality [40, 100].
+
+    Returns:
+        uint8 ndarray (H, W) after JPEG encode/decode.
+    """
     quality_variance = random.randint(-15, 15)
     new_quality = int(np.clip(quality + quality_variance, 40, 100))
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), new_quality]
-    success, encoded_img = cv2.imencode('.jpg', img, encode_param)
-
+    success, encoded_img = cv2.imencode('.jpg', img_gray, encode_param)
     if success:
-        return cv2.imdecode(encoded_img, cv2.IMREAD_UNCHANGED)
-    return img
+        return cv2.imdecode(encoded_img, cv2.IMREAD_GRAYSCALE)
+    return img_gray
 
 def gm_blur_kernel(mean, cov, size=15):
     center = size / 2.0 + 0.5

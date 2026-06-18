@@ -26,7 +26,15 @@ from tqdm import tqdm
 
 from dataset.dataset_loader import warmup_dataloader
 from evaluator.metrics import evaluate_clip
-from model import ModelConfig, Video_Backbone, VGGPerceptualLoss, charbonnier_loss
+from model import ModelConfig, Video_Backbone
+from model.losses import (
+    CharbonnierLoss,
+    DiffusionLoss,
+    FocalFrequencyLoss,
+    HoleDetectionLoss,
+    MaskedReconstructionLoss,
+    VGGPerceptualLoss,
+)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
@@ -58,12 +66,17 @@ class Trainer:
         self.model_cfg = ModelConfig.from_dict(cfg.get("model", {}))
         self.net = Video_Backbone(self.model_cfg).to(self.device)
 
-        default_w = {"pix": 1.0, "perceptual": 1.0, "detect": 0.5, "v": 1.0}
+        default_w = {"pix": 1.0, "perceptual": 1.0, "detect": 0.5, "v": 1.0, "fft": 0.1, "vfi": 10.0}
         default_w.update(self.train_cfg.get("loss_weights", {}) or {})
         self.weights = default_w
 
+        self.loss_pix = CharbonnierLoss().to(self.device)
         self.use_perceptual = bool(self.train_cfg.get("use_perceptual", True))
-        self.perceptual = VGGPerceptualLoss().to(self.device) if self.use_perceptual else None
+        self.loss_perceptual = VGGPerceptualLoss().to(self.device) if self.use_perceptual else None
+        self.loss_detect = HoleDetectionLoss().to(self.device)
+        self.loss_diffusion = DiffusionLoss().to(self.device)
+        self.loss_fft = FocalFrequencyLoss().to(self.device)
+        self.loss_vfi = MaskedReconstructionLoss().to(self.device)
 
         lr = float(self.train_cfg.get("lr", 2e-4))
         betas = (float(self.train_cfg.get("beta1", 0.9)), float(self.train_cfg.get("beta2", 0.99)))
@@ -82,7 +95,7 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def _coarse_perceptual(self, coarse: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         n, t, c, h, w = coarse.shape
-        return self.perceptual(coarse.reshape(-1, c, h, w), gt.reshape(-1, c, h, w))
+        return self.loss_perceptual(coarse.reshape(-1, c, h, w), gt.reshape(-1, c, h, w))
 
     def train_step(self, batch) -> dict:
         self.net.train()
@@ -106,17 +119,36 @@ class Trainer:
             print(f"[iter {self.iteration}] AMP scaler reset to 128.0 (was stuck at ~{self.scaler.get_scale():.2e})")
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            losses = self.net.compute_losses(lq, gt, frame_mask)
-            coarse = losses["coarse"]
+            out = self.net(lq, frame_mask)
+            
+            coarse = out["coarse"]
+            coarse_f = out["coarse_f"]
+            
+            # target for diffusion
+            n_b, t_b, c_b, h_b, w_b = gt.shape
+            gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
+            residual_target = (gt_f - coarse_f).detach()
 
+            loss_pix = self.loss_pix(coarse, gt)
+            loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
+            loss_v = self.loss_diffusion(self.net.diffusion, self.net.refine_unet, residual_target, out["refine_cond"])
+            loss_fft = self.loss_fft(coarse, gt)
+            loss_vfi = self.loss_vfi(coarse, gt, frame_mask)
 
-            loss_pix = charbonnier_loss(coarse, gt)
-            total = w["pix"] * loss_pix + w["detect"] * losses["detect"] + w["v"] * losses["v"]
+            total = (
+                w["pix"] * loss_pix
+                + w["detect"] * loss_detect
+                + w["v"] * loss_v
+                + w["fft"] * loss_fft
+                + w["vfi"] * loss_vfi
+            )
 
             log = {
                 "loss_pix": float(loss_pix.detach()),
-                "loss_detect": float(losses["detect"].detach()),
-                "loss_v": float(losses["v"].detach()),
+                "loss_detect": float(loss_detect.detach()),
+                "loss_v": float(loss_v.detach()),
+                "loss_fft": float(loss_fft.detach()),
+                "loss_vfi": float(loss_vfi.detach()),
             }
 
             if self.use_perceptual:
@@ -158,27 +190,46 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def validate(self, val_loader, max_clips: Optional[int] = None) -> dict:
-        max_clips = max_clips if max_clips is not None else int(self.val_cfg.get("max_clips", 10))
+    def validate(self, val_loader) -> dict:
+        """Run validation on the full validation set (MambaOFR style windowing)."""
         self.net.eval()
         if self.device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
-        for i, batch in enumerate(val_loader):
-            if i >= max_clips:
-                break
-            lq = batch["lq"].to(self.device, non_blocking=True)
-            gt = batch["gt"].to(self.device, non_blocking=True)
-            with torch.amp.autocast("cuda", enabled=self.use_amp):
-                out = self.net.restore(lq)
-            m = evaluate_clip(out[0].float(), gt[0].float())
+        window_size = int(self.train_cfg.get("num_frame", 7))
+        
+        for batch in val_loader:
+            lq = batch["lq"]
+            gt = batch["gt"]
+            
+            all_len = lq.shape[1]
+            all_output = []
+            
+            # Slide window without overlap (MambaOFR style)
+            for i in range(0, all_len, window_size):
+                end = min(i + window_size, all_len)
+                part_lq = lq[:, i:end].to(self.device, non_blocking=True)
+                
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    part_out = self.net.restore(part_lq)
+                    
+                all_output.append(part_out.detach().cpu())
+                del part_lq, part_out
+            
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+                
+            full_out = torch.cat(all_output, dim=1)
+            
+            m = evaluate_clip(full_out[0].float(), gt[0].float())
             psnr_sum += m["psnr"] if m["psnr"] != float("inf") else 0.0
             ssim_sum += m["ssim"]
             count += 1
-            del lq, gt, out
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+            
+            del lq, gt, full_out, all_output
+            
         count = max(count, 1)
         return {"psnr": psnr_sum / count, "ssim": ssim_sum / count}
 
@@ -187,8 +238,12 @@ class Trainer:
         """Save LQ / restored / GT frames from the first validation clip."""
         self.net.eval()
         batch = next(iter(val_loader))
-        lq = batch["lq"].to(self.device, non_blocking=True)
-        gt = batch["gt"].to(self.device, non_blocking=True)
+        
+        window_size = int(self.train_cfg.get("num_frame", 7))
+        
+        lq = batch["lq"][:, :window_size].to(self.device, non_blocking=True)
+        gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
+        
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.net.restore(lq)
 
@@ -215,7 +270,6 @@ class Trainer:
     ):
         total_epochs = epochs if epochs is not None else int(self.train_cfg.get("epochs", 20))
         log_every = int(self.log_cfg.get("log_every", 50))
-        val_every = int(self.val_cfg.get("val_every", 1))
         save_every = max(1, int(self.log_cfg.get("save_checkpoint_every", 5)))
 
         if start_epoch > total_epochs:
@@ -250,7 +304,7 @@ class Trainer:
             pbar.close()
 
             metrics = None
-            if val_loader is not None and epoch % val_every == 0:
+            if val_loader is not None:
                 metrics = self.validate(val_loader)
                 print(f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}")
                 if metrics["psnr"] > self.best_psnr:
@@ -333,6 +387,7 @@ class Trainer:
                 f"[trainer] resumed from {resume_path} "
                 f"(next epoch {start_epoch}, best psnr {self.best_psnr:.3f}{best_at})"
             )
+            self.save_training_config()
             return start_epoch
 
         self.save_training_config()

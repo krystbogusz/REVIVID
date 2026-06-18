@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from dataset.augment import augment_frames
 from dataset.degradation.cache import build_texture_mmap, get_texture_cache, resolve_texture_dir
+from dataset.degradation.pipeline import apply_holes_to_window
 
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov")
 
@@ -129,6 +130,7 @@ class VideoFrameDataset(Dataset):
         is_train: bool = True,
         vfi_prob: float = 0.5,
         vfi_mask_ratio: float = 0.3,
+        hole_prob: float = 0.15,
         normalize: bool = True,
         sr_scale: int = 1,
         patch_size: int = 0,
@@ -143,6 +145,7 @@ class VideoFrameDataset(Dataset):
         self.is_train = is_train
         self.vfi_prob = vfi_prob
         self.vfi_mask_ratio = vfi_mask_ratio
+        self.hole_prob = hole_prob
         self.normalize = normalize
         self.sr_scale = max(1, int(sr_scale))
         self.patch_size = int(patch_size)
@@ -180,10 +183,12 @@ class VideoFrameDataset(Dataset):
     def _sample_window(self, total: int) -> List[int]:
         if total <= 0:
             return [0] * self.num_frame
+        if not self.is_train:
+            return list(range(total))
         if total <= self.num_frame:
             idx = list(range(total)) + [total - 1] * (self.num_frame - total)
             return idx
-        start = random.randint(0, total - self.num_frame) if self.is_train else 0
+        start = random.randint(0, total - self.num_frame)
         return list(range(start, start + self.num_frame))
 
     def __getitem__(self, index: int):
@@ -246,19 +251,21 @@ class VideoFrameDataset(Dataset):
 
         deg_bgrs = None
         if self.is_train and self.texture_dir is not None:
-            from dataset.degradation.pipeline import process_video_frames
+            from dataset.degradation.pipeline import process_video_frames, sample_degree
 
             texture_cache = get_texture_cache(self.texture_dir)
-            degree = random.randint(0, 2)
+            degree = sample_degree()
             deg_bgrs = process_video_frames(
                 window_gt_bgrs,
                 texture_cache,
                 degree=degree,
                 downscale_factor=self.sr_scale,
                 device=torch.device("cpu"),
-                bake_holes=True,
                 out_size=(lph, lpw),
             )
+            # Apply holes per window (same mask for all frames in the window)
+            deg_bgrs = apply_holes_to_window(deg_bgrs, self.hole_prob)
+
             if self.use_flip or self.use_rot:
                 n_gt = len(window_gt_bgrs)
                 combined = augment_frames(
@@ -272,7 +279,9 @@ class VideoFrameDataset(Dataset):
 
         gts = []
         for gt_crop in window_gt_bgrs:
-            gt_rgb = cv2.cvtColor(gt_crop, cv2.COLOR_BGR2RGB)
+            # GT is greyscale (no colour — network must not learn colourisation)
+            gt_gray = cv2.cvtColor(gt_crop, cv2.COLOR_BGR2GRAY)
+            gt_rgb  = cv2.cvtColor(gt_gray, cv2.COLOR_GRAY2RGB)
             gts.append(_to_tensor(gt_rgb, self.normalize))
 
         lqs = []
@@ -361,6 +370,7 @@ def get_loader(
     num_workers: int = 0,
     vfi_prob: float = 0.5,
     vfi_mask_ratio: float = 0.3,
+    hole_prob: float = 0.15,
     root: Optional[str] = None,
     shuffle: Optional[bool] = None,
     sr_scale: int = 1,
@@ -378,6 +388,7 @@ def get_loader(
         is_train=is_train,
         vfi_prob=vfi_prob,
         vfi_mask_ratio=vfi_mask_ratio,
+        hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
         texture_dir=texture_dir,
@@ -409,6 +420,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     num_frame = int(tc.get("num_frame", 7))
     vfi_prob = float(trainer.model_cfg.vfi_prob)
     vfi_mask_ratio = float(trainer.model_cfg.vfi_mask_ratio)
+    hole_prob = float(trainer.model_cfg.hole_prob)
     sr_scale = int(trainer.model_cfg.sr_scale)
     patch_size = int(tc.get("patch_size", 0))
     val_patch_size = int(val_cfg.get("patch_size", patch_size))
@@ -422,6 +434,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
         num_workers=int(tc.get("num_workers", 0)),
         vfi_prob=vfi_prob,
         vfi_mask_ratio=vfi_mask_ratio,
+        hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
         texture_dir=texture_dir,

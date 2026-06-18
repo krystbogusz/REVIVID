@@ -113,21 +113,14 @@ class Video_Backbone(nn.Module):
     # Training
     # ------------------------------------------------------------------ #
 
-    def compute_losses(
+    def forward(
         self,
         lq: torch.Tensor,
-        gt: torch.Tensor,
         frame_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Args:
-            lq:         (N, T, 3, h, w) degraded LR input; zeros at VFI positions.
-            gt:         (N, T, 3, H, W) clean HR target.
-            frame_mask: (N, T) bool — True = observed, False = masked (VFI).
-                        None → all frames observed.
-
-        Returns a dict with scalar tensors: ``detect``, ``v``, plus
-        non-scalar auxiliaries ``coarse`` and ``hole_logits``.
+        Forward pass for training. 
+        Returns unweighted predictions and building blocks for the loss functions.
         """
         if frame_mask is None:
             frame_mask = lq.new_ones(lq.shape[:2], dtype=torch.bool)
@@ -137,39 +130,25 @@ class Video_Backbone(nn.Module):
 
         coarse_f, nt = _flatten_time(coarse)      # (N*T, 3, H, W)
         cond_f, _    = _flatten_time(cond)          # (N*T, cond_dim, H, W)
-        gt_f, _      = _flatten_time(gt)            # (N*T, 3, H, W)
         logits_f, _  = _flatten_time(hole_logits)   # (N*T, 1, H, W)
 
         frame_mask_f = frame_mask.reshape(-1)        # (N*T,) bool
 
-        # ---- Spatial hole mask — detected on-the-fly from LQ fill value ----
-        # DatasetCreator fills baked holes with exactly -1.0 in normalised space.
-        # VFI-masked frames are filled with 0.0, so they won't trigger this.
+        # Spatial hole mask — detected on-the-fly from LQ fill value
         lq_f, _ = _flatten_time(lq)                 # (N*T, 3, h, w)
         lq_hr = F.interpolate(lq_f, size=coarse_f.shape[-2:], mode="nearest") \
                 if lq_f.shape[-2:] != coarse_f.shape[-2:] else lq_f
-        # Average across channels: a pixel is a hole if all channels ≈ -1.0
         hole_mask_f = (lq_hr.mean(dim=1, keepdim=True) < -0.95).float()
 
-        losses: Dict[str, torch.Tensor] = {}
-
-        # ---- Hole detection (BCE) ----
-        losses["detect"] = F.binary_cross_entropy_with_logits(logits_f, hole_mask_f)
-
-        # ---- V-prediction on residual (restoration + VFI + inpainting) ----
-        residual_target = (gt_f - coarse_f).detach()
         refine_cond = self._build_cond(coarse_f.detach(), hole_mask_f, cond_f, frame_mask_f)
         
-        v_loss, _ = self.diffusion.training_losses(
-            self.refine_unet, residual_target,
-            model_kwargs={"cond": refine_cond},
-        )
-        losses["v"] = v_loss
-
-        # Auxiliaries (non-scalar, used by trainer for pixel/perceptual loss)
-        losses["coarse"]      = coarse
-        losses["hole_logits"] = hole_logits
-        return losses
+        return {
+            "coarse": coarse,
+            "coarse_f": coarse_f,
+            "hole_logits_f": logits_f,
+            "hole_mask_f": hole_mask_f,
+            "refine_cond": refine_cond
+        }
 
     # ------------------------------------------------------------------ #
     # Inference

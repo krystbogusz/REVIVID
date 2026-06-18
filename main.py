@@ -63,12 +63,12 @@ def build_datasets(seed: int = 2021):
     reds_train = RAW_DIR / "reds" / "train"
     if reds_train.exists() and any(reds_train.iterdir()):
         print(f"[pipeline] degrading REDS train from {reds_train}...")
-        creator.create_dataset("train", str(reds_train), bake_holes=True)
+        creator.create_dataset("train", str(reds_train))
 
     reds_val = RAW_DIR / "reds" / "val"
     if reds_val.exists() and any(reds_val.iterdir()):
         print(f"[pipeline] degrading REDS val from {reds_val}...")
-        creator.create_dataset("valid", str(reds_val), bake_holes=True)
+        creator.create_dataset("valid", str(reds_val))
 
     old_films = RAW_DIR / "old_films"
     if old_films.exists() and any(old_films.iterdir()):

@@ -42,6 +42,9 @@ class ModelConfig:
     vfi_prob: float = 0.5         # probability a training clip has masked frames
     vfi_mask_ratio: float = 0.3   # fraction of inner frames that may be masked
 
+    # Persistent spatial holes (applied per window by DatasetCreator / DataLoader)
+    hole_prob: float = 0.15       # probability a training window has holes burned in
+
     @classmethod
     def from_dict(cls, d: dict | None) -> "ModelConfig":
         if not d:
