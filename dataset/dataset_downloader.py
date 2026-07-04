@@ -40,7 +40,9 @@ class DatasetDownloader:
 
                 section_dir = str(self.download_dir / section_name.lower())
                 os.makedirs(section_dir, exist_ok=True)
-                print(f"\nProcessing section: {section_name} -> saving to {section_dir}")
+                print(
+                    f"\nProcessing section: {section_name} -> saving to {section_dir}"
+                )
 
                 for url in urls:
                     if not url:
@@ -103,7 +105,9 @@ class DatasetDownloader:
         except requests.exceptions.RequestException as req_error:
             print(f"Failed to download {url}. Error: {req_error}")
         except Exception as general_error:
-            print(f"An unexpected error occurred processing {url}. Error: {general_error}")
+            print(
+                f"An unexpected error occurred processing {url}. Error: {general_error}"
+            )
 
     def _download_google_drive_file(self, url: str, target_dir: str) -> None:
         filename = self._create_filename(url)
@@ -126,7 +130,9 @@ class DatasetDownloader:
         except requests.exceptions.RequestException as req_error:
             print(f"Failed to download {url}. Error: {req_error}")
         except Exception as general_error:
-            print(f"An unexpected error occurred processing {url}. Error: {general_error}")
+            print(
+                f"An unexpected error occurred processing {url}. Error: {general_error}"
+            )
 
     def _download_youtube_video(self, url: str, target_dir: str) -> None:
         ydl_opts = {

@@ -32,7 +32,11 @@ def flow_warp(
     vgrid_y = 2.0 * vgrid[..., 1] / max(h - 1, 1) - 1.0
     vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
     return F.grid_sample(
-        x, vgrid_scaled, mode=interp_mode, padding_mode=padding_mode, align_corners=align_corners
+        x,
+        vgrid_scaled,
+        mode=interp_mode,
+        padding_mode=padding_mode,
+        align_corners=align_corners,
     )
 
 
@@ -48,21 +52,20 @@ class RAFTFlow(nn.Module):
 
         try:
             from torchvision.models.optical_flow import Raft_Small_Weights
+
             self.raft = raft_small(weights=Raft_Small_Weights.DEFAULT)
-        except Exception:  # offline: build with random weights
+        except Exception:
             self.raft = raft_small(weights=None)
 
-        # Freeze all RAFT parameters — never fine-tuned.
         for p in self.raft.parameters():
             p.requires_grad_(False)
         self.eval()
 
-    # RAFT downsamples by 8 and the correlation pyramid needs feature maps >= 16,
-    # so inputs must be at least 128 px and a multiple of 8 on each side.
     _MIN_SIZE = 128
 
     def _work_size(self, h: int, w: int):
         import math
+
         H = max(self._MIN_SIZE, math.ceil(h / 8) * 8)
         W = max(self._MIN_SIZE, math.ceil(w / 8) * 8)
         return H, W
@@ -76,10 +79,12 @@ class RAFTFlow(nn.Module):
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
         with torch.no_grad():
-            flow = self.raft(a.contiguous(), b.contiguous())[-1]  # (n, 2, H, W)
+            flow = self.raft(a.contiguous(), b.contiguous())[-1]
 
         if (H, W) != (h, w):
-            flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)
+            flow = F.interpolate(
+                flow, size=(h, w), mode="bilinear", align_corners=False
+            )
             flow = flow.clone()
             flow[:, 0] *= w / W
             flow[:, 1] *= h / H

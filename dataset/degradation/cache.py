@@ -25,7 +25,7 @@ _PIXELS_NAME = "noise_textures_pixels.bin"
 _SOURCE_NAME = "noise_textures_source.txt"
 _BUILD_LOCK_NAME = ".building.lock"
 
-# One open mmap handle per process (cheap); physical pages are shared by the OS.
+
 _process_caches: dict[str, "TextureCache"] = {}
 
 
@@ -75,7 +75,10 @@ def _needs_rebuild(texture_dir: Path, cache_dir: Path) -> bool:
         return True
     source_path = cache_dir / _SOURCE_NAME
     resolved_source = str(texture_dir.resolve())
-    if not source_path.exists() or source_path.read_text(encoding="utf-8").strip() != resolved_source:
+    if (
+        not source_path.exists()
+        or source_path.read_text(encoding="utf-8").strip() != resolved_source
+    ):
         return True
     manifest_mtime = manifest_path.stat().st_mtime
     for file_path in _iter_texture_files(texture_dir):
@@ -123,7 +126,9 @@ def _build_mmap_cache(texture_dir: Path, cache_dir: Path) -> None:
     tmp_manifest = cache_dir / f"{_MANIFEST_NAME}.tmp"
     tmp_pixels.write_bytes(pixels.tobytes())
     tmp_manifest.write_text(
-        json.dumps({"entries": entries, "moving_line_keys": moving_line_keys}, indent=2),
+        json.dumps(
+            {"entries": entries, "moving_line_keys": moving_line_keys}, indent=2
+        ),
         encoding="utf-8",
     )
     tmp_pixels.replace(cache_dir / _PIXELS_NAME)

@@ -2,7 +2,7 @@
 
 Reads raw video/image sources, applies the degradation pipeline to the ENTIRE
 clip, then divides the clip into non-overlapping windows of ``num_frame`` frames.
-Holes and VFI masking are decided independently for each window so the model sees 
+Holes and VFI masking are decided independently for each window so the model sees
 diverse augmentations within a single source video. Finally, the entire sequence
 is written as a SINGLE paired MP4 clip (degraded LR, clean HR).
 
@@ -55,8 +55,8 @@ class DatasetCreator:
     ):
         self.project_root = Path(__file__).parent.parent
         self.file_counter = 0
-        self.video_exts = ('.mp4', '.mkv', '.avi', '.mov')
-        self.img_exts = ('.png', '.jpg', '.jpeg')
+        self.video_exts = (".mp4", ".mkv", ".avi", ".mov")
+        self.img_exts = (".png", ".jpg", ".jpeg")
         self.texture_dir = self.project_root / "data" / "raw" / "noise_data"
         self.fps = 24
 
@@ -66,10 +66,12 @@ class DatasetCreator:
         self.vfi_mask_ratio = vfi_mask_ratio
         self.hole_prob = hole_prob
 
-        self.size_multiple = 8  # keep H/W divisible by this (UNet + codec friendly)
+        self.size_multiple = 8
 
     @classmethod
-    def from_config(cls, config_path: Union[str, Path, None] = None) -> "DatasetCreator":
+    def from_config(
+        cls, config_path: Union[str, Path, None] = None
+    ) -> "DatasetCreator":
         """Build a DatasetCreator from ``config/REVIVID.yaml``.
 
         Reads ``model.sr_scale``, ``training.num_frame``,
@@ -80,14 +82,14 @@ class DatasetCreator:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
-        model_cfg  = cfg.get("model", {}) or {}
-        train_cfg  = cfg.get("training", {}) or {}
+        model_cfg = cfg.get("model", {}) or {}
+        train_cfg = cfg.get("training", {}) or {}
 
-        sr_scale       = int(model_cfg.get("sr_scale", 4))
-        num_frame      = int(train_cfg.get("num_frame", 7))
-        vfi_prob       = float(model_cfg.get("vfi_prob", 0.5))
+        sr_scale = int(model_cfg.get("sr_scale", 4))
+        num_frame = int(train_cfg.get("num_frame", 7))
+        vfi_prob = float(model_cfg.get("vfi_prob", 0.5))
         vfi_mask_ratio = float(model_cfg.get("vfi_mask_ratio", 0.3))
-        hole_prob      = float(model_cfg.get("hole_prob", 0.15))
+        hole_prob = float(model_cfg.get("hole_prob", 0.15))
 
         creator = cls(
             sr_scale=sr_scale,
@@ -102,20 +104,12 @@ class DatasetCreator:
         )
         return creator
 
-    # ------------------------------------------------------------------ #
-    # Texture setup
-    # ------------------------------------------------------------------ #
-
     def ensure_texture_mmap(self, texture_dir=None) -> Path:
         """Build the shared mmap texture archive under ``data/training/noise_textures``."""
         source = texture_dir or self.texture_dir
         cache_dir = build_texture_mmap(source)
         print(f"[DatasetCreator] texture mmap ready: {cache_dir}")
         return cache_dir
-
-    # ------------------------------------------------------------------ #
-    # Input gathering
-    # ------------------------------------------------------------------ #
 
     def _gather_inputs(self, source_paths: Union[str, List[str]]):
         if isinstance(source_paths, (str, Path)):
@@ -128,7 +122,7 @@ class DatasetCreator:
                 continue
 
             if sp.is_file() and sp.suffix.lower() in self.video_exts:
-                inputs.append(('video', sp))
+                inputs.append(("video", sp))
                 continue
 
             if sp.is_dir():
@@ -138,18 +132,16 @@ class DatasetCreator:
                         [f for f in files if Path(f).suffix.lower() in self.img_exts]
                     )
                     if len(images) > 0:
-                        inputs.append(('frames', root_path, [root_path / img for img in images]))
+                        inputs.append(
+                            ("frames", root_path, [root_path / img for img in images])
+                        )
                         dirs.clear()
                     else:
                         for f in files:
                             if Path(f).suffix.lower() in self.video_exts:
-                                inputs.append(('video', root_path / f))
+                                inputs.append(("video", root_path / f))
 
         return inputs
-
-    # ------------------------------------------------------------------ #
-    # Size helpers
-    # ------------------------------------------------------------------ #
 
     def _target_size(self, height: int, width: int) -> Tuple[int, int]:
         """Round to nearest multiple of ``size_multiple``."""
@@ -161,7 +153,7 @@ class DatasetCreator:
     def _iter_frames(self, item: tuple):
         """Yield BGR frames for a 'video' or 'frames' item."""
         item_type = item[0]
-        if item_type == 'video':
+        if item_type == "video":
             cap = cv2.VideoCapture(str(item[1]))
             if not cap.isOpened():
                 return
@@ -173,16 +165,12 @@ class DatasetCreator:
                     break
                 yield frame
             cap.release()
-        elif item_type == 'frames':
+        elif item_type == "frames":
             self._current_fps = self.fps
             for img_p in item[2]:
                 frame = cv2.imread(str(img_p))
                 if frame is not None:
                     yield frame
-
-    # ------------------------------------------------------------------ #
-    # VFI mask helpers
-    # ------------------------------------------------------------------ #
 
     def _sample_vfi_mask(self, window_size: int) -> Optional[List[bool]]:
         """Return a per-frame visibility list (True = visible) or None if no VFI.
@@ -191,7 +179,7 @@ class DatasetCreator:
         Internal frames are randomly masked up to ``vfi_mask_ratio``.
         """
         if self.vfi_prob <= 0.0 or random.random() >= self.vfi_prob:
-            return None  # no VFI for this window
+            return None
 
         n = window_size
         mask = [True] * n
@@ -204,10 +192,6 @@ class DatasetCreator:
         for idx in random.sample(internal, min(num_to_mask, len(internal))):
             mask[idx] = False
         return mask
-
-    # ------------------------------------------------------------------ #
-    # Core per-item degradation (new windowed approach)
-    # ------------------------------------------------------------------ #
 
     def _degrade_item(
         self,
@@ -222,7 +206,6 @@ class DatasetCreator:
         """
         self._current_fps = self.fps
 
-        # 1. Read ALL frames into memory and resize to GT target.
         all_gt_frames: List[np.ndarray] = []
         target_h = target_w = None
         deg_h = deg_w = None
@@ -235,8 +218,10 @@ class DatasetCreator:
                 deg_w = target_w // self.sr_scale
 
             if frame.shape[:2] != (target_h, target_w):
-                frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            # GT is greyscale (MambaOFR transfer_1 convention — no colour)
+                frame = cv2.resize(
+                    frame, (target_w, target_h), interpolation=cv2.INTER_AREA
+                )
+
             all_gt_frames.append(_to_grayscale_bgr(frame))
 
         if not all_gt_frames:
@@ -244,9 +229,8 @@ class DatasetCreator:
 
         total = len(all_gt_frames)
         fps = self._current_fps
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
-        # 2. Degrade the FULL clip in one shot (no holes/VFI here).
         all_deg_frames = process_video_frames(
             all_gt_frames,
             self.texture_cache,
@@ -255,32 +239,27 @@ class DatasetCreator:
             out_size=(deg_h, deg_w),
         )
 
-        # 3. Create writers for the ONE output file.
         filename = f"{self.file_counter:07d}.mp4"
         out_deg = degraded_dir / filename
-        out_gt  = gt_dir / filename
+        out_gt = gt_dir / filename
 
-        writer_gt  = cv2.VideoWriter(str(out_gt),  fourcc, fps, (target_w, target_h))
+        writer_gt = cv2.VideoWriter(str(out_gt), fourcc, fps, (target_w, target_h))
         writer_deg = cv2.VideoWriter(str(out_deg), fourcc, fps, (deg_w, deg_h))
 
-        # 4. Iterate over the clip in non-overlapping chunks of num_frame.
         n = self.num_frame
         for start in range(0, total, n):
-            gt_chunk  = all_gt_frames[start : start + n]
+            gt_chunk = all_gt_frames[start : start + n]
             deg_chunk = all_deg_frames[start : start + n]
             chunk_len = len(gt_chunk)
 
-            # 4a. Random holes for this chunk
             deg_chunk = apply_holes_to_window(deg_chunk, self.hole_prob)
 
-            # 4b. Random VFI for this chunk
             vfi_mask = self._sample_vfi_mask(chunk_len)
             if vfi_mask is not None:
                 for fi, visible in enumerate(vfi_mask):
                     if not visible:
                         deg_chunk[fi] = np.zeros_like(deg_chunk[fi])
 
-            # 4c. Write the frames of this chunk sequentially
             for gt_f, deg_f in zip(gt_chunk, deg_chunk):
                 writer_gt.write(gt_f)
                 writer_deg.write(deg_f)
@@ -290,10 +269,6 @@ class DatasetCreator:
 
         self.file_counter += 1
         return 1
-
-    # ------------------------------------------------------------------ #
-    # Public dataset creation methods
-    # ------------------------------------------------------------------ #
 
     def _setup_dirs(self, dataset_mode: str) -> Tuple[Path, Path]:
         target_dir = self.project_root / "data" / "training" / dataset_mode
@@ -306,7 +281,7 @@ class DatasetCreator:
     def _init_shared(self):
         self.ensure_texture_mmap()
         self.texture_cache = get_texture_cache(self.texture_dir)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def create_dataset(
         self,
@@ -330,6 +305,7 @@ class DatasetCreator:
     def create_test_dataset(self, source_paths: Union[str, List[str]]):
         """Tworzy zbiór testowy poprzez bezpośrednie kopiowanie plików wideo bez degradacji."""
         import shutil
+
         self.dataset_mode = "test"
         self.file_counter = 0
 
@@ -339,14 +315,18 @@ class DatasetCreator:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         inputs = self._gather_inputs(source_paths)
-        for item in tqdm(inputs, desc="Tworzenie datasetu testowego (tylko kopiowanie)"):
+        for item in tqdm(
+            inputs, desc="Tworzenie datasetu testowego (tylko kopiowanie)"
+        ):
             item_type = item[0]
-            if item_type == 'video':
+            if item_type == "video":
                 filename = f"{self.file_counter:07d}{item[1].suffix}"
                 shutil.copy(str(item[1]), str(target_dir / filename))
                 self.file_counter += 1
             else:
-                print(f"[DatasetCreator] Pomijanie ścieżki z klatkami: {item[1]}. Oczekiwano wideo.")
+                print(
+                    f"[DatasetCreator] Skipping frame path: {item[1]}. Expected video."
+                )
 
     def create_reds_split_dataset(
         self,
@@ -377,8 +357,8 @@ class DatasetCreator:
 
         splits = [
             ("train", inputs[:n_train]),
-            ("valid", inputs[n_train:n_train + n_valid]),
-            ("test",  inputs[n_train + n_valid:]),
+            ("valid", inputs[n_train : n_train + n_valid]),
+            ("test", inputs[n_train + n_valid :]),
         ]
 
         old_films_dir = self.project_root / "data" / "raw" / "old_films"
@@ -387,7 +367,9 @@ class DatasetCreator:
             if old_films_inputs:
                 name, items = splits[2]
                 splits[2] = (name, items + old_films_inputs)
-                print(f"[DatasetCreator] Adding {len(old_films_inputs)} old_films clips to test split.")
+                print(
+                    f"[DatasetCreator] Adding {len(old_films_inputs)} old_films clips to test split."
+                )
 
         n_test = len(splits[2][1])
         print(

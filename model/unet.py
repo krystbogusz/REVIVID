@@ -52,7 +52,6 @@ class ConditionalUNet(nn.Module):
 
         self.conv_in = nn.Conv2d(in_channels + cond_channels, base_channels, 3, 1, 1)
 
-        # ----- Encoder -----
         self.down_blocks = nn.ModuleList()
         self.down_samplers = nn.ModuleList()
         chans = [base_channels]
@@ -74,19 +73,21 @@ class ConditionalUNet(nn.Module):
             else:
                 self.down_samplers.append(None)
 
-        # ----- Bottleneck -----
         self.mid_block1 = TimeConditionedResBlock(cur, cur, time_dim, dropout)
         self.mid_attn = AttnBlock(cur)
         self.mid_block2 = TimeConditionedResBlock(cur, cur, time_dim, dropout)
 
-        # ----- Decoder -----
         self.up_blocks = nn.ModuleList()
         self.up_samplers = nn.ModuleList()
         for level, mult in reversed(list(enumerate(channel_mult))):
             out_ch = base_channels * mult
             blocks = nn.ModuleList()
             for _ in range(num_res_blocks + 1):
-                blocks.append(TimeConditionedResBlock(cur + chans.pop(), out_ch, time_dim, dropout))
+                blocks.append(
+                    TimeConditionedResBlock(
+                        cur + chans.pop(), out_ch, time_dim, dropout
+                    )
+                )
                 cur = out_ch
                 if level in attn_levels:
                     blocks.append(AttnBlock(cur))
@@ -101,13 +102,13 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor = None
+    ) -> torch.Tensor:
         t_emb = self.time_embed(t)
         if cond is not None:
             x = torch.cat([x, cond], dim=1)
 
-        # Pad to a multiple of the down-sampling factor so any H/W works, then
-        # crop the result back to the original spatial size.
         h0, w0 = x.shape[-2:]
         f = self.size_factor
         pad_h = (f - h0 % f) % f

@@ -64,11 +64,11 @@ class GaussianDiffusion(nn.Module):
             "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod).float()
         )
 
-    # ------------------------------------------------------------------ #
-    # Forward (noising) process
-    # ------------------------------------------------------------------ #
     def q_sample(
-        self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None
+        self,
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x_start)
@@ -98,9 +98,6 @@ class GaussianDiffusion(nn.Module):
         sqrt_1m = _extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
         return sqrt_1m * x_t + sqrt_acp * v
 
-    # ------------------------------------------------------------------ #
-    # Training helper
-    # ------------------------------------------------------------------ #
     def training_losses(
         self,
         model_fn: Callable[..., torch.Tensor],
@@ -136,15 +133,12 @@ class GaussianDiffusion(nn.Module):
         x0_pred = self.predict_start_from_v(x_t, t, v_pred)
         return v_loss, {"x0_pred": x0_pred, "x_t": x_t, "t": t, "v_pred": v_pred}
 
-    # ------------------------------------------------------------------ #
-    # DDIM sampling (deterministic, eta = 0)
-    # ------------------------------------------------------------------ #
     def _ddim_timesteps(self, num_steps: int) -> torch.Tensor:
         num_steps = max(1, min(num_steps, self.num_timesteps))
         step = self.num_timesteps / num_steps
         ts = (torch.arange(num_steps) * step).round().long()
         ts = ts.clamp(max=self.num_timesteps - 1)
-        return torch.flip(ts, dims=[0])  # from high noise to low noise
+        return torch.flip(ts, dims=[0])
 
     @torch.no_grad()
     def ddim_sample(
@@ -164,7 +158,9 @@ class GaussianDiffusion(nn.Module):
 
         timesteps = self._ddim_timesteps(num_steps).to(device)
         for i, t_cur in enumerate(timesteps):
-            t_batch = torch.full((shape[0],), int(t_cur), device=device, dtype=torch.long)
+            t_batch = torch.full(
+                (shape[0],), int(t_cur), device=device, dtype=torch.long
+            )
             v_pred = model_fn(x, t_batch, **model_kwargs)
             x0 = self.predict_start_from_v(x, t_batch, v_pred)
             eps = self.predict_noise_from_v(x, t_batch, v_pred)
@@ -186,7 +182,11 @@ class GaussianDiffusion(nn.Module):
                     * torch.sqrt(1 - acp_cur / acp_next)
                 )
                 noise = torch.randn_like(x)
-                x = sqrt_acp_next * x0 + torch.sqrt((sqrt_1m_next**2 - sigma**2).clamp(min=0)) * eps + sigma * noise
+                x = (
+                    sqrt_acp_next * x0
+                    + torch.sqrt((sqrt_1m_next**2 - sigma**2).clamp(min=0)) * eps
+                    + sigma * noise
+                )
             else:
                 x = sqrt_acp_next * x0 + sqrt_1m_next * eps
 

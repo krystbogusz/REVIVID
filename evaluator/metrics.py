@@ -49,7 +49,9 @@ def calculate_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
     a, b = _to_uint8(img1), _to_uint8(img2)
     if a.ndim == 2:
         return _ssim_single(a, b)
-    return float(np.mean([_ssim_single(a[..., c], b[..., c]) for c in range(a.shape[-1])]))
+    return float(
+        np.mean([_ssim_single(a[..., c], b[..., c]) for c in range(a.shape[-1])])
+    )
 
 
 @torch.no_grad()

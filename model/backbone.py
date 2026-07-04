@@ -107,16 +107,16 @@ class ConditioningBackbone(nn.Module):
 
         self.backward_agg = GatedAggregation(num_feat)
         self.forward_agg = GatedAggregation(num_feat)
-        blk_kwargs = dict(embed_dim=embed_dim, depth=num_block, d_state=d_state, expand=ssm_expand)
+        blk_kwargs = dict(
+            embed_dim=embed_dim, depth=num_block, d_state=d_state, expand=ssm_expand
+        )
         self.backward_blocks = build_feature_blocks(num_feat, **blk_kwargs)
         self.forward_blocks = build_feature_blocks(num_feat, **blk_kwargs)
 
-        # Fusion + decoding heads
         self.fuse = nn.Conv2d(num_feat * 2, num_feat * 2, 3, 1, 1)
         self.trunk = make_layer(ResidualBlockNoBN, 2, num_feat=num_feat * 2)
         self.lrelu = nn.LeakyReLU(0.1, inplace=True)
 
-        # Upsampling tail: LR → HR before the heads
         self.upsampler = build_upsampler(num_feat * 2, sr_scale)
 
         self.coarse_head = nn.Sequential(
@@ -125,16 +125,12 @@ class ConditioningBackbone(nn.Module):
             nn.Conv2d(num_feat * 2, 3, 3, 1, 1),
         )
         self.cond_head = nn.Conv2d(num_feat * 2, cond_dim, 3, 1, 1)
-        # Hole detection: also sees accumulated residual evidence (1 channel)
+
         self.hole_head = nn.Sequential(
             nn.Conv2d(num_feat * 2 + 1, num_feat, 3, 1, 1),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(num_feat, 1, 3, 1, 1),
         )
-
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
 
     def _make_effective_frames(
         self, lrs: torch.Tensor, frame_mask: torch.Tensor
@@ -153,31 +149,30 @@ class ConditioningBackbone(nn.Module):
             lrs_eff: (N, T, C, H, W) — lrs with masked positions interpolated.
         """
         n, t = frame_mask.shape
-        # Assume a shared mask across the batch dimension (batch_size = 1 during
-        # training; at inference the caller always passes fully-observed clips).
-        obs = frame_mask[0].tolist()   # list of bool, length T
 
-        # Fast path: nothing is masked
+        obs = frame_mask[0].tolist()
+
         if all(obs):
             return lrs
 
         lrs_eff = lrs.clone()
         for i in range(t):
             if obs[i]:
-                continue  # observed — keep as is
+                continue
 
-            # Nearest observed frame before position i
             prev_obs = next((j for j in range(i - 1, -1, -1) if obs[j]), None)
-            # Nearest observed frame after position i
+
             next_obs = next((j for j in range(i + 1, t) if obs[j]), None)
 
             if prev_obs is not None and next_obs is not None:
                 alpha = (i - prev_obs) / (next_obs - prev_obs)
-                lrs_eff[:, i] = (1.0 - alpha) * lrs[:, prev_obs] + alpha * lrs[:, next_obs]
+                lrs_eff[:, i] = (1.0 - alpha) * lrs[:, prev_obs] + alpha * lrs[
+                    :, next_obs
+                ]
             elif prev_obs is not None:
-                lrs_eff[:, i] = lrs[:, prev_obs]   # edge: masked frame at the end
+                lrs_eff[:, i] = lrs[:, prev_obs]
             elif next_obs is not None:
-                lrs_eff[:, i] = lrs[:, next_obs]   # edge: masked frame at the start
+                lrs_eff[:, i] = lrs[:, next_obs]
 
         return lrs_eff
 
@@ -193,10 +188,6 @@ class ConditioningBackbone(nn.Module):
         fwd = self.flow_net(a, b).view(n, t - 1, 2, h, w)
         bwd = self.flow_net(b, a).view(n, t - 1, 2, h, w)
         return fwd, bwd
-
-    # ------------------------------------------------------------------ #
-    # Forward
-    # ------------------------------------------------------------------ #
 
     def forward(
         self,
@@ -217,75 +208,74 @@ class ConditioningBackbone(nn.Module):
         if frame_mask is None:
             frame_mask = lrs.new_ones((n, t), dtype=torch.bool)
 
-        # Observed flags as a plain Python list for cheap per-frame branching
-        obs: list[bool] = frame_mask[0].tolist()   # shared mask (batch_size = 1)
+        obs: list[bool] = frame_mask[0].tolist()
 
         lrs_eff = self._make_effective_frames(lrs, frame_mask)
         fwd_flow, bwd_flow = self._comp_flow(lrs_eff)
 
         zero_feat = lrs.new_zeros(n, self.num_feat, h, w)
-        zero_ind  = lrs.new_zeros(n, 1, h, w)
+        zero_ind = lrs.new_zeros(n, 1, h, w)
 
-        # ---------------------------------------------------------------- #
-        # Backward propagation
-        # ---------------------------------------------------------------- #
-        back_feats   = [None] * t
+        back_feats = [None] * t
         residual_acc = [zero_ind] * t
         feat_prop = zero_feat
-        pre_mask  = torch.ones_like(zero_ind)
+        pre_mask = torch.ones_like(zero_ind)
 
         for i in range(t - 1, -1, -1):
             if i < t - 1:
                 flow = bwd_flow[:, i].permute(0, 2, 3, 1)
                 feat_prop = flow_warp(feat_prop, flow)
-                pre_mask  = flow_warp(pre_mask, flow)
+                pre_mask = flow_warp(pre_mask, flow)
 
-                # Residual indicator uses effective frames (never zeros)
                 warped_pix = flow_warp(lrs_eff[:, i + 1], flow)
-                res_ind = torch.abs(rgb_to_luma(warped_pix) - rgb_to_luma(lrs_eff[:, i]))
+                res_ind = torch.abs(
+                    rgb_to_luma(warped_pix) - rgb_to_luma(lrs_eff[:, i])
+                )
 
                 if obs[i]:
-                    # Observed: anchor to the actual LR frame
+
                     feat_prop, gate = self.backward_agg(
                         feat_prop, lrs[:, i], res_ind, pre_mask, is_head=False
                     )
                     pre_mask = gate
-                # Masked: propagate SSM state unchanged (no anchoring to zeros)
+
             else:
-                # Head frame (first in backward order = last in time)
+
                 res_ind = zero_ind
                 if obs[i]:
                     feat_prop, _ = self.backward_agg(
                         None, lrs[:, i], res_ind, pre_mask, is_head=True
                     )
                 else:
-                    feat_prop = zero_feat   # masked head: start from zero state
+                    feat_prop = zero_feat
 
-            feat_prop = ckpt.checkpoint(self.backward_blocks, feat_prop, use_reentrant=False)
-            back_feats[i]   = feat_prop
+            feat_prop = ckpt.checkpoint(
+                self.backward_blocks, feat_prop, use_reentrant=False
+            )
+            back_feats[i] = feat_prop
             residual_acc[i] = res_ind
 
-        # Forward propagation + decode
-        # ---------------------------------------------------------------- #
         coarse_out, cond_out, hole_out = [], [], []
         feat_prop = zero_feat
-        pre_mask  = torch.ones_like(zero_ind)
+        pre_mask = torch.ones_like(zero_ind)
 
         for i in range(t):
             if i > 0:
                 flow = fwd_flow[:, i - 1].permute(0, 2, 3, 1)
                 feat_prop = flow_warp(feat_prop, flow)
-                pre_mask  = flow_warp(pre_mask, flow)
+                pre_mask = flow_warp(pre_mask, flow)
 
                 warped_pix = flow_warp(lrs_eff[:, i - 1], flow)
-                res_ind = torch.abs(rgb_to_luma(warped_pix) - rgb_to_luma(lrs_eff[:, i]))
+                res_ind = torch.abs(
+                    rgb_to_luma(warped_pix) - rgb_to_luma(lrs_eff[:, i])
+                )
 
                 if obs[i]:
                     feat_prop, gate = self.forward_agg(
                         feat_prop, lrs[:, i], res_ind, pre_mask, is_head=False
                     )
                     pre_mask = gate
-                # Masked: propagate without anchoring
+
             else:
                 res_ind = zero_ind
                 if obs[i]:
@@ -295,35 +285,37 @@ class ConditioningBackbone(nn.Module):
                 else:
                     feat_prop = zero_feat
 
-            feat_prop = ckpt.checkpoint(self.forward_blocks, feat_prop, use_reentrant=False)
+            feat_prop = ckpt.checkpoint(
+                self.forward_blocks, feat_prop, use_reentrant=False
+            )
 
-            # Fuse bidirectional features and decode to HR
-            fused    = self.lrelu(self.fuse(torch.cat([back_feats[i], feat_prop], dim=1)))
-            fused    = self.trunk(fused)
+            fused = self.lrelu(self.fuse(torch.cat([back_feats[i], feat_prop], dim=1)))
+            fused = self.trunk(fused)
             fused_hr = self.upsampler(fused)
-            hr_size  = fused_hr.shape[-2:]
+            hr_size = fused_hr.shape[-2:]
 
             if self.sr_scale > 1:
-                curr_hr = F.interpolate(lrs_eff[:, i], size=hr_size,
-                                        mode="bilinear", align_corners=False)
+                curr_hr = F.interpolate(
+                    lrs_eff[:, i], size=hr_size, mode="bilinear", align_corners=False
+                )
             else:
                 curr_hr = lrs_eff[:, i]
 
             coarse_res = self.coarse_head(fused_hr)
             if obs[i]:
-                # Observed: global residual learning on top of the LR frame
+
                 coarse = torch.tanh(coarse_res + curr_hr)
             else:
-                # Masked (VFI): pure generation — no observed anchor
+
                 coarse = torch.tanh(coarse_res)
 
             cond = self.cond_head(fused_hr)
 
-            # Hole detector: combine bidirectional residual evidence
             evidence = torch.maximum(residual_acc[i], res_ind)
             if self.sr_scale > 1:
-                evidence = F.interpolate(evidence, size=hr_size,
-                                         mode="bilinear", align_corners=False)
+                evidence = F.interpolate(
+                    evidence, size=hr_size, mode="bilinear", align_corners=False
+                )
             hole_logit = self.hole_head(torch.cat([fused_hr, evidence], dim=1))
 
             coarse_out.append(coarse)
@@ -331,7 +323,7 @@ class ConditioningBackbone(nn.Module):
             hole_out.append(hole_logit)
 
         return {
-            "coarse":      torch.stack(coarse_out, dim=1),
-            "cond":        torch.stack(cond_out,   dim=1),
-            "hole_logits": torch.stack(hole_out,   dim=1),
+            "coarse": torch.stack(coarse_out, dim=1),
+            "cond": torch.stack(cond_out, dim=1),
+            "hole_logits": torch.stack(hole_out, dim=1),
         }

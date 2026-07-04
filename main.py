@@ -1,6 +1,6 @@
 import os
 import shutil
-# Reduce CUDA fragmentation OOMs (must be set before torch is imported).
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from pathlib import Path
@@ -53,7 +53,7 @@ def build_datasets(seed: int = 2021):
             d = TRAINING_DIR / split / sub
             if d.exists():
                 shutil.rmtree(d)
-    
+
     test_dir = TRAINING_DIR / "test"
     if test_dir.exists():
         shutil.rmtree(test_dir)
@@ -92,5 +92,5 @@ def main():
     train()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
