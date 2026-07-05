@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def sinusoidal_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+def sinusoidal_embedding(
+    timesteps: torch.Tensor, dim: int, max_period: int = 10000
+) -> torch.Tensor:
     """Standard transformer sinusoidal timestep embedding."""
     half = dim // 2
     freqs = torch.exp(
@@ -42,9 +44,10 @@ class TimestepEmbedding(nn.Module):
 
 
 def Normalize(channels: int, groups: int = 8) -> nn.GroupNorm:
-    # eps=1e-4: fp16 minimum positive normal is ~6.1e-5, so eps must be >= 1e-4
-    # to avoid sqrt(var + eps) underflowing to sqrt(0) = 0 -> division by zero -> NaN.
-    return nn.GroupNorm(num_groups=min(groups, channels), num_channels=channels, eps=1e-4)
+
+    return nn.GroupNorm(
+        num_groups=min(groups, channels), num_channels=channels, eps=1e-4
+    )
 
 
 class ResidualBlockNoBN(nn.Module):
@@ -102,11 +105,10 @@ class AttnBlock(nn.Module):
         q = q.reshape(b, c, h * w).permute(0, 2, 1)
         k = k.reshape(b, c, h * w)
         v = v.reshape(b, c, h * w).permute(0, 2, 1)
-        # Cast Q·K to float32 — in fp16 large activations (after ~70k+ iters) can
-        # exceed 65504 before softmax, producing Inf → NaN in the attention map.
-        attn = torch.softmax(
-            torch.bmm(q.float(), k.float()) / math.sqrt(c), dim=-1
-        ).to(q.dtype)
+
+        attn = torch.softmax(torch.bmm(q.float(), k.float()) / math.sqrt(c), dim=-1).to(
+            q.dtype
+        )
         out = torch.bmm(attn, v).permute(0, 2, 1).reshape(b, c, h, w)
         return x + self.proj(out)
 

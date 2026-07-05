@@ -6,7 +6,6 @@ model:
   cond_dim: 64
   d_state: 16
   ssm_expand: 2
-  finetune_flow: false
   sr_scale: 4
   refiner_base: 64
   channel_mult:
@@ -21,19 +20,19 @@ model:
   hole_threshold: 0.5
   vfi_prob: 0.5
   vfi_mask_ratio: 0.3
+  hole_prob: 0.15
 training:
   epochs: 2
   batch_size: 2
   num_frame: 7
   patch_size: 256
   lr: 0.0002
-  flow_lr_mul: 0.125
   beta1: 0.9
   beta2: 0.99
   use_perceptual: true
   use_amp: true
   loss_weights:
-    pix: 1.0
+    pix: 100.0
     perceptual: 1.0
     detect: 0.5
     v: 1.0
@@ -41,8 +40,7 @@ training:
   use_flip: true
   use_rot: true
 validation:
-  val_every: 1
-  max_clips: 10
+  # Validation runs every epoch on the full validation set.
   patch_size: 256
 logging:
   log_every: 50

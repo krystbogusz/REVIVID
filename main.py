@@ -1,6 +1,6 @@
 import os
 import shutil
-# Reduce CUDA fragmentation OOMs (must be set before torch is imported).
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from pathlib import Path
@@ -53,7 +53,7 @@ def build_datasets(seed: int = 2021):
             d = TRAINING_DIR / split / sub
             if d.exists():
                 shutil.rmtree(d)
-    
+
     test_dir = TRAINING_DIR / "test"
     if test_dir.exists():
         shutil.rmtree(test_dir)
@@ -63,12 +63,12 @@ def build_datasets(seed: int = 2021):
     reds_train = RAW_DIR / "reds" / "train"
     if reds_train.exists() and any(reds_train.iterdir()):
         print(f"[pipeline] degrading REDS train from {reds_train}...")
-        creator.create_dataset("train", str(reds_train), bake_holes=True)
+        creator.create_dataset("train", str(reds_train))
 
     reds_val = RAW_DIR / "reds" / "val"
     if reds_val.exists() and any(reds_val.iterdir()):
         print(f"[pipeline] degrading REDS val from {reds_val}...")
-        creator.create_dataset("valid", str(reds_val), bake_holes=True)
+        creator.create_dataset("valid", str(reds_val))
 
     old_films = RAW_DIR / "old_films"
     if old_films.exists() and any(old_films.iterdir()):
@@ -92,5 +92,5 @@ def main():
     train()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

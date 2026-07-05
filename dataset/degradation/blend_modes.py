@@ -13,7 +13,9 @@ def _compose_alpha(img_in, img_layer, opacity):
     comp_alpha = torch.min(img_in[:, :, 3], img_layer[:, :, 3]) * opacity
     new_alpha = img_in[:, :, 3] + (1.0 - img_in[:, :, 3]) * comp_alpha
 
-    ratio = torch.where(new_alpha == 0, torch.zeros_like(comp_alpha), comp_alpha / new_alpha)
+    ratio = torch.where(
+        new_alpha == 0, torch.zeros_like(comp_alpha), comp_alpha / new_alpha
+    )
     return ratio
 
 
@@ -26,7 +28,9 @@ def addition(img_rgba, texture_rgba, opacity):
     comp = img_in[:, :, :3] + img_layer[:, :, :3]
 
     ratio_rs = ratio.unsqueeze(-1).expand(-1, -1, 3)
-    img_out = torch.clamp(comp * ratio_rs + img_in[:, :, :3] * (1.0 - ratio_rs), 0.0, 1.0)
+    img_out = torch.clamp(
+        comp * ratio_rs + img_in[:, :, :3] * (1.0 - ratio_rs), 0.0, 1.0
+    )
     return img_out * 255.0
 
 
@@ -39,7 +43,9 @@ def subtract(img_rgba, texture_rgba, opacity):
     comp = img_in[:, :, :3] - img_layer[:, :, :3]
 
     ratio_rs = ratio.unsqueeze(-1).expand(-1, -1, 3)
-    img_out = torch.clamp(comp * ratio_rs + img_in[:, :, :3] * (1.0 - ratio_rs), 0.0, 1.0)
+    img_out = torch.clamp(
+        comp * ratio_rs + img_in[:, :, :3] * (1.0 - ratio_rs), 0.0, 1.0
+    )
     return img_out * 255.0
 
 

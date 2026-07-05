@@ -16,7 +16,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _selective_scan_cuda
+from mamba_ssm.ops.selective_scan_interface import (
+    selective_scan_fn as _selective_scan_cuda,
+)
 
 
 def _selective_scan(u, delta, A, B, C, D, delta_bias):
@@ -30,7 +32,14 @@ class SS2D(nn.Module):
 
     K = 4
 
-    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2, d_conv: int = 3, dt_rank="auto"):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        expand: int = 2,
+        d_conv: int = 3,
+        dt_rank="auto",
+    ):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -39,25 +48,30 @@ class SS2D(nn.Module):
 
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         self.conv2d = nn.Conv2d(
-            self.d_inner, self.d_inner, kernel_size=d_conv, padding=d_conv // 2, groups=self.d_inner
+            self.d_inner,
+            self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv // 2,
+            groups=self.d_inner,
         )
         self.act = nn.SiLU()
 
-        # per-direction projections
         self.x_proj = nn.ModuleList(
-            [nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False) for _ in range(self.K)]
+            [
+                nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
+                for _ in range(self.K)
+            ]
         )
         self.dt_proj = nn.ModuleList(
             [nn.Linear(self.dt_rank, self.d_inner, bias=True) for _ in range(self.K)]
         )
 
-        # state matrices A (negative, diagonal) and skip D, one per direction
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_logs = nn.Parameter(torch.log(A).unsqueeze(0).repeat(self.K, 1, 1).contiguous())
+        self.A_logs = nn.Parameter(
+            torch.log(A).unsqueeze(0).repeat(self.K, 1, 1).contiguous()
+        )
         self.Ds = nn.Parameter(torch.ones(self.K, self.d_inner))
 
-        # eps=1e-4: fp16 minimum positive normal is ~6.1e-5, so eps must be >= 1e-4
-        # to avoid sqrt(var + eps) underflowing to sqrt(0) = 0 -> NaN.
         self.out_norm = nn.LayerNorm(self.d_inner, eps=1e-4)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
@@ -67,53 +81,61 @@ class SS2D(nn.Module):
         l = h * w
         hor = x.reshape(b, d, l)
         ver = x.transpose(2, 3).reshape(b, d, l)
-        stacked = torch.stack([hor, ver], dim=1)  # (b, 2, d, l)
+        stacked = torch.stack([hor, ver], dim=1)
         flipped = torch.flip(stacked, dims=[-1])
-        return torch.cat([stacked, flipped], dim=1)  # (b, 4, d, l)
+        return torch.cat([stacked, flipped], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         l = h * w
 
-        xz = self.in_proj(x.permute(0, 2, 3, 1))  # (b, h, w, 2*d_inner)
+        xz = self.in_proj(x.permute(0, 2, 3, 1))
         x_in, z = xz.chunk(2, dim=-1)
-        x_in = x_in.permute(0, 3, 1, 2).contiguous()  # (b, d_inner, h, w)
+        x_in = x_in.permute(0, 3, 1, 2).contiguous()
         x_in = self.act(self.conv2d(x_in))
 
-        xs = self._scan_sequences(x_in)  # (b, K, d_inner, l)
+        xs = self._scan_sequences(x_in)
 
         out = 0
         for k in range(self.K):
-            u = xs[:, k]  # (b, d_inner, l)
-            x_dbl = self.x_proj[k](u.transpose(1, 2))  # (b, l, dt_rank + 2N)
-            dt, Bk, Ck = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = self.dt_proj[k](dt).transpose(1, 2).contiguous()  # (b, d_inner, l)
-            Bk = Bk.transpose(1, 2).contiguous()  # (b, N, l)
-            Ck = Ck.transpose(1, 2).contiguous()  # (b, N, l)
-            A = -torch.exp(self.A_logs[k].float())  # (d_inner, N)
+            u = xs[:, k]
+            x_dbl = self.x_proj[k](u.transpose(1, 2))
+            dt, Bk, Ck = torch.split(
+                x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1
+            )
+            dt = self.dt_proj[k](dt).transpose(1, 2).contiguous()
+            Bk = Bk.transpose(1, 2).contiguous()
+            Ck = Ck.transpose(1, 2).contiguous()
+            A = -torch.exp(self.A_logs[k].float())
             y = _selective_scan(
                 u, dt, A, Bk, Ck, self.Ds[k].float(), self.dt_proj[k].bias.float()
-            )  # (b, d_inner, l)
+            )
 
-            if k in (1, 3):  # undo the flip
+            if k in (1, 3):
                 y = torch.flip(y, dims=[-1])
-            if k in (2, 3):  # undo the transpose (vertical scans)
-                y = y.reshape(b, self.d_inner, w, h).transpose(2, 3).reshape(b, self.d_inner, l)
+            if k in (2, 3):
+                y = (
+                    y.reshape(b, self.d_inner, w, h)
+                    .transpose(2, 3)
+                    .reshape(b, self.d_inner, l)
+                )
             out = out + y
 
-        out = out.transpose(1, 2)  # (b, l, d_inner)
+        out = out.transpose(1, 2)
         out = self.out_norm(out)
         out = out * F.silu(z.reshape(b, l, self.d_inner))
-        out = self.out_proj(out)  # (b, l, d_model)
+        out = self.out_proj(out)
         return out.transpose(1, 2).reshape(b, c, h, w)
 
 
 class SSBlock(nn.Module):
     """Residual SS2D block with a feed-forward mixer."""
 
-    def __init__(self, dim: int, d_state: int = 16, expand: int = 2, mlp_ratio: float = 2.0):
+    def __init__(
+        self, dim: int, d_state: int = 16, expand: int = 2, mlp_ratio: float = 2.0
+    ):
         super().__init__()
-        # eps=1e-4: safe minimum for fp16 (fp16 min positive normal ~6.1e-5)
+
         self.norm1 = nn.GroupNorm(min(8, dim), dim, eps=1e-4)
         self.ss2d = SS2D(dim, d_state=d_state, expand=expand)
         self.norm2 = nn.GroupNorm(min(8, dim), dim, eps=1e-4)
@@ -131,7 +153,14 @@ class SSBlock(nn.Module):
 class MambaFeatureBlocks(nn.Module):
     """Stack of SSBlocks with channel adaptation, applied as a residual group."""
 
-    def __init__(self, in_chans: int, embed_dim: int = 64, depth: int = 6, d_state: int = 16, expand: int = 2):
+    def __init__(
+        self,
+        in_chans: int,
+        embed_dim: int = 64,
+        depth: int = 6,
+        d_state: int = 16,
+        expand: int = 2,
+    ):
         super().__init__()
         self.conv_in = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)
         self.blocks = nn.ModuleList(
@@ -148,6 +177,12 @@ class MambaFeatureBlocks(nn.Module):
 
 
 def build_feature_blocks(
-    in_chans: int, embed_dim: int = 64, depth: int = 6, d_state: int = 16, expand: int = 2
+    in_chans: int,
+    embed_dim: int = 64,
+    depth: int = 6,
+    d_state: int = 16,
+    expand: int = 2,
 ) -> nn.Module:
-    return MambaFeatureBlocks(in_chans, embed_dim=embed_dim, depth=depth, d_state=d_state, expand=expand)
+    return MambaFeatureBlocks(
+        in_chans, embed_dim=embed_dim, depth=depth, d_state=d_state, expand=expand
+    )

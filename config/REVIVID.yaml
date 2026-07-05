@@ -26,7 +26,7 @@ model:
   cond_dim: 64            # conditioning features fed to the diffusion head
   d_state: 16             # SSM state dimension
   ssm_expand: 2           # SSM inner expansion factor
-  finetune_flow: false    # reserved — RAFT is always frozen, do not change
+  # RAFT optical flow is always frozen — no fine-tuning parameter exists
 
   # Super-resolution upscale factor in the backbone (PixelShuffle)
   # and LR downscale factor for dataset generation.
@@ -51,16 +51,19 @@ model:
   vfi_prob: 0.5           # probability a training clip has ≥1 masked frames
   vfi_mask_ratio: 0.3     # max fraction of inner frames that may be masked
 
+  # Persistent spatial holes (baked per window by DatasetCreator / DataLoader)
+  hole_prob: 0.2          # probability a training window has holes burned in
+
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
 training:
   epochs: 4000
-  batch_size: 2
+  batch_size: 1
   num_frame: 7
 
   # Random GT crop for training (LR crop = patch_size / sr_scale).
-  patch_size: 256
+  patch_size: 512
 
   lr: 0.0002
   beta1: 0.9
@@ -72,8 +75,10 @@ training:
   loss_weights:
     pix: 1.0
     perceptual: 1.0
-    detect: 0.5           # BCE on spatial hole_head (lighter weight)
+    detect: 0.05          # BCE on spatial hole_head (temporarily off for initial SR training)
     v: 1.0                # single v-prediction loss (restoration + VFI + inpainting)
+    fft: 0.1              # Focal Frequency loss to recover high-frequency details and avoid watercolor
+    vfi: 0.05              # targeted Charbonnier for missing frames (temporarily off)
 
   num_workers: 4
 
@@ -86,13 +91,12 @@ training:
 # Validation / logging
 # --------------------------------------------------------------------------- #
 validation:
-  val_every: 1
-  max_clips: 10
+  # Validation runs every epoch on the full validation set.
   # HR crop for validation (center crop). 0 = full frames — DDIM at native
   # REDS resolution (~1280×720) will OOM on most GPUs. Defaults to training patch_size.
-  patch_size: 256
+  patch_size: 0
 
 logging:
   log_every: 50
   exp_dir: ./experiments/revivid
-  save_checkpoint_every: 50   # numbered + latest checkpoints (not every epoch)
+  save_checkpoint_every: 100   # numbered + latest checkpoints (not every epoch)

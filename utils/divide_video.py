@@ -8,9 +8,9 @@ from tqdm import tqdm
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input', type=str, required=True)
-    parser.add_argument('-o', '--output', type=str, required=True)
-    parser.add_argument('-n', '--num-frames', type=int, default=None)
+    parser.add_argument("-i", "--input", type=str, required=True)
+    parser.add_argument("-o", "--output", type=str, required=True)
+    parser.add_argument("-n", "--num-frames", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -32,9 +32,7 @@ def main():
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
                 if ret:
-                    frame_filename = os.path.join(
-                        args.output, f"{frame_idx:07d}.jpg"
-                    )
+                    frame_filename = os.path.join(args.output, f"{frame_idx:07d}.jpg")
                     cv2.imwrite(frame_filename, frame)
                 pbar.update(1)
     else:
@@ -45,9 +43,7 @@ def main():
                 if not ret:
                     break
 
-                frame_filename = os.path.join(
-                    args.output, f"{frame_count:07d}.jpg"
-                )
+                frame_filename = os.path.join(args.output, f"{frame_count:07d}.jpg")
                 cv2.imwrite(frame_filename, frame)
                 frame_count += 1
                 pbar.update(1)

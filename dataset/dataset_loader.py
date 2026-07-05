@@ -30,7 +30,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dataset.augment import augment_frames
-from dataset.degradation.cache import build_texture_mmap, get_texture_cache, resolve_texture_dir
+from dataset.degradation.cache import (
+    build_texture_mmap,
+    get_texture_cache,
+    resolve_texture_dir,
+)
+from dataset.degradation.pipeline import apply_holes_to_window
 
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov")
 
@@ -51,17 +56,17 @@ def _read_video_frames(path: str, indices: List[int]) -> dict:
     """
     if not indices:
         return {}
-    
+
     cap = cv2.VideoCapture(str(path))
     frames: dict = {}
     last_frame = None
     target = set(indices)
     max_idx = max(indices)
     start_idx = min(indices)
-    
+
     if start_idx > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
-        
+
     fi = start_idx
     while fi <= max_idx:
         ret, frame = cap.read()
@@ -72,7 +77,7 @@ def _read_video_frames(path: str, indices: List[int]) -> dict:
             last_frame = frame
         fi += 1
     cap.release()
-    # Fill any indices that were beyond the end of the file
+
     if last_frame is None and not frames:
         return {}
     fallback = last_frame if last_frame is not None else next(iter(frames.values()))
@@ -129,6 +134,7 @@ class VideoFrameDataset(Dataset):
         is_train: bool = True,
         vfi_prob: float = 0.5,
         vfi_mask_ratio: float = 0.3,
+        hole_prob: float = 0.15,
         normalize: bool = True,
         sr_scale: int = 1,
         patch_size: int = 0,
@@ -143,12 +149,13 @@ class VideoFrameDataset(Dataset):
         self.is_train = is_train
         self.vfi_prob = vfi_prob
         self.vfi_mask_ratio = vfi_mask_ratio
+        self.hole_prob = hole_prob
         self.normalize = normalize
         self.sr_scale = max(1, int(sr_scale))
         self.patch_size = int(patch_size)
         self.use_flip = use_flip
         self.use_rot = use_rot
-        # Store path only — textures load lazily per DataLoader worker (not in main).
+
         self.texture_dir = (
             str(resolve_texture_dir(texture_dir).resolve()) if self.is_train else None
         )
@@ -180,16 +187,17 @@ class VideoFrameDataset(Dataset):
     def _sample_window(self, total: int) -> List[int]:
         if total <= 0:
             return [0] * self.num_frame
+        if not self.is_train:
+            return list(range(total))
         if total <= self.num_frame:
             idx = list(range(total)) + [total - 1] * (self.num_frame - total)
             return idx
-        start = random.randint(0, total - self.num_frame) if self.is_train else 0
+        start = random.randint(0, total - self.num_frame)
         return list(range(start, start + self.num_frame))
 
     def __getitem__(self, index: int):
         deg_path, gt_path = self.pairs[index]
 
-        # 1. Determine clip length without decoding any frames.
         gt_count = _video_frame_count(str(gt_path))
         if self.is_train:
             total = max(gt_count, 1)
@@ -198,7 +206,6 @@ class VideoFrameDataset(Dataset):
             total = min(gt_count, deg_count) if deg_count > 0 else gt_count
             total = max(total, 1)
 
-        # 2. Sample the temporal window first, then decode only those frames.
         window = self._sample_window(total)
         sorted_window = sorted(set(window))
 
@@ -210,15 +217,12 @@ class VideoFrameDataset(Dataset):
 
         sr = self.sr_scale
 
-        # HR (GT) target size = native GT size, made divisible
-        # by sr so the LR input tiles cleanly. LR size = HR / sr.
         first_gt = gt_map[sorted_window[0]]
         nh, nw = first_gt.shape[:2]
         gh = max(sr, nh // sr * sr)
         gw = max(sr, nw // sr * sr)
         lh, lw = gh // sr, gw // sr
 
-        # Crop window in HR coords (training: random; val/test: center crop).
         if self.patch_size > 0:
             ph = min(self.patch_size, gh) // sr * sr
             pw = min(self.patch_size, gw) // sr * sr
@@ -232,7 +236,6 @@ class VideoFrameDataset(Dataset):
             ph, pw, gy, gx = gh, gw, 0, 0
         ly, lx, lph, lpw = gy // sr, gx // sr, ph // sr, pw // sr
 
-        # VFI frame visibility mask.
         frame_mask = _sample_frame_mask(
             self.num_frame, self.vfi_mask_ratio, self.vfi_prob, self.is_train
         )
@@ -242,23 +245,25 @@ class VideoFrameDataset(Dataset):
             gt_bgr = gt_map[frame_idx]
             if gt_bgr.shape[:2] != (gh, gw):
                 gt_bgr = cv2.resize(gt_bgr, (gw, gh), interpolation=cv2.INTER_AREA)
-            window_gt_bgrs.append(gt_bgr[gy:gy + ph, gx:gx + pw])
+            window_gt_bgrs.append(gt_bgr[gy : gy + ph, gx : gx + pw])
 
         deg_bgrs = None
         if self.is_train and self.texture_dir is not None:
-            from dataset.degradation.pipeline import process_video_frames
+            from dataset.degradation.pipeline import process_video_frames, sample_degree
 
             texture_cache = get_texture_cache(self.texture_dir)
-            degree = random.randint(0, 2)
+            degree = sample_degree()
             deg_bgrs = process_video_frames(
                 window_gt_bgrs,
                 texture_cache,
                 degree=degree,
                 downscale_factor=self.sr_scale,
                 device=torch.device("cpu"),
-                bake_holes=True,
                 out_size=(lph, lpw),
             )
+
+            deg_bgrs = apply_holes_to_window(deg_bgrs, self.hole_prob)
+
             if self.use_flip or self.use_rot:
                 n_gt = len(window_gt_bgrs)
                 combined = augment_frames(
@@ -272,13 +277,15 @@ class VideoFrameDataset(Dataset):
 
         gts = []
         for gt_crop in window_gt_bgrs:
-            gt_rgb = cv2.cvtColor(gt_crop, cv2.COLOR_BGR2RGB)
+
+            gt_gray = cv2.cvtColor(gt_crop, cv2.COLOR_BGR2GRAY)
+            gt_rgb = cv2.cvtColor(gt_gray, cv2.COLOR_GRAY2RGB)
             gts.append(_to_tensor(gt_rgb, self.normalize))
 
         lqs = []
         for pos_idx, frame_idx in enumerate(window):
             if not frame_mask[pos_idx]:
-                # VFI-masked frame: fill with zeros (distinguishable from hole fill -1.0)
+
                 lq_t = torch.zeros(3, lph, lpw)
             else:
                 if self.is_train and deg_bgrs is not None:
@@ -287,11 +294,17 @@ class VideoFrameDataset(Dataset):
                     if deg_map:
                         deg_bgr = deg_map[frame_idx]
                         if deg_bgr.shape[:2] != (lh, lw):
-                            deg_bgr = cv2.resize(deg_bgr, (lw, lh), interpolation=cv2.INTER_LINEAR)
+                            deg_bgr = cv2.resize(
+                                deg_bgr, (lw, lh), interpolation=cv2.INTER_LINEAR
+                            )
                     else:
-                        deg_bgr = cv2.resize(window_gt_bgrs[pos_idx], (lw, lh), interpolation=cv2.INTER_AREA)
-                    deg_bgr = deg_bgr[ly:ly + lph, lx:lx + lpw]
-                
+                        deg_bgr = cv2.resize(
+                            window_gt_bgrs[pos_idx],
+                            (lw, lh),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    deg_bgr = deg_bgr[ly : ly + lph, lx : lx + lpw]
+
                 deg_rgb = cv2.cvtColor(deg_bgr, cv2.COLOR_BGR2RGB)
                 lq_t = _to_tensor(deg_rgb, self.normalize)
 
@@ -308,11 +321,12 @@ class VideoFrameDataset(Dataset):
 class SyntheticHoleVideoDataset(Dataset):
     """In-memory random clips (for tests / dry runs)."""
 
-    def __init__(self, length: int = 8, num_frame: int = 5, size: int = 64,
-                 sr_scale: int = 1):
+    def __init__(
+        self, length: int = 8, num_frame: int = 5, size: int = 64, sr_scale: int = 1
+    ):
         self.length = length
         self.num_frame = num_frame
-        self.size = size  # LR size; GT is sr_scale x this
+        self.size = size
         self.sr_scale = max(1, int(sr_scale))
 
     def __len__(self) -> int:
@@ -321,11 +335,16 @@ class SyntheticHoleVideoDataset(Dataset):
     def __getitem__(self, index: int):
         t, s, sr = self.num_frame, self.size, self.sr_scale
         hs = s * sr
-        gt = torch.rand(t, 3, hs, hs) * 2 - 1                       # HR target
-        lq = torch.rand(t, 3, s, s) * 2 - 1                         # LR input
-        # Synthetic dataset does not do VFI masking — all frames visible
+        gt = torch.rand(t, 3, hs, hs) * 2 - 1
+        lq = torch.rand(t, 3, s, s) * 2 - 1
+
         frame_mask = torch.ones(t, dtype=torch.bool)
-        return {"lq": lq, "gt": gt, "frame_mask": frame_mask, "key": f"synthetic_{index:04d}"}
+        return {
+            "lq": lq,
+            "gt": gt,
+            "frame_mask": frame_mask,
+            "key": f"synthetic_{index:04d}",
+        }
 
 
 def _default_root() -> Path:
@@ -361,6 +380,7 @@ def get_loader(
     num_workers: int = 0,
     vfi_prob: float = 0.5,
     vfi_mask_ratio: float = 0.3,
+    hole_prob: float = 0.15,
     root: Optional[str] = None,
     shuffle: Optional[bool] = None,
     sr_scale: int = 1,
@@ -378,6 +398,7 @@ def get_loader(
         is_train=is_train,
         vfi_prob=vfi_prob,
         vfi_mask_ratio=vfi_mask_ratio,
+        hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
         texture_dir=texture_dir,
@@ -409,6 +430,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     num_frame = int(tc.get("num_frame", 7))
     vfi_prob = float(trainer.model_cfg.vfi_prob)
     vfi_mask_ratio = float(trainer.model_cfg.vfi_mask_ratio)
+    hole_prob = float(trainer.model_cfg.hole_prob)
     sr_scale = int(trainer.model_cfg.sr_scale)
     patch_size = int(tc.get("patch_size", 0))
     val_patch_size = int(val_cfg.get("patch_size", patch_size))
@@ -422,6 +444,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
         num_workers=int(tc.get("num_workers", 0)),
         vfi_prob=vfi_prob,
         vfi_mask_ratio=vfi_mask_ratio,
+        hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
         texture_dir=texture_dir,
@@ -452,8 +475,7 @@ def get_valid_loader(**kwargs) -> DataLoader:
 
 
 def get_test_loader(**kwargs) -> DataLoader:
-    # Test clips already have holes baked in by DatasetCreator.
-    # No VFI masking during test evaluation.
+
     kwargs.setdefault("batch_size", 1)
     kwargs.setdefault("vfi_prob", 0.0)
     return get_loader(split="test", **kwargs)

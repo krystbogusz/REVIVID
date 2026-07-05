@@ -36,8 +36,13 @@ def _dry_run_config(path):
     """A small config so the synthetic dry run is fast even on CPU."""
     cfg = copy.deepcopy(load_config(path))
     cfg.setdefault("model", {}).update(
-        {"num_block": 1, "embed_dim": 32, "d_state": 8,
-         "num_timesteps": 50, "refine_steps": 2}
+        {
+            "num_block": 1,
+            "embed_dim": 32,
+            "d_state": 8,
+            "num_timesteps": 50,
+            "refine_steps": 2,
+        }
     )
     cfg.setdefault("training", {}).update({"num_frame": 3, "use_amp": False})
     return cfg

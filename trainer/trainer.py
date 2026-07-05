@@ -26,7 +26,15 @@ from tqdm import tqdm
 
 from dataset.dataset_loader import warmup_dataloader
 from evaluator.metrics import evaluate_clip
-from model import ModelConfig, Video_Backbone, VGGPerceptualLoss, charbonnier_loss
+from model import ModelConfig, Video_Backbone
+from model.losses import (
+    CharbonnierLoss,
+    DiffusionLoss,
+    FocalFrequencyLoss,
+    HoleDetectionLoss,
+    MaskedReconstructionLoss,
+    VGGPerceptualLoss,
+)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
@@ -58,15 +66,32 @@ class Trainer:
         self.model_cfg = ModelConfig.from_dict(cfg.get("model", {}))
         self.net = Video_Backbone(self.model_cfg).to(self.device)
 
-        default_w = {"pix": 1.0, "perceptual": 1.0, "detect": 0.5, "v": 1.0}
+        default_w = {
+            "pix": 1.0,
+            "perceptual": 1.0,
+            "detect": 0.5,
+            "v": 1.0,
+            "fft": 0.1,
+            "vfi": 10.0,
+        }
         default_w.update(self.train_cfg.get("loss_weights", {}) or {})
         self.weights = default_w
 
+        self.loss_pix = CharbonnierLoss().to(self.device)
         self.use_perceptual = bool(self.train_cfg.get("use_perceptual", True))
-        self.perceptual = VGGPerceptualLoss().to(self.device) if self.use_perceptual else None
+        self.loss_perceptual = (
+            VGGPerceptualLoss().to(self.device) if self.use_perceptual else None
+        )
+        self.loss_detect = HoleDetectionLoss().to(self.device)
+        self.loss_diffusion = DiffusionLoss().to(self.device)
+        self.loss_fft = FocalFrequencyLoss().to(self.device)
+        self.loss_vfi = MaskedReconstructionLoss().to(self.device)
 
         lr = float(self.train_cfg.get("lr", 2e-4))
-        betas = (float(self.train_cfg.get("beta1", 0.9)), float(self.train_cfg.get("beta2", 0.99)))
+        betas = (
+            float(self.train_cfg.get("beta1", 0.9)),
+            float(self.train_cfg.get("beta2", 0.99)),
+        )
         self.optimizer_g = torch.optim.AdamW(self._param_groups(lr), lr=lr, betas=betas)
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
 
@@ -79,44 +104,74 @@ class Trainer:
     def _param_groups(self, lr: float):
         return [p for p in self.net.parameters() if p.requires_grad]
 
-    # ------------------------------------------------------------------ #
-    def _coarse_perceptual(self, coarse: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    def _coarse_perceptual(
+        self, coarse: torch.Tensor, gt: torch.Tensor
+    ) -> torch.Tensor:
         n, t, c, h, w = coarse.shape
-        return self.perceptual(coarse.reshape(-1, c, h, w), gt.reshape(-1, c, h, w))
+        return self.loss_perceptual(
+            coarse.reshape(-1, c, h, w), gt.reshape(-1, c, h, w)
+        )
 
     def train_step(self, batch) -> dict:
         self.net.train()
         lq = batch["lq"].to(self.device, non_blocking=True)
         gt = batch["gt"].to(self.device, non_blocking=True)
         frame_mask = batch.get("frame_mask")
-        frame_mask = frame_mask.to(self.device, non_blocking=True) if frame_mask is not None else None
+        frame_mask = (
+            frame_mask.to(self.device, non_blocking=True)
+            if frame_mask is not None
+            else None
+        )
         w = self.weights
 
-        # --- Guard: skip batches with corrupt input data ---
         if not (torch.isfinite(lq).all() and torch.isfinite(gt).all()):
-            print(f"[iter {self.iteration}] SKIPPED: NaN/Inf in input batch (lq={lq.isnan().any()}, gt={gt.isnan().any()})")
+            print(
+                f"[iter {self.iteration}] SKIPPED: NaN/Inf in input batch (lq={lq.isnan().any()}, gt={gt.isnan().any()})"
+            )
             self.iteration += 1
             return {"loss_total": float("nan"), "skipped": 1.0}
 
-        # --- Guard: reset AMP scaler if it has collapsed to near-zero ---
-        # A scale < 1.0 means backward gradients are SMALLER than original — AMP is
-        # working against us. Reset to a safe starting value so training can continue.
         if self.use_amp and self.scaler.get_scale() < 1.0:
-            self.scaler._scale.fill_(128.0)  # noqa: SLF001
-            print(f"[iter {self.iteration}] AMP scaler reset to 128.0 (was stuck at ~{self.scaler.get_scale():.2e})")
+            self.scaler._scale.fill_(128.0)
+            print(
+                f"[iter {self.iteration}] AMP scaler reset to 128.0 (was stuck at ~{self.scaler.get_scale():.2e})"
+            )
 
         with torch.amp.autocast("cuda", enabled=self.use_amp):
-            losses = self.net.compute_losses(lq, gt, frame_mask)
-            coarse = losses["coarse"]
+            out = self.net(lq, frame_mask)
 
+            coarse = out["coarse"]
+            coarse_f = out["coarse_f"]
 
-            loss_pix = charbonnier_loss(coarse, gt)
-            total = w["pix"] * loss_pix + w["detect"] * losses["detect"] + w["v"] * losses["v"]
+            n_b, t_b, c_b, h_b, w_b = gt.shape
+            gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
+            residual_target = (gt_f - coarse_f).detach()
+
+            loss_pix = self.loss_pix(coarse, gt)
+            loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
+            loss_v = self.loss_diffusion(
+                self.net.diffusion,
+                self.net.refine_unet,
+                residual_target,
+                out["refine_cond"],
+            )
+            loss_fft = self.loss_fft(coarse, gt)
+            loss_vfi = self.loss_vfi(coarse, gt, frame_mask)
+
+            total = (
+                w["pix"] * loss_pix
+                + w["detect"] * loss_detect
+                + w["v"] * loss_v
+                + w["fft"] * loss_fft
+                + w["vfi"] * loss_vfi
+            )
 
             log = {
                 "loss_pix": float(loss_pix.detach()),
-                "loss_detect": float(losses["detect"].detach()),
-                "loss_v": float(losses["v"].detach()),
+                "loss_detect": float(loss_detect.detach()),
+                "loss_v": float(loss_v.detach()),
+                "loss_fft": float(loss_fft.detach()),
+                "loss_vfi": float(loss_vfi.detach()),
             }
 
             if self.use_perceptual:
@@ -128,7 +183,9 @@ class Trainer:
         self.scaler.scale(total).backward()
         self.scaler.unscale_(self.optimizer_g)
         if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=self.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                self.net.parameters(), max_norm=self.grad_clip
+            )
         scale_before = self.scaler.get_scale()
         self.scaler.step(self.optimizer_g)
         self.scaler.update()
@@ -137,17 +194,18 @@ class Trainer:
         self.iteration += 1
         log["loss_total"] = float(total.detach())
 
-        # Detailed NaN/Inf diagnostics — prints which component is the culprit
         if not torch.isfinite(total):
-            bad = {k: v for k, v in log.items()
-                   if not (isinstance(v, float) and v == v and v < float("inf"))}
+            bad = {
+                k: v
+                for k, v in log.items()
+                if not (isinstance(v, float) and v == v and v < float("inf"))
+            }
             print(
                 f"\n[WARN iter {self.iteration}] NaN/Inf loss detected! "
                 f"Culprits: {bad} | "
                 f"AMP scale: {scale_before:.3g} -> {scale_after:.3g}"
             )
 
-        # Log AMP scale drops (overflow in backward pass, step was skipped)
         elif scale_after < scale_before:
             print(
                 f"[iter {self.iteration}] AMP scale dropped "
@@ -156,56 +214,87 @@ class Trainer:
 
         return log
 
-    # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def validate(self, val_loader, max_clips: Optional[int] = None) -> dict:
-        max_clips = max_clips if max_clips is not None else int(self.val_cfg.get("max_clips", 10))
+    def validate(self, val_loader) -> dict:
+        """Run validation on the full validation set (MambaOFR style windowing)."""
         self.net.eval()
         if self.device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
-        for i, batch in enumerate(val_loader):
-            if i >= max_clips:
-                break
-            lq = batch["lq"].to(self.device, non_blocking=True)
-            gt = batch["gt"].to(self.device, non_blocking=True)
-            with torch.amp.autocast("cuda", enabled=self.use_amp):
-                out = self.net.restore(lq)
-            m = evaluate_clip(out[0].float(), gt[0].float())
+        window_size = int(self.train_cfg.get("num_frame", 7))
+
+        for batch in val_loader:
+            lq = batch["lq"]
+            gt = batch["gt"]
+
+            all_len = lq.shape[1]
+            all_output = []
+
+            for i in range(0, all_len, window_size):
+                end = min(i + window_size, all_len)
+                part_lq = lq[:, i:end].to(self.device, non_blocking=True)
+
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    part_out = self.net.restore(part_lq)
+
+                all_output.append(part_out.detach().cpu())
+                del part_lq, part_out
+
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            full_out = torch.cat(all_output, dim=1)
+
+            m = evaluate_clip(full_out[0].float(), gt[0].float())
             psnr_sum += m["psnr"] if m["psnr"] != float("inf") else 0.0
             ssim_sum += m["ssim"]
             count += 1
-            del lq, gt, out
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+
+            del lq, gt, full_out, all_output
+
         count = max(count, 1)
         return {"psnr": psnr_sum / count, "ssim": ssim_sum / count}
 
     @torch.no_grad()
-    def _save_validation_sample(self, epoch: int, val_loader, tag: str = "checkpoint") -> None:
+    def _save_validation_sample(
+        self, epoch: int, val_loader, tag: str = "checkpoint"
+    ) -> None:
         """Save LQ / restored / GT frames from the first validation clip."""
         self.net.eval()
         batch = next(iter(val_loader))
-        lq = batch["lq"].to(self.device, non_blocking=True)
-        gt = batch["gt"].to(self.device, non_blocking=True)
+
+        window_size = int(self.train_cfg.get("num_frame", 7))
+
+        lq = batch["lq"][:, :window_size].to(self.device, non_blocking=True)
+        gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
+
         with torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.net.restore(lq)
 
         def _to_grid(clip: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
             frames = clip[0].float().clamp(-1.0, 1.0)
             if frames.shape[-2:] != target_hw:
-                frames = F.interpolate(frames, size=target_hw, mode="bilinear", align_corners=False)
+                frames = F.interpolate(
+                    frames, size=target_hw, mode="bilinear", align_corners=False
+                )
             return frames.add(1.0).div(2.0)
 
         target_hw = (int(out.shape[-2]), int(out.shape[-1]))
         nrow = int(lq.shape[1])
-        grid = torch.cat([_to_grid(lq, target_hw), _to_grid(out, target_hw), _to_grid(gt, target_hw)], dim=0)
+        grid = torch.cat(
+            [
+                _to_grid(lq, target_hw),
+                _to_grid(out, target_hw),
+                _to_grid(gt, target_hw),
+            ],
+            dim=0,
+        )
         path = self.exp_dir / "samples" / f"epoch{epoch:03d}_{tag}.png"
         save_image(grid, path, nrow=nrow, padding=2)
         print(f"[epoch {epoch}] saved validation sample: {path}")
 
-    # ------------------------------------------------------------------ #
     def fit(
         self,
         train_loader,
@@ -213,9 +302,10 @@ class Trainer:
         epochs: Optional[int] = None,
         start_epoch: int = 1,
     ):
-        total_epochs = epochs if epochs is not None else int(self.train_cfg.get("epochs", 20))
+        total_epochs = (
+            epochs if epochs is not None else int(self.train_cfg.get("epochs", 20))
+        )
         log_every = int(self.log_cfg.get("log_every", 50))
-        val_every = int(self.val_cfg.get("val_every", 1))
         save_every = max(1, int(self.log_cfg.get("save_checkpoint_every", 5)))
 
         if start_epoch > total_epochs:
@@ -250,9 +340,11 @@ class Trainer:
             pbar.close()
 
             metrics = None
-            if val_loader is not None and epoch % val_every == 0:
+            if val_loader is not None:
                 metrics = self.validate(val_loader)
-                print(f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}")
+                print(
+                    f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}"
+                )
                 if metrics["psnr"] > self.best_psnr:
                     self.best_psnr = metrics["psnr"]
                     self.best_epoch = epoch
@@ -267,7 +359,6 @@ class Trainer:
 
             print(f"[epoch {epoch}] done in {time.time() - t0:.1f}s")
 
-    # ------------------------------------------------------------------ #
     def _checkpoint_state(self, epoch: int, metrics: Optional[dict] = None) -> dict:
         state = {
             "epoch": epoch,
@@ -285,7 +376,9 @@ class Trainer:
             state["val_metrics"] = metrics
         return state
 
-    def _save_checkpoint_file(self, filename: str, epoch: int, metrics: Optional[dict] = None):
+    def _save_checkpoint_file(
+        self, filename: str, epoch: int, metrics: Optional[dict] = None
+    ):
         path = self.exp_dir / "checkpoints" / filename
         torch.save(self._checkpoint_state(epoch, metrics), path)
         print(f"[epoch {epoch}] saved checkpoint: {path}")
@@ -315,8 +408,12 @@ class Trainer:
         if state.get("epoch_numbering") == 1:
             self.best_epoch = int(state.get("best_epoch", 0))
             return stored_epoch + 1
-        # Legacy checkpoints used 0-based epoch indices.
-        self.best_epoch = int(state.get("best_epoch", -1)) + 1 if state.get("best_epoch", -1) >= 0 else 0
+
+        self.best_epoch = (
+            int(state.get("best_epoch", -1)) + 1
+            if state.get("best_epoch", -1) >= 0
+            else 0
+        )
         return stored_epoch + 2
 
     def maybe_resume(self, path: Optional[Union[str, Path]] = None) -> int:
@@ -333,6 +430,7 @@ class Trainer:
                 f"[trainer] resumed from {resume_path} "
                 f"(next epoch {start_epoch}, best psnr {self.best_psnr:.3f}{best_at})"
             )
+            self.save_training_config()
             return start_epoch
 
         self.save_training_config()

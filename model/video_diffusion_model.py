@@ -56,8 +56,13 @@ class Video_Backbone(nn.Module):
     def __init__(self, config: Optional[ModelConfig] = None, **kwargs):
         super().__init__()
         if config is None:
-            config = ModelConfig(**{k: v for k, v in kwargs.items()
-                                    if k in ModelConfig.__dataclass_fields__})
+            config = ModelConfig(
+                **{
+                    k: v
+                    for k, v in kwargs.items()
+                    if k in ModelConfig.__dataclass_fields__
+                }
+            )
         self.cfg = config
 
         self.backbone = ConditioningBackbone(
@@ -70,16 +75,14 @@ class Video_Backbone(nn.Module):
             sr_scale=config.sr_scale,
         )
 
-        self.diffusion = GaussianDiffusion(config.num_timesteps, schedule=config.schedule)
+        self.diffusion = GaussianDiffusion(
+            config.num_timesteps, schedule=config.schedule
+        )
 
-        # Embedding for the temporal frame mask (0 = masked/VFI, 1 = observed).
-        # Small dim suffices for a binary signal.
         self.mask_embed = nn.Embedding(2, config.mask_embed_dim)
 
-        # Single unified denoiser.
-        # Conditioning channels: coarse(3) + hole_mask(1) + cond(cond_dim) + mask_emb(mask_embed_dim)
         cond_ch = 3 + 1 + config.cond_dim + config.mask_embed_dim
-        # attn_levels=() — no global self-attention so inference is O(HW) not O(H²W²)
+
         self.refine_unet = ConditionalUNet(
             in_channels=3,
             cond_channels=cond_ch,
@@ -91,43 +94,28 @@ class Video_Backbone(nn.Module):
             use_checkpoint=True,
         )
 
-    # ------------------------------------------------------------------ #
-    # Conditioning helper
-    # ------------------------------------------------------------------ #
-
     def _build_cond(
         self,
-        coarse_f: torch.Tensor,     # (N*T, 3, H, W)
-        hole_mask_f: torch.Tensor,  # (N*T, 1, H, W)
-        cond_f: torch.Tensor,       # (N*T, cond_dim, H, W)
-        frame_mask_f: torch.Tensor, # (N*T,) bool — True=observed
+        coarse_f: torch.Tensor,
+        hole_mask_f: torch.Tensor,
+        cond_f: torch.Tensor,
+        frame_mask_f: torch.Tensor,
     ) -> torch.Tensor:
         """Concatenate all conditioning signals for the refine_unet."""
         h, w = coarse_f.shape[-2:]
-        # Temporal mask embedding: shape (N*T, mask_embed_dim) → broadcast spatial
-        mask_emb = self.mask_embed(frame_mask_f.long())          # (N*T, D)
+
+        mask_emb = self.mask_embed(frame_mask_f.long())
         mask_emb = mask_emb[:, :, None, None].expand(-1, -1, h, w)
         return torch.cat([coarse_f, hole_mask_f, cond_f, mask_emb], dim=1)
 
-    # ------------------------------------------------------------------ #
-    # Training
-    # ------------------------------------------------------------------ #
-
-    def compute_losses(
+    def forward(
         self,
         lq: torch.Tensor,
-        gt: torch.Tensor,
         frame_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Args:
-            lq:         (N, T, 3, h, w) degraded LR input; zeros at VFI positions.
-            gt:         (N, T, 3, H, W) clean HR target.
-            frame_mask: (N, T) bool — True = observed, False = masked (VFI).
-                        None → all frames observed.
-
-        Returns a dict with scalar tensors: ``detect``, ``v``, plus
-        non-scalar auxiliaries ``coarse`` and ``hole_logits``.
+        Forward pass for training.
+        Returns unweighted predictions and building blocks for the loss functions.
         """
         if frame_mask is None:
             frame_mask = lq.new_ones(lq.shape[:2], dtype=torch.bool)
@@ -135,45 +123,31 @@ class Video_Backbone(nn.Module):
         out = self.backbone(lq, frame_mask=frame_mask)
         coarse, cond, hole_logits = out["coarse"], out["cond"], out["hole_logits"]
 
-        coarse_f, nt = _flatten_time(coarse)      # (N*T, 3, H, W)
-        cond_f, _    = _flatten_time(cond)          # (N*T, cond_dim, H, W)
-        gt_f, _      = _flatten_time(gt)            # (N*T, 3, H, W)
-        logits_f, _  = _flatten_time(hole_logits)   # (N*T, 1, H, W)
+        coarse_f, nt = _flatten_time(coarse)
+        cond_f, _ = _flatten_time(cond)
+        logits_f, _ = _flatten_time(hole_logits)
 
-        frame_mask_f = frame_mask.reshape(-1)        # (N*T,) bool
+        frame_mask_f = frame_mask.reshape(-1)
 
-        # ---- Spatial hole mask — detected on-the-fly from LQ fill value ----
-        # DatasetCreator fills baked holes with exactly -1.0 in normalised space.
-        # VFI-masked frames are filled with 0.0, so they won't trigger this.
-        lq_f, _ = _flatten_time(lq)                 # (N*T, 3, h, w)
-        lq_hr = F.interpolate(lq_f, size=coarse_f.shape[-2:], mode="nearest") \
-                if lq_f.shape[-2:] != coarse_f.shape[-2:] else lq_f
-        # Average across channels: a pixel is a hole if all channels ≈ -1.0
+        lq_f, _ = _flatten_time(lq)
+        lq_hr = (
+            F.interpolate(lq_f, size=coarse_f.shape[-2:], mode="nearest")
+            if lq_f.shape[-2:] != coarse_f.shape[-2:]
+            else lq_f
+        )
         hole_mask_f = (lq_hr.mean(dim=1, keepdim=True) < -0.95).float()
 
-        losses: Dict[str, torch.Tensor] = {}
-
-        # ---- Hole detection (BCE) ----
-        losses["detect"] = F.binary_cross_entropy_with_logits(logits_f, hole_mask_f)
-
-        # ---- V-prediction on residual (restoration + VFI + inpainting) ----
-        residual_target = (gt_f - coarse_f).detach()
-        refine_cond = self._build_cond(coarse_f.detach(), hole_mask_f, cond_f, frame_mask_f)
-        
-        v_loss, _ = self.diffusion.training_losses(
-            self.refine_unet, residual_target,
-            model_kwargs={"cond": refine_cond},
+        refine_cond = self._build_cond(
+            coarse_f.detach(), hole_mask_f, cond_f, frame_mask_f
         )
-        losses["v"] = v_loss
 
-        # Auxiliaries (non-scalar, used by trainer for pixel/perceptual loss)
-        losses["coarse"]      = coarse
-        losses["hole_logits"] = hole_logits
-        return losses
-
-    # ------------------------------------------------------------------ #
-    # Inference
-    # ------------------------------------------------------------------ #
+        return {
+            "coarse": coarse,
+            "coarse_f": coarse_f,
+            "hole_logits_f": logits_f,
+            "hole_mask_f": hole_mask_f,
+            "refine_cond": refine_cond,
+        }
 
     @torch.no_grad()
     def restore(
@@ -202,35 +176,39 @@ class Video_Backbone(nn.Module):
         coarse, cond, hole_logits = out["coarse"], out["cond"], out["hole_logits"]
 
         coarse_f, nt = _flatten_time(coarse)
-        cond_f, _    = _flatten_time(cond)
-        logits_f, _  = _flatten_time(hole_logits)
+        cond_f, _ = _flatten_time(cond)
+        logits_f, _ = _flatten_time(hole_logits)
         frame_mask_f = frame_mask.reshape(-1)
 
         device = coarse_f.device
-        shape  = coarse_f.shape
+        shape = coarse_f.shape
 
-        # Spatial hole mask from sigmoid of hole_head output
         hole_mask_f = (torch.sigmoid(logits_f) > self.cfg.hole_threshold).float()
 
-        # LQ upsampled for hole detection (same as in training)
         lq_f, _ = _flatten_time(lq)
-        lq_hr = F.interpolate(lq_f, size=coarse_f.shape[-2:], mode="nearest") \
-                if lq_f.shape[-2:] != coarse_f.shape[-2:] else lq_f
-        # Supplement with fill-value detection for robustness
+        lq_hr = (
+            F.interpolate(lq_f, size=coarse_f.shape[-2:], mode="nearest")
+            if lq_f.shape[-2:] != coarse_f.shape[-2:]
+            else lq_f
+        )
+
         fill_holes = (lq_hr.mean(dim=1, keepdim=True) < -0.95).float()
         hole_mask_f = torch.maximum(hole_mask_f, fill_holes)
 
         refine_cond = self._build_cond(coarse_f, hole_mask_f, cond_f, frame_mask_f)
         residual = self.diffusion.ddim_sample(
-            self.refine_unet, shape, refine_steps,
+            self.refine_unet,
+            shape,
+            refine_steps,
             model_kwargs={"cond": refine_cond},
             device=device,
         )
         refined = torch.clamp(coarse_f + residual, -1.0, 1.0)
         return _unflatten_time(refined, nt)
 
-    def forward(self, lq: torch.Tensor,
-                frame_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, lq: torch.Tensor, frame_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return self.restore(lq, frame_mask=frame_mask)
 
 
@@ -241,34 +219,47 @@ def build_model(config: Optional[ModelConfig] = None, **kwargs) -> Video_Backbon
 if __name__ == "__main__":
     torch.manual_seed(0)
     cfg = ModelConfig(
-        num_timesteps=50, refine_steps=2,
-        num_block=1, embed_dim=32, d_state=8,
+        num_timesteps=50,
+        refine_steps=2,
+        num_block=1,
+        embed_dim=32,
+        d_state=8,
     )
     net = Video_Backbone(cfg)
     n, t, h, w = 1, 4, 32, 32
     hr = h * cfg.sr_scale
 
-    # Restoration only (no masking)
-    lq   = torch.randn(n, t, 3, h, w).clamp(-1, 1)
-    gt   = torch.randn(n, t, 3, hr, hr).clamp(-1, 1)
+    lq = torch.randn(n, t, 3, h, w).clamp(-1, 1)
+    gt = torch.randn(n, t, 3, hr, hr).clamp(-1, 1)
     losses = net.compute_losses(lq, gt)
     total = losses["detect"] + losses["v"]
     total.backward()
-    print("restoration losses:", {k: float(v.detach()) for k, v in losses.items()
-                                   if torch.is_tensor(v) and v.dim() == 0})
+    print(
+        "restoration losses:",
+        {
+            k: float(v.detach())
+            for k, v in losses.items()
+            if torch.is_tensor(v) and v.dim() == 0
+        },
+    )
 
-    # VFI: frame index 2 is masked
-    mask   = torch.ones(n, t, dtype=torch.bool)
+    mask = torch.ones(n, t, dtype=torch.bool)
     mask[0, 2] = False
     lq_vfi = lq.clone()
-    lq_vfi[:, 2] = 0.0    # zero fill at masked position
+    lq_vfi[:, 2] = 0.0
 
     net.zero_grad()
     losses_vfi = net.compute_losses(lq_vfi, gt, frame_mask=mask)
     total_vfi = losses_vfi["detect"] + losses_vfi["v"]
     total_vfi.backward()
-    print("VFI losses:", {k: float(v.detach()) for k, v in losses_vfi.items()
-                           if torch.is_tensor(v) and v.dim() == 0})
+    print(
+        "VFI losses:",
+        {
+            k: float(v.detach())
+            for k, v in losses_vfi.items()
+            if torch.is_tensor(v) and v.dim() == 0
+        },
+    )
 
     with torch.no_grad():
         y = net.restore(lq_vfi, frame_mask=mask)
