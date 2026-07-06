@@ -237,7 +237,7 @@ class VideoFrameDataset(Dataset):
         ly, lx, lph, lpw = gy // sr, gx // sr, ph // sr, pw // sr
 
         frame_mask = _sample_frame_mask(
-            self.num_frame, self.vfi_mask_ratio, self.vfi_prob, self.is_train
+            len(window), self.vfi_mask_ratio, self.vfi_prob, self.is_train
         )
 
         window_gt_bgrs = []
