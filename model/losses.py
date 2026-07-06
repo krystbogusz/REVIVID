@@ -1,5 +1,8 @@
 """Loss functions for REVIVID training (pure diffusion model, no GAN).
 
+Every loss is its own ``nn.Module`` class — there are no free-standing helper
+functions:
+
 * ``CharbonnierLoss`` - robust L1 used for the coarse restoration.
 * ``VGGPerceptualLoss`` - VGG19 feature loss.
 * ``HoleDetectionLoss`` - BCE for the persistent-hole detector.

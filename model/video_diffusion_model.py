@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from .backbone import ConditioningBackbone
 from .config import ModelConfig
 from .diffusion import GaussianDiffusion
-from .losses import VGGPerceptualLoss, charbonnier_loss
+from .losses import CharbonnierLoss, DiffusionLoss, HoleDetectionLoss
 from .unet import ConditionalUNet
 
 
@@ -206,14 +206,30 @@ class Video_Backbone(nn.Module):
         refined = torch.clamp(coarse_f + residual, -1.0, 1.0)
         return _unflatten_time(refined, nt)
 
-    def forward(
-        self, lq: torch.Tensor, frame_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        return self.restore(lq, frame_mask=frame_mask)
-
 
 def build_model(config: Optional[ModelConfig] = None, **kwargs) -> Video_Backbone:
     return Video_Backbone(config=config, **kwargs)
+
+
+def _selftest_losses(
+    net: "Video_Backbone",
+    lq: torch.Tensor,
+    gt: torch.Tensor,
+    frame_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Mirror the trainer's loss wiring for a quick forward/backward smoke test."""
+    out = net(lq, frame_mask)
+
+    n, t, c, hr_h, hr_w = gt.shape
+    gt_f = gt.reshape(n * t, c, hr_h, hr_w)
+    residual_target = (gt_f - out["coarse_f"]).detach()
+
+    loss_pix = CharbonnierLoss()(out["coarse"], gt)
+    loss_detect = HoleDetectionLoss()(out["hole_logits_f"], out["hole_mask_f"])
+    loss_v = DiffusionLoss()(
+        net.diffusion, net.refine_unet, residual_target, out["refine_cond"]
+    )
+    return {"pix": loss_pix, "detect": loss_detect, "v": loss_v}
 
 
 if __name__ == "__main__":
@@ -231,16 +247,12 @@ if __name__ == "__main__":
 
     lq = torch.randn(n, t, 3, h, w).clamp(-1, 1)
     gt = torch.randn(n, t, 3, hr, hr).clamp(-1, 1)
-    losses = net.compute_losses(lq, gt)
-    total = losses["detect"] + losses["v"]
+    losses = _selftest_losses(net, lq, gt)
+    total = losses["pix"] + losses["detect"] + losses["v"]
     total.backward()
     print(
         "restoration losses:",
-        {
-            k: float(v.detach())
-            for k, v in losses.items()
-            if torch.is_tensor(v) and v.dim() == 0
-        },
+        {k: float(v.detach()) for k, v in losses.items()},
     )
 
     mask = torch.ones(n, t, dtype=torch.bool)
@@ -249,16 +261,12 @@ if __name__ == "__main__":
     lq_vfi[:, 2] = 0.0
 
     net.zero_grad()
-    losses_vfi = net.compute_losses(lq_vfi, gt, frame_mask=mask)
-    total_vfi = losses_vfi["detect"] + losses_vfi["v"]
+    losses_vfi = _selftest_losses(net, lq_vfi, gt, frame_mask=mask)
+    total_vfi = losses_vfi["pix"] + losses_vfi["detect"] + losses_vfi["v"]
     total_vfi.backward()
     print(
         "VFI losses:",
-        {
-            k: float(v.detach())
-            for k, v in losses_vfi.items()
-            if torch.is_tensor(v) and v.dim() == 0
-        },
+        {k: float(v.detach()) for k, v in losses_vfi.items()},
     )
 
     with torch.no_grad():

@@ -2,12 +2,26 @@
 #
 # One diffusion network handles all three tasks simultaneously:
 #   1. Restoration  — remove degradations (scratches, noise, blur, compression)
-#   2. SR           — 2× super-resolution via PixelShuffle in the backbone
+#   2. SR           — 4× super-resolution via PixelShuffle in the backbone
 #   3. VFI          — generate masked intermediate frames (temporal inpainting)
 #
 # Persistent spatial holes (baked by DatasetCreator for test clips and a fraction
 # of train clips) are detected on-the-fly from the LQ fill value (-1.0) and fed
 # as an explicit conditioning channel to the single refine UNet.
+#
+# ============================================================================ #
+# CURRICULUM — training from scratch in two phases (this file = PHASE 1)
+# ---------------------------------------------------------------------------- #
+# PHASE 1 (ACTIVE): restoration + SR only.
+#   * holes OFF  (model.hole_prob = 0.0, loss_weights.detect = 0.0)
+#   * VFI   OFF  (model.vfi_prob  = 0.0, loss_weights.vfi    = 0.0)
+#   Trains the backbone + diffusion head on degraded->clean HR pairs.
+#
+# PHASE 2 (later): add inpainting of large holes + VFI, resuming PHASE 1 weights.
+#   Flip the values marked "PHASE 2" below, keep training (latest.pth is resumed
+#   automatically). No dataset regeneration needed — holes/VFI are applied
+#   on-the-fly by the DataLoader from these probabilities.
+# ============================================================================ #
 #
 # Data locations are fixed by the pipeline and NOT configured here:
 #   sources.yaml → downloader → data/raw/
@@ -48,11 +62,11 @@ model:
   hole_threshold: 0.5
 
   # VFI — temporal masked frame prediction (on-the-fly in DataLoader)
-  vfi_prob: 0.5           # probability a training clip has ≥1 masked frames
-  vfi_mask_ratio: 0.3     # max fraction of inner frames that may be masked
+  vfi_prob: 0.0           # PHASE 1: OFF. PHASE 2: 0.5 (prob a clip has ≥1 masked frames)
+  vfi_mask_ratio: 0.3     # max fraction of inner frames that may be masked (PHASE 2)
 
   # Persistent spatial holes (baked per window by DatasetCreator / DataLoader)
-  hole_prob: 0.2          # probability a training window has holes burned in
+  hole_prob: 0.0          # PHASE 1: OFF. PHASE 2: 0.2 (prob a window has holes burned in)
 
 # --------------------------------------------------------------------------- #
 # Training
@@ -69,16 +83,29 @@ training:
   beta1: 0.9
   beta2: 0.99
 
+  # Learning-rate scheduler (stepped once per epoch).
+  #   type: cosine | step | plateau | none
+  scheduler:
+    type: cosine          # cosine annealing from lr -> eta_min over training
+    warmup_epochs: 20     # linear warmup 0 -> lr (ignored for plateau)
+    eta_min: 0.000001     # floor LR (cosine / plateau min_lr)
+    # step scheduler only:
+    step_size: 1000       # epochs between LR drops
+    gamma: 0.5            # multiplicative drop factor
+    # plateau scheduler only (monitors validation PSNR, mode=max):
+    factor: 0.5           # LR *= factor on plateau
+    patience: 50          # epochs without PSNR improvement before dropping
+
   use_perceptual: true
   use_amp: false
 
   loss_weights:
-    pix: 1.0
-    perceptual: 1.0
-    detect: 0.05          # BCE on spatial hole_head (temporarily off for initial SR training)
-    v: 1.0                # single v-prediction loss (restoration + VFI + inpainting)
-    fft: 0.1              # Focal Frequency loss to recover high-frequency details and avoid watercolor
-    vfi: 0.05              # targeted Charbonnier for missing frames (temporarily off)
+    pix: 1.0              # Charbonnier on coarse restoration (backbone)
+    perceptual: 1.0       # VGG perceptual on coarse
+    detect: 0.0           # PHASE 1: OFF (no holes). PHASE 2: 0.05 — BCE on hole_head
+    v: 1.0                # v-prediction diffusion loss (restoration + SR now, + VFI/inpaint later)
+    fft: 0.1              # Focal Frequency loss — recover high-frequency detail, avoid watercolor
+    vfi: 0.0              # PHASE 1: OFF. PHASE 2: 0.05+ — targeted Charbonnier on masked frames
 
   num_workers: 4
 
