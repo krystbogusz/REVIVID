@@ -72,12 +72,12 @@ model:
 # Training
 # --------------------------------------------------------------------------- #
 training:
-  epochs: 4000
+  epochs: 2000
   batch_size: 1
   num_frame: 7
 
   # Random GT crop for training (LR crop = patch_size / sr_scale).
-  patch_size: 512
+  patch_size: 400
 
   lr: 0.0002
   beta1: 0.9
@@ -101,13 +101,13 @@ training:
 
   loss_weights:
     pix: 1.0              # Charbonnier on coarse restoration (backbone)
-    perceptual: 1.0       # VGG perceptual on coarse
+    perceptual: 0.1       # VGG perceptual on coarse
     detect: 0.0           # PHASE 1: OFF (no holes). PHASE 2: 0.05 — BCE on hole_head
     v: 1.0                # v-prediction diffusion loss (restoration + SR now, + VFI/inpaint later)
-    fft: 0.1              # Focal Frequency loss — recover high-frequency detail, avoid watercolor
+    fft: 1.0              # Focal Frequency loss — recover high-frequency detail, avoid watercolor
     vfi: 0.0              # PHASE 1: OFF. PHASE 2: 0.05+ — targeted Charbonnier on masked frames
 
-  num_workers: 4
+  num_workers: 10
 
   # On-the-fly degradation (textures cached once per DataLoader worker).
   # Default directory: data/raw/noise_data
@@ -118,13 +118,21 @@ training:
 # Validation / logging
 # --------------------------------------------------------------------------- #
 validation:
-  # Validation runs every epoch on the full validation set.
+  # NOTE: this is a diffusion model — each validation window costs `refine_steps`
+  # DDIM forward passes, so full-resolution validation every epoch is very slow.
+  # The knobs below trade a bit of metric fidelity for a big speedup.
+
   # HR crop for validation (center crop). 0 = full frames — DDIM at native
-  # REDS resolution (~1280×720) will OOM on most GPUs. Defaults to training patch_size.
-  patch_size: 0
-  num_workers: 2         # DataLoader workers for validation (0 = main process)
+  # REDS resolution (~1280×720) is very slow / may OOM. A crop is MUCH faster.
+  patch_size: 400        # e.g. 256; set 0 for full-frame validation
+
+  val_every: 10          # run validation every N epochs (1 = every epoch)
+  max_clips: 0           # cap number of validation clips (0 = all)
+  max_frames: 35          # cap frames evaluated per clip (0 = all)
+  refine_steps: 0        # DDIM steps during validation (0 = model default, e.g. 8)
+  num_workers: 5         # DataLoader workers for validation (0 = main process)
 
 logging:
-  log_every: 50
+  log_every: 120
   exp_dir: ./experiments/revivid
   save_checkpoint_every: 100   # numbered + latest checkpoints (not every epoch)

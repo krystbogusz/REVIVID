@@ -56,6 +56,13 @@ class Trainer:
         self.val_cfg = cfg.get("validation", {})
         self.log_cfg = cfg.get("logging", {})
 
+        # Validation cost controls (validation on a diffusion model is expensive:
+        # every window costs `refine_steps` DDIM forward passes).
+        self.val_every = max(1, int(self.val_cfg.get("val_every", 1)))
+        self.val_max_clips = int(self.val_cfg.get("max_clips", 0))
+        self.val_max_frames = int(self.val_cfg.get("max_frames", 0))
+        self.val_refine_steps = int(self.val_cfg.get("refine_steps", 0))
+
         self.device = torch.device("cuda")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU is required. No CUDA device found.")
@@ -304,11 +311,14 @@ class Trainer:
 
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
         window_size = int(self.train_cfg.get("num_frame", 7))
+        refine_steps = self.val_refine_steps or None
 
         try:
             total_clips = len(val_loader)
         except TypeError:
             total_clips = None
+        if self.val_max_clips > 0 and total_clips is not None:
+            total_clips = min(total_clips, self.val_max_clips)
         desc = f"Val {epoch}" if epoch is not None else "Validation"
         vbar = tqdm(
             val_loader,
@@ -320,10 +330,17 @@ class Trainer:
         )
 
         for batch in vbar:
+            if self.val_max_clips > 0 and count >= self.val_max_clips:
+                break
+
             lq = batch["lq"]
             gt = batch["gt"]
 
             all_len = lq.shape[1]
+            if self.val_max_frames > 0:
+                all_len = min(all_len, self.val_max_frames)
+                lq = lq[:, :all_len]
+                gt = gt[:, :all_len]
             all_output = []
 
             for i in range(0, all_len, window_size):
@@ -331,7 +348,7 @@ class Trainer:
                 part_lq = lq[:, i:end].to(self.device, non_blocking=True)
 
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    part_out = self.net.restore(part_lq)
+                    part_out = self.net.restore(part_lq, refine_steps=refine_steps)
 
                 all_output.append(part_out.detach().cpu())
                 del part_lq, part_out
@@ -440,7 +457,10 @@ class Trainer:
             pbar.close()
 
             metrics = None
-            if val_loader is not None:
+            do_validate = val_loader is not None and (
+                epoch % self.val_every == 0 or epoch == total_epochs
+            )
+            if do_validate:
                 metrics = self.validate(val_loader, epoch=epoch)
                 print(
                     f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}"
