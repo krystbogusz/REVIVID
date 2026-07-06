@@ -434,6 +434,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     sr_scale = int(trainer.model_cfg.sr_scale)
     patch_size = int(tc.get("patch_size", 0))
     val_patch_size = int(val_cfg.get("patch_size", patch_size))
+    val_num_workers = int(val_cfg.get("num_workers", 0))
     texture_dir = tc.get("texture_dir")
 
     build_texture_mmap(texture_dir)
@@ -454,7 +455,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     try:
         val_loader = get_valid_loader(
             num_frame=num_frame,
-            num_workers=0,
+            num_workers=val_num_workers,
             vfi_prob=vfi_prob,
             vfi_mask_ratio=vfi_mask_ratio,
             sr_scale=sr_scale,

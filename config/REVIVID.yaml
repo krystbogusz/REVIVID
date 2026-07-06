@@ -122,6 +122,7 @@ validation:
   # HR crop for validation (center crop). 0 = full frames — DDIM at native
   # REDS resolution (~1280×720) will OOM on most GPUs. Defaults to training patch_size.
   patch_size: 0
+  num_workers: 2         # DataLoader workers for validation (0 = main process)
 
 logging:
   log_every: 50

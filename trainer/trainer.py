@@ -295,7 +295,7 @@ class Trainer:
         return log
 
     @torch.no_grad()
-    def validate(self, val_loader) -> dict:
+    def validate(self, val_loader, epoch: Optional[int] = None) -> dict:
         """Run validation on the full validation set (MambaOFR style windowing)."""
         self.net.eval()
         if self.device.type == "cuda":
@@ -305,7 +305,21 @@ class Trainer:
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
         window_size = int(self.train_cfg.get("num_frame", 7))
 
-        for batch in val_loader:
+        try:
+            total_clips = len(val_loader)
+        except TypeError:
+            total_clips = None
+        desc = f"Val {epoch}" if epoch is not None else "Validation"
+        vbar = tqdm(
+            val_loader,
+            total=total_clips,
+            desc=desc,
+            unit="clip",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+        for batch in vbar:
             lq = batch["lq"]
             gt = batch["gt"]
 
@@ -332,7 +346,13 @@ class Trainer:
             ssim_sum += m["ssim"]
             count += 1
 
+            vbar.set_postfix(
+                psnr=f"{psnr_sum / count:.3f}", ssim=f"{ssim_sum / count:.4f}"
+            )
+
             del lq, gt, full_out, all_output
+
+        vbar.close()
 
         count = max(count, 1)
         return {"psnr": psnr_sum / count, "ssim": ssim_sum / count}
@@ -421,7 +441,7 @@ class Trainer:
 
             metrics = None
             if val_loader is not None:
-                metrics = self.validate(val_loader)
+                metrics = self.validate(val_loader, epoch=epoch)
                 print(
                     f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}"
                 )
