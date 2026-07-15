@@ -18,31 +18,45 @@ model:
   schedule: cosine
   refine_steps: 8
   hole_threshold: 0.5
-  vfi_prob: 0.5
+  vfi_prob: 0.0
   vfi_mask_ratio: 0.3
-  hole_prob: 0.15
+  hole_prob: 0.0
 training:
-  epochs: 2
-  batch_size: 2
+  epochs: 2000
+  batch_size: 1
   num_frame: 7
-  patch_size: 256
+  patch_size: 400
   lr: 0.0002
   beta1: 0.9
   beta2: 0.99
+  scheduler:
+    type: cosine
+    warmup_epochs: 20
+    eta_min: 1.0e-06
+    step_size: 1000
+    gamma: 0.5
+    factor: 0.5
+    patience: 50
   use_perceptual: true
-  use_amp: true
+  use_amp: false
   loss_weights:
-    pix: 100.0
-    perceptual: 1.0
-    detect: 0.5
+    pix: 1.0
+    perceptual: 0.1
+    detect: 0.0
     v: 1.0
-  num_workers: 4
+    fft: 1.0
+    vfi: 0.0
+  num_workers: 10
   use_flip: true
   use_rot: true
 validation:
-  # Validation runs every epoch on the full validation set.
-  patch_size: 256
+  patch_size: 400
+  val_every: 10
+  max_clips: 0
+  max_frames: 35
+  refine_steps: 0
+  num_workers: 5
 logging:
-  log_every: 50
+  log_every: 120
   exp_dir: ./experiments/revivid
-  save_checkpoint_every: 50
+  save_checkpoint_every: 100
