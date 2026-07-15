@@ -226,7 +226,7 @@ def _selftest_losses(
 
     loss_pix = CharbonnierLoss()(out["coarse"], gt)
     loss_detect = HoleDetectionLoss()(out["hole_logits_f"], out["hole_mask_f"])
-    loss_v = DiffusionLoss()(
+    loss_v, _ = DiffusionLoss()(
         net.diffusion, net.refine_unet, residual_target, out["refine_cond"]
     )
     return {"pix": loss_pix, "detect": loss_detect, "v": loss_v}

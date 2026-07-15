@@ -8,10 +8,11 @@ It performs joint optimization of:
     * the coarse restoration (charbonnier + optional VGG perceptual),
     * the persistent-hole detector (BCE),
     * the v-prediction diffusion head,
-with AMP mixed precision, a per-epoch LR scheduler (cosine / step / plateau,
-configurable via ``training.scheduler``), checkpointing and PSNR/SSIM validation
-(DDIM sampling). This is a pure diffusion model - there is no adversarial / GAN
-component.
+    * sharpness losses (perceptual / frequency / gradient) on the final refined
+      output to combat over-smoothing.
+The learning rate is constant (no scheduler). Training uses AMP mixed precision,
+checkpointing and PSNR/SSIM validation (DDIM sampling). This is a pure diffusion
+model - there is no adversarial / GAN component.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from model.losses import (
     CharbonnierLoss,
     DiffusionLoss,
     FocalFrequencyLoss,
+    GradientLoss,
     HoleDetectionLoss,
     MaskedReconstructionLoss,
     VGGPerceptualLoss,
@@ -66,7 +68,7 @@ class Trainer:
         self.device = torch.device("cuda")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU is required. No CUDA device found.")
-        torch.manual_seed(int(cfg.get("seed", 2021)))
+        torch.manual_seed(int(cfg.get("seed", 2026)))
 
         self.exp_dir = Path(self.log_cfg.get("exp_dir", "./experiments/revivid"))
         (self.exp_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -77,14 +79,17 @@ class Trainer:
 
         default_w = {
             "pix": 1.0,
-            "perceptual": 1.0,
-            "detect": 0.5,
+            "perceptual": 0.1,
+            "detect": 2.0,
             "v": 1.0,
-            "fft": 0.1,
-            "vfi": 10.0,
+            "vfi": 2.0,
+            "refine_perceptual": 0.1,
+            "refine_fft": 0.5,
+            "refine_grad": 0.5,
         }
         default_w.update(self.train_cfg.get("loss_weights", {}) or {})
         self.weights = default_w
+        self.refine_snr_weight = bool(self.train_cfg.get("refine_snr_weight", True))
 
         self.loss_pix = CharbonnierLoss().to(self.device)
         self.use_perceptual = bool(self.train_cfg.get("use_perceptual", True))
@@ -94,6 +99,7 @@ class Trainer:
         self.loss_detect = HoleDetectionLoss().to(self.device)
         self.loss_diffusion = DiffusionLoss().to(self.device)
         self.loss_fft = FocalFrequencyLoss().to(self.device)
+        self.loss_grad = GradientLoss().to(self.device)
         self.loss_vfi = MaskedReconstructionLoss().to(self.device)
 
         lr = float(self.train_cfg.get("lr", 2e-4))
@@ -104,11 +110,6 @@ class Trainer:
         self.optimizer_g = torch.optim.AdamW(self._param_groups(lr), lr=lr, betas=betas)
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
 
-        self.base_lr = lr
-        self.total_epochs = int(self.train_cfg.get("epochs", 20))
-        self.scheduler_type = "none"
-        self.scheduler = self._build_scheduler()
-
         self.use_amp = bool(self.train_cfg.get("use_amp", True))
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.iteration = 0
@@ -117,79 +118,6 @@ class Trainer:
 
     def _param_groups(self, lr: float):
         return [p for p in self.net.parameters() if p.requires_grad]
-
-    def _build_scheduler(self):
-        """Build the LR scheduler (stepped once per epoch) from config.
-
-        ``training.scheduler.type``:
-            * ``cosine``  — CosineAnnealingLR (lr → eta_min) with optional
-                            linear warmup.
-            * ``step``    — StepLR (drop by ``gamma`` every ``step_size`` epochs).
-            * ``plateau`` — ReduceLROnPlateau on validation PSNR (mode=max).
-            * ``none``    — no scheduling (constant LR).
-        """
-        sch_cfg = self.train_cfg.get("scheduler", {}) or {}
-        sch_type = str(sch_cfg.get("type", "none")).lower()
-        self.scheduler_type = sch_type
-
-        if sch_type in ("none", "off", ""):
-            self.scheduler_type = "none"
-            return None
-
-        opt = self.optimizer_g
-        epochs = self.total_epochs
-        warmup = max(0, int(sch_cfg.get("warmup_epochs", 0)))
-        eta_min = float(sch_cfg.get("eta_min", self.base_lr * 0.01))
-
-        if sch_type == "plateau":
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt,
-                mode="max",
-                factor=float(sch_cfg.get("factor", 0.5)),
-                patience=int(sch_cfg.get("patience", 50)),
-                min_lr=eta_min,
-            )
-
-        if sch_type == "cosine":
-            t_max = max(1, epochs - warmup)
-            main = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=t_max, eta_min=eta_min
-            )
-        elif sch_type == "step":
-            step_size = max(1, int(sch_cfg.get("step_size", max(1, epochs // 4))))
-            gamma = float(sch_cfg.get("gamma", 0.5))
-            main = torch.optim.lr_scheduler.StepLR(
-                opt, step_size=step_size, gamma=gamma
-            )
-        else:
-            raise ValueError(
-                f"Unknown scheduler type '{sch_type}'. "
-                f"Use one of: cosine, step, plateau, none."
-            )
-
-        if warmup > 0:
-            warm = torch.optim.lr_scheduler.LinearLR(
-                opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup
-            )
-            return torch.optim.lr_scheduler.SequentialLR(
-                opt, schedulers=[warm, main], milestones=[warmup]
-            )
-        return main
-
-    def _step_scheduler(self, epoch: int, metrics: Optional[dict]) -> None:
-        """Advance the LR scheduler once per epoch and log the new LR."""
-        if self.scheduler is None:
-            return
-
-        if self.scheduler_type == "plateau":
-            if metrics is None:
-                return
-            self.scheduler.step(metrics["psnr"])
-        else:
-            self.scheduler.step()
-
-        cur_lr = self.optimizer_g.param_groups[0]["lr"]
-        print(f"[epoch {epoch}] lr -> {cur_lr:.3e}")
 
     def _coarse_perceptual(
         self, coarse: torch.Tensor, gt: torch.Tensor
@@ -236,30 +164,61 @@ class Trainer:
 
             loss_pix = self.loss_pix(coarse, gt)
             loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
-            loss_v = self.loss_diffusion(
+            loss_v, diff_info = self.loss_diffusion(
                 self.net.diffusion,
                 self.net.refine_unet,
                 residual_target,
                 out["refine_cond"],
             )
-            loss_fft = self.loss_fft(coarse, gt)
             loss_vfi = self.loss_vfi(coarse, gt, frame_mask)
+
+            # Sharpness losses on the FINAL refiner output (coarse + predicted
+            # residual). x0_pred is the diffusion estimate of the clean residual;
+            # coarse is detached so these losses train the refiner (and the
+            # backbone `cond` features), not the coarse branch.
+            refined_pred = torch.clamp(
+                coarse_f.detach() + diff_info["x0_pred"], -1.0, 1.0
+            )
+            loss_r_fft = self.loss_fft(refined_pred, gt_f)
+            loss_r_grad = self.loss_grad(refined_pred, gt_f)
+            if self.use_perceptual:
+                loss_r_perc = self.loss_perceptual(refined_pred, gt_f)
+            else:
+                loss_r_perc = coarse_f.new_zeros(())
+
+            # Down-weight the refined losses when x0_pred is unreliable (high
+            # noise / large timestep); alphas_cumprod[t] ~ 1 at low noise, ~ 0
+            # at high noise.
+            if self.refine_snr_weight:
+                w_snr = self.net.diffusion.alphas_cumprod[
+                    diff_info["t"]
+                ].float().mean()
+            else:
+                w_snr = coarse_f.new_ones(())
 
             total = (
                 w["pix"] * loss_pix
                 + w["detect"] * loss_detect
                 + w["v"] * loss_v
-                + w["fft"] * loss_fft
                 + w["vfi"] * loss_vfi
+                + w_snr
+                * (
+                    w["refine_perceptual"] * loss_r_perc
+                    + w["refine_fft"] * loss_r_fft
+                    + w["refine_grad"] * loss_r_grad
+                )
             )
 
             log = {
                 "loss_pix": float(loss_pix.detach()),
                 "loss_detect": float(loss_detect.detach()),
                 "loss_v": float(loss_v.detach()),
-                "loss_fft": float(loss_fft.detach()),
                 "loss_vfi": float(loss_vfi.detach()),
+                "loss_r_fft": float(loss_r_fft.detach()),
+                "loss_r_grad": float(loss_r_grad.detach()),
             }
+            if self.use_perceptual:
+                log["loss_r_perc"] = float(loss_r_perc.detach())
 
             if self.use_perceptual:
                 loss_perc = self._coarse_perceptual(coarse, gt)
@@ -471,8 +430,6 @@ class Trainer:
                     self._save_checkpoint_file("best.pth", epoch, metrics)
                     self._save_validation_sample(epoch, val_loader, tag="best")
 
-            self._step_scheduler(epoch, metrics)
-
             is_last = epoch == total_epochs
             if epoch % save_every == 0 or is_last:
                 self._save_checkpoint(epoch, metrics)
@@ -488,9 +445,6 @@ class Trainer:
             "iteration": self.iteration,
             "model": self.net.state_dict(),
             "optimizer_g": self.optimizer_g.state_dict(),
-            "scheduler": (
-                self.scheduler.state_dict() if self.scheduler is not None else None
-            ),
             "scaler": self.scaler.state_dict(),
             "model_config": self.model_cfg.to_dict(),
             "config": self.cfg,
@@ -525,8 +479,6 @@ class Trainer:
         self.net.load_state_dict(state["model"], strict=strict)
         if "optimizer_g" in state:
             self.optimizer_g.load_state_dict(state["optimizer_g"])
-        if self.scheduler is not None and state.get("scheduler") is not None:
-            self.scheduler.load_state_dict(state["scheduler"])
         if "scaler" in state and self.use_amp:
             self.scaler.load_state_dict(state["scaler"])
         self.iteration = state.get("iteration", 0)

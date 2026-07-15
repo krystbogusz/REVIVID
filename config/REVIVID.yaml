@@ -79,22 +79,9 @@ training:
   # Random GT crop for training (LR crop = patch_size / sr_scale).
   patch_size: 400
 
-  lr: 0.0002
+  lr: 0.0002              # constant learning rate (no scheduler)
   beta1: 0.9
   beta2: 0.99
-
-  # Learning-rate scheduler (stepped once per epoch).
-  #   type: cosine | step | plateau | none
-  scheduler:
-    type: cosine          # cosine annealing from lr -> eta_min over training
-    warmup_epochs: 20     # linear warmup 0 -> lr (ignored for plateau)
-    eta_min: 0.000001     # floor LR (cosine / plateau min_lr)
-    # step scheduler only:
-    step_size: 1000       # epochs between LR drops
-    gamma: 0.5            # multiplicative drop factor
-    # plateau scheduler only (monitors validation PSNR, mode=max):
-    factor: 0.5           # LR *= factor on plateau
-    patience: 50          # epochs without PSNR improvement before dropping
 
   use_perceptual: true
   use_amp: false
@@ -104,8 +91,12 @@ training:
     perceptual: 0.1       # VGG perceptual on coarse
     detect: 0.0           # PHASE 1: OFF (no holes). PHASE 2: 0.05 — BCE on hole_head
     v: 1.0                # v-prediction diffusion loss (restoration + SR now, + VFI/inpaint later)
-    fft: 1.0              # Focal Frequency loss — recover high-frequency detail, avoid watercolor
     vfi: 0.0              # PHASE 1: OFF. PHASE 2: 0.05+ — targeted Charbonnier on masked frames
+    # Sharpness losses on the FINAL refined output (coarse + predicted residual):
+    refine_perceptual: 0.1 # VGG perceptual on refined
+    refine_fft: 0.5        # frequency-domain loss on refined (recover fine texture)
+    refine_grad: 0.5       # Sobel gradient loss on refined (crisp edges)
+  refine_snr_weight: true  # scale refined losses by alphas_cumprod[t] (down-weight noisy x0_pred)
 
   num_workers: 10
 

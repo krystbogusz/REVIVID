@@ -8,6 +8,7 @@ functions:
 * ``HoleDetectionLoss`` - BCE for the persistent-hole detector.
 * ``DiffusionLoss`` - wrapper for V-prediction diffusion step.
 * ``FocalFrequencyLoss`` - L1 distance in spectral/frequency domain to combat oversmoothing.
+* ``GradientLoss`` - L1 on Sobel gradients; penalises soft/blurry edges directly.
 * ``MaskedReconstructionLoss`` - targeted Charbonnier for missing VFI frames.
 """
 
@@ -71,12 +72,12 @@ class DiffusionLoss(nn.Module):
         residual_target: torch.Tensor,
         cond: torch.Tensor,
     ) -> torch.Tensor:
-        loss, _ = diffusion_obj.training_losses(
+        loss, info = diffusion_obj.training_losses(
             refine_unet,
             residual_target,
             model_kwargs={"cond": cond},
         )
-        return loss
+        return loss, info
 
 
 class FocalFrequencyLoss(nn.Module):
@@ -92,6 +93,35 @@ class FocalFrequencyLoss(nn.Module):
         target_amp = torch.abs(target_fft)
 
         return F.l1_loss(pred_amp, target_amp)
+
+
+class GradientLoss(nn.Module):
+    """L1 on Sobel image gradients.
+
+    Plain pixel losses (Charbonnier / MSE) tolerate blur — a soft edge is only
+    "slightly wrong" per pixel. Comparing spatial gradients instead makes blur
+    expensive: a blurry edge has much weaker gradient magnitude than a sharp
+    one, so this loss directly pushes the output towards crisp edges.
+    """
+
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
+        self.register_buffer("kx", kx.view(1, 1, 3, 3))
+        self.register_buffer("ky", kx.t().contiguous().view(1, 1, 3, 3))
+
+    def _grad(self, x: torch.Tensor):
+        c = x.shape[1]
+        kx = self.kx.expand(c, 1, 3, 3).contiguous()
+        ky = self.ky.expand(c, 1, 3, 3).contiguous()
+        gx = F.conv2d(x, kx, padding=1, groups=c)
+        gy = F.conv2d(x, ky, padding=1, groups=c)
+        return gx, gy
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pgx, pgy = self._grad(pred)
+        tgx, tgy = self._grad(target)
+        return F.l1_loss(pgx, tgx) + F.l1_loss(pgy, tgy)
 
 
 class VGGPerceptualLoss(nn.Module):
