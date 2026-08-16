@@ -44,7 +44,17 @@ def _load_model(
         model_cfg = ModelConfig.from_dict(cfg.get("model", {}))
 
     net = Video_Backbone(model_cfg).to(device)
-    net.load_state_dict(state["model"], strict=True)
+
+    # Prefer the EMA weights when the checkpoint carries them — they give
+    # smoother, higher-metric outputs than the raw training weights.
+    weights = state["model"]
+    ema = state.get("ema")
+    shadow = ema.get("shadow") if isinstance(ema, dict) else None
+    if shadow:
+        weights = {**weights, **shadow}
+        print("[restore_video] using EMA weights")
+
+    net.load_state_dict(weights, strict=True)
     net.eval()
     return net
 
@@ -106,8 +116,11 @@ def main():
     parser.add_argument(
         "--refine-steps",
         type=int,
-        default=None,
-        help="DDIM denoising steps at inference (default: value from model config).",
+        default=25,
+        help=(
+            "DDIM denoising steps for the final render (default: 25 — more "
+            "than the fast validation default, for crisper residual detail)."
+        ),
     )
     parser.add_argument(
         "--downscale-factor",
@@ -141,7 +154,8 @@ def main():
     print(f"[restore_video] loading model from: {checkpoint}")
     net = _load_model(str(checkpoint), args.config, device)
     sr_scale = net.cfg.sr_scale
-    print(f"[restore_video] sr_scale={sr_scale}, refine_steps={net.cfg.refine_steps}")
+    steps = args.refine_steps or net.cfg.refine_steps
+    print(f"[restore_video] sr_scale={sr_scale}, refine_steps={steps}")
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
