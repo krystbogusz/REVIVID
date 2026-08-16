@@ -29,14 +29,6 @@ training:
   lr: 0.0002
   beta1: 0.9
   beta2: 0.99
-  scheduler:
-    type: cosine
-    warmup_epochs: 20
-    eta_min: 1.0e-06
-    step_size: 1000
-    gamma: 0.5
-    factor: 0.5
-    patience: 50
   use_perceptual: true
   use_amp: false
   loss_weights:
@@ -44,8 +36,11 @@ training:
     perceptual: 0.1
     detect: 0.0
     v: 1.0
-    fft: 1.0
     vfi: 0.0
+    refine_perceptual: 0.1
+    refine_fft: 0.5
+    refine_grad: 0.5
+  refine_snr_weight: true
   num_workers: 10
   use_flip: true
   use_rot: true
