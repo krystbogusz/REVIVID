@@ -10,7 +10,11 @@ It performs joint optimization of:
     * the v-prediction diffusion head,
     * sharpness losses (perceptual / frequency / gradient) on the final refined
       output to combat over-smoothing.
-The learning rate is constant (no scheduler). Training uses AMP mixed precision,
+The learning rate decays linearly from ``training.lr`` to ``training.lr_min``
+over the configured number of epochs (MambaOFR recipe). Gradients are
+accumulated over ``training.grad_accum`` batches before each optimizer step,
+and an exponential moving average (EMA) of the weights is maintained and used
+for validation / checkpointed inference. Training uses AMP mixed precision,
 checkpointing and PSNR/SSIM validation (DDIM sampling). This is a pure diffusion
 model - there is no adversarial / GAN component.
 """
@@ -18,10 +22,12 @@ model - there is no adversarial / GAN component.
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torchvision.utils import save_image
@@ -42,6 +48,59 @@ from model.losses import (
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
+
+
+class ModelEMA:
+    """Exponential moving average of a model's floating-point weights.
+
+    ``apply_to`` / ``restore`` temporarily swap the EMA weights into the live
+    model (used for validation and when saving samples); the raw training
+    weights are kept as a backup and restored afterwards.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().clone().float()
+            for k, v in model.state_dict().items()
+            if v.dtype.is_floating_point
+        }
+        self._backup: Optional[dict] = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        d = self.decay
+        for k, v in model.state_dict().items():
+            s = self.shadow.get(k)
+            if s is not None:
+                s.mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module) -> None:
+        self._backup = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+            if k in self.shadow
+        }
+        model.load_state_dict(
+            {k: v.to(dtype=self._backup[k].dtype) for k, v in self.shadow.items()},
+            strict=False,
+        )
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if self._backup is not None:
+            model.load_state_dict(self._backup, strict=False)
+            self._backup = None
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.decay = float(state.get("decay", self.decay))
+        for k, v in (state.get("shadow") or {}).items():
+            if k in self.shadow and self.shadow[k].shape == v.shape:
+                self.shadow[k] = v.detach().clone().float()
 
 
 def load_config(path: Union[str, Path, None] = None) -> dict:
@@ -105,16 +164,50 @@ class Trainer:
         lr = float(self.train_cfg.get("lr", 2e-4))
         betas = (
             float(self.train_cfg.get("beta1", 0.9)),
-            float(self.train_cfg.get("beta2", 0.99)),
+            float(self.train_cfg.get("beta2", 0.999)),
         )
         self.optimizer_g = torch.optim.AdamW(self._param_groups(lr), lr=lr, betas=betas)
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
+
+        # Linear LR decay: lr (epoch 1) -> lr_min (last epoch).
+        self.base_lr = lr
+        self.lr_min = float(self.train_cfg.get("lr_min", 1e-6))
+
+        # Gradient accumulation: optimizer steps every `grad_accum` batches.
+        self.grad_accum = max(1, int(self.train_cfg.get("grad_accum", 1)))
+        self._accum_count = 0
+
+        # EMA of the model weights, used for validation / saved with checkpoints.
+        ema_decay = float(self.train_cfg.get("ema_decay", 0.999))
+        self.ema = ModelEMA(self.net, ema_decay) if ema_decay > 0 else None
 
         self.use_amp = bool(self.train_cfg.get("use_amp", True))
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.iteration = 0
         self.best_psnr = -1.0
         self.best_epoch = 0
+
+    def _set_epoch_lr(self, epoch: int, total_epochs: int) -> float:
+        """Linearly decay the LR from ``base_lr`` (epoch 1) to ``lr_min`` (last epoch)."""
+        if total_epochs <= 1:
+            lr = self.base_lr
+        else:
+            frac = min(max((epoch - 1) / (total_epochs - 1), 0.0), 1.0)
+            lr = self.base_lr + (self.lr_min - self.base_lr) * frac
+        for group in self.optimizer_g.param_groups:
+            group["lr"] = lr
+        return lr
+
+    @contextmanager
+    def _ema_weights(self):
+        """Temporarily swap the EMA weights into ``self.net``."""
+        if self.ema is not None:
+            self.ema.apply_to(self.net)
+        try:
+            yield
+        finally:
+            if self.ema is not None:
+                self.ema.restore(self.net)
 
     def _param_groups(self, lr: float):
         return [p for p in self.net.parameters() if p.requires_grad]
@@ -160,7 +253,10 @@ class Trainer:
 
             n_b, t_b, c_b, h_b, w_b = gt.shape
             gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
-            residual_target = (gt_f - coarse_f).detach()
+            # Scale the residual into the noise schedule's native ~[-1, 1]
+            # range (gt - coarse spans [-2, 2]); inverted below and in restore().
+            res_scale = float(self.net.cfg.residual_scale)
+            residual_target = ((gt_f - coarse_f) * res_scale).detach()
 
             loss_pix = self.loss_pix(coarse, gt)
             loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
@@ -177,7 +273,7 @@ class Trainer:
             # coarse is detached so these losses train the refiner (and the
             # backbone `cond` features), not the coarse branch.
             refined_pred = torch.clamp(
-                coarse_f.detach() + diff_info["x0_pred"], -1.0, 1.0
+                coarse_f.detach() + diff_info["x0_pred"] / res_scale, -1.0, 1.0
             )
             loss_r_fft = self.loss_fft(refined_pred, gt_f)
             loss_r_grad = self.loss_grad(refined_pred, gt_f)
@@ -225,17 +321,25 @@ class Trainer:
                 total = total + w["perceptual"] * loss_perc
                 log["loss_perc"] = float(loss_perc.detach())
 
-        self.optimizer_g.zero_grad(set_to_none=True)
-        self.scaler.scale(total).backward()
-        self.scaler.unscale_(self.optimizer_g)
-        if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.net.parameters(), max_norm=self.grad_clip
-            )
+        # Accumulate gradients over `grad_accum` batches, then step once.
+        self.scaler.scale(total / self.grad_accum).backward()
+        self._accum_count += 1
+
         scale_before = self.scaler.get_scale()
-        self.scaler.step(self.optimizer_g)
-        self.scaler.update()
-        scale_after = self.scaler.get_scale()
+        scale_after = scale_before
+        if self._accum_count >= self.grad_accum:
+            self._accum_count = 0
+            self.scaler.unscale_(self.optimizer_g)
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.net.parameters(), max_norm=self.grad_clip
+                )
+            self.scaler.step(self.optimizer_g)
+            self.scaler.update()
+            scale_after = self.scaler.get_scale()
+            self.optimizer_g.zero_grad(set_to_none=True)
+            if self.ema is not None:
+                self.ema.update(self.net)
 
         self.iteration += 1
         log["loss_total"] = float(total.detach())
@@ -262,13 +366,23 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, val_loader, epoch: Optional[int] = None) -> dict:
-        """Run validation on the full validation set (MambaOFR style windowing)."""
+        """Run validation on the full validation set (MambaOFR style windowing).
+
+        Uses the EMA weights (if enabled) and reports metrics both for the
+        final refined output and for the backbone's coarse output, so it is
+        visible whether the diffusion refinement helps or hurts PSNR/SSIM.
+        """
+        with self._ema_weights():
+            return self._validate_impl(val_loader, epoch=epoch)
+
+    def _validate_impl(self, val_loader, epoch: Optional[int] = None) -> dict:
         self.net.eval()
         if self.device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
+        c_psnr_sum, c_ssim_sum = 0.0, 0.0
         window_size = int(self.train_cfg.get("num_frame", 7))
         refine_steps = self.val_refine_steps or None
 
@@ -301,37 +415,53 @@ class Trainer:
                 lq = lq[:, :all_len]
                 gt = gt[:, :all_len]
             all_output = []
+            all_coarse = []
 
             for i in range(0, all_len, window_size):
                 end = min(i + window_size, all_len)
                 part_lq = lq[:, i:end].to(self.device, non_blocking=True)
 
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    part_out = self.net.restore(part_lq, refine_steps=refine_steps)
+                    part_out, part_coarse = self.net.restore(
+                        part_lq, refine_steps=refine_steps, return_coarse=True
+                    )
 
                 all_output.append(part_out.detach().cpu())
-                del part_lq, part_out
+                all_coarse.append(part_coarse.detach().clamp(-1.0, 1.0).cpu())
+                del part_lq, part_out, part_coarse
 
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
             full_out = torch.cat(all_output, dim=1)
+            full_coarse = torch.cat(all_coarse, dim=1)
 
             m = evaluate_clip(full_out[0].float(), gt[0].float())
             psnr_sum += m["psnr"] if m["psnr"] != float("inf") else 0.0
             ssim_sum += m["ssim"]
+
+            mc = evaluate_clip(full_coarse[0].float(), gt[0].float())
+            c_psnr_sum += mc["psnr"] if mc["psnr"] != float("inf") else 0.0
+            c_ssim_sum += mc["ssim"]
             count += 1
 
             vbar.set_postfix(
-                psnr=f"{psnr_sum / count:.3f}", ssim=f"{ssim_sum / count:.4f}"
+                psnr=f"{psnr_sum / count:.3f}",
+                ssim=f"{ssim_sum / count:.4f}",
+                coarse_psnr=f"{c_psnr_sum / count:.3f}",
             )
 
-            del lq, gt, full_out, all_output
+            del lq, gt, full_out, full_coarse, all_output, all_coarse
 
         vbar.close()
 
         count = max(count, 1)
-        return {"psnr": psnr_sum / count, "ssim": ssim_sum / count}
+        return {
+            "psnr": psnr_sum / count,
+            "ssim": ssim_sum / count,
+            "psnr_coarse": c_psnr_sum / count,
+            "ssim_coarse": c_ssim_sum / count,
+        }
 
     @torch.no_grad()
     def _save_validation_sample(
@@ -346,7 +476,7 @@ class Trainer:
         lq = batch["lq"][:, :window_size].to(self.device, non_blocking=True)
         gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
 
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
+        with self._ema_weights(), torch.amp.autocast("cuda", enabled=self.use_amp):
             out = self.net.restore(lq)
 
         def _to_grid(clip: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -396,6 +526,7 @@ class Trainer:
 
         for epoch in range(start_epoch, total_epochs + 1):
             t0 = time.time()
+            lr_now = self._set_epoch_lr(epoch, total_epochs)
             try:
                 total_iters = len(train_loader)
             except TypeError:
@@ -403,7 +534,7 @@ class Trainer:
             pbar = tqdm(
                 train_loader,
                 total=total_iters,
-                desc=f"Epoch {epoch}/{total_epochs}",
+                desc=f"Epoch {epoch}/{total_epochs} (lr {lr_now:.2e})",
                 unit="batch",
                 dynamic_ncols=True,
             )
@@ -422,7 +553,10 @@ class Trainer:
             if do_validate:
                 metrics = self.validate(val_loader, epoch=epoch)
                 print(
-                    f"[epoch {epoch}] VAL psnr:{metrics['psnr']:.3f} ssim:{metrics['ssim']:.4f}"
+                    f"[epoch {epoch}] VAL refined psnr:{metrics['psnr']:.3f} "
+                    f"ssim:{metrics['ssim']:.4f} | coarse "
+                    f"psnr:{metrics['psnr_coarse']:.3f} "
+                    f"ssim:{metrics['ssim_coarse']:.4f}"
                 )
                 if metrics["psnr"] > self.best_psnr:
                     self.best_psnr = metrics["psnr"]
@@ -444,6 +578,7 @@ class Trainer:
             "epoch_numbering": 1,
             "iteration": self.iteration,
             "model": self.net.state_dict(),
+            "ema": self.ema.state_dict() if self.ema is not None else None,
             "optimizer_g": self.optimizer_g.state_dict(),
             "scaler": self.scaler.state_dict(),
             "model_config": self.model_cfg.to_dict(),
@@ -477,6 +612,13 @@ class Trainer:
     def load_checkpoint(self, path: Union[str, Path], strict: bool = True) -> int:
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.net.load_state_dict(state["model"], strict=strict)
+        if self.ema is not None:
+            if state.get("ema"):
+                self.ema.load_state_dict(state["ema"])
+            else:
+                # Older checkpoint without EMA — seed the shadow from the
+                # freshly loaded weights instead of the random init.
+                self.ema = ModelEMA(self.net, self.ema.decay)
         if "optimizer_g" in state:
             self.optimizer_g.load_state_dict(state["optimizer_g"])
         if "scaler" in state and self.use_amp:

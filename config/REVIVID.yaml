@@ -34,7 +34,7 @@ seed: 2026
 # --------------------------------------------------------------------------- #
 model:
   # Recurrent conditioning backbone (MambaOFR-inspired)
-  num_feat: 16            # propagation feature channels
+  num_feat: 32            # propagation feature channels (detail capacity of coarse/cond)
   num_block: 6            # SSM blocks per propagation branch
   embed_dim: 64           # internal width of SSM blocks
   cond_dim: 64            # conditioning features fed to the diffusion head
@@ -56,7 +56,8 @@ model:
   # Diffusion process
   num_timesteps: 1000
   schedule: cosine
-  refine_steps: 8         # DDIM steps at inference
+  refine_steps: 8         # DDIM steps at inference (validation; final renders use more)
+  residual_scale: 0.5     # gt-coarse residual ([-2,2]) is scaled to ~[-1,1] for diffusion
 
   # Spatial hole detection (inference only — training uses on-the-fly threshold)
   hole_threshold: 0.5
@@ -77,25 +78,41 @@ training:
   num_frame: 7
 
   # Random GT crop for training (LR crop = patch_size / sr_scale).
-  patch_size: 400
+  # 256 matches the MambaOFR recipe and (with grad_accum) allows a much larger
+  # effective batch than a single 400px crop.
+  patch_size: 256
 
-  lr: 0.0002              # constant learning rate (no scheduler)
+  # Learning rate: linear decay from `lr` (epoch 1) to `lr_min` (last epoch),
+  # matching the MambaOFR training recipe ("2e-4 with linear decay").
+  lr: 0.0002
+  lr_min: 1.0e-6
   beta1: 0.9
-  beta2: 0.99
+  beta2: 0.999            # Adam beta2 as in the MambaOFR paper
+
+  # Gradient accumulation: optimizer steps every N batches -> effective batch
+  # = batch_size * grad_accum. Diffusion training with batch 1 is very noisy.
+  grad_accum: 8
+
+  # Exponential moving average of model weights (decay per optimizer step).
+  # Validation / checkpointed inference use the EMA weights. 0 disables EMA.
+  ema_decay: 0.999
 
   use_perceptual: true
-  use_amp: false
+  use_amp: true            # mixed precision — frees VRAM for the larger effective batch
 
+  # Loss weights biased towards fidelity (PSNR/SSIM). The sharpness losses
+  # (fft / grad / perceptual) trade PSNR for texture — keep them small while
+  # chasing metric parity; raise them later for perceptual quality.
   loss_weights:
     pix: 1.0              # Charbonnier on coarse restoration (backbone)
-    perceptual: 0.1       # VGG perceptual on coarse
+    perceptual: 0.05      # VGG perceptual on coarse
     detect: 0.0           # PHASE 1: OFF (no holes). PHASE 2: 0.05 — BCE on hole_head
     v: 1.0                # v-prediction diffusion loss (restoration + SR now, + VFI/inpaint later)
     vfi: 0.0              # PHASE 1: OFF. PHASE 2: 0.05+ — targeted Charbonnier on masked frames
     # Sharpness losses on the FINAL refined output (coarse + predicted residual):
-    refine_perceptual: 0.1 # VGG perceptual on refined
-    refine_fft: 0.5        # frequency-domain loss on refined (recover fine texture)
-    refine_grad: 0.5       # Sobel gradient loss on refined (crisp edges)
+    refine_perceptual: 0.05 # VGG perceptual on refined
+    refine_fft: 0.1        # frequency-domain loss on refined (recover fine texture)
+    refine_grad: 0.1       # Sobel gradient loss on refined (crisp edges)
   refine_snr_weight: true  # scale refined losses by alphas_cumprod[t] (down-weight noisy x0_pred)
 
   num_workers: 10
@@ -126,4 +143,4 @@ validation:
 logging:
   log_every: 120
   exp_dir: ./experiments/revivid
-  save_checkpoint_every: 100   # numbered + latest checkpoints (not every epoch)
+  save_checkpoint_every: 10   # numbered + latest checkpoints (not every epoch)

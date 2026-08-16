@@ -134,11 +134,18 @@ class GaussianDiffusion(nn.Module):
         return v_loss, {"x0_pred": x0_pred, "x_t": x_t, "t": t, "v_pred": v_pred}
 
     def _ddim_timesteps(self, num_steps: int) -> torch.Tensor:
+        """Trailing timestep spacing: always start at t = T-1 and end at t = 0.
+
+        Leading spacing (``arange * T/steps``) would start sampling at
+        t = T - T/steps with pure Gaussian noise, where the model expects a
+        partially-signalled x_t — a train/inference mismatch that degrades the
+        first (most global) denoising step.
+        """
         num_steps = max(1, min(num_steps, self.num_timesteps))
-        step = self.num_timesteps / num_steps
-        ts = (torch.arange(num_steps) * step).round().long()
-        ts = ts.clamp(max=self.num_timesteps - 1)
-        return torch.flip(ts, dims=[0])
+        if num_steps == 1:
+            return torch.tensor([self.num_timesteps - 1], dtype=torch.long)
+        ts = torch.linspace(self.num_timesteps - 1, 0, num_steps).round().long()
+        return ts.clamp(min=0, max=self.num_timesteps - 1)
 
     @torch.no_grad()
     def ddim_sample(

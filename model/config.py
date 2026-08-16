@@ -32,6 +32,11 @@ class ModelConfig:
     schedule: str = "cosine"
     refine_steps: int = 8
 
+    # The diffusion target is the residual gt - coarse, whose natural range is
+    # [-2, 2]. It is multiplied by this factor before diffusion (and divided
+    # back after sampling) so the noise schedule sees ~[-1, 1] data.
+    residual_scale: float = 0.5
+
     hole_threshold: float = 0.5
 
     vfi_prob: float = 0.5

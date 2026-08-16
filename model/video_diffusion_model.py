@@ -155,6 +155,7 @@ class Video_Backbone(nn.Module):
         lq: torch.Tensor,
         frame_mask: Optional[torch.Tensor] = None,
         refine_steps: Optional[int] = None,
+        return_coarse: bool = False,
     ) -> torch.Tensor:
         """Run DDIM restoration / interpolation on a clip.
 
@@ -163,9 +164,12 @@ class Video_Backbone(nn.Module):
             frame_mask: (N, T) bool — True = observed, False = masked.
                         None → all frames observed (pure restoration mode).
             refine_steps: DDIM steps (default: cfg.refine_steps).
+            return_coarse: also return the backbone's coarse output (before
+                        diffusion refinement) for diagnostics.
 
         Returns:
-            (N, T, 3, H, W) restored/interpolated HR clip in [-1, 1].
+            (N, T, 3, H, W) restored/interpolated HR clip in [-1, 1];
+            with ``return_coarse=True`` a tuple ``(refined, coarse)``.
         """
         refine_steps = refine_steps or self.cfg.refine_steps
 
@@ -203,7 +207,12 @@ class Video_Backbone(nn.Module):
             model_kwargs={"cond": refine_cond},
             device=device,
         )
+        # The diffusion operates on the residual scaled by cfg.residual_scale
+        # (see trainer) — undo that scaling before compositing.
+        residual = residual / self.cfg.residual_scale
         refined = torch.clamp(coarse_f + residual, -1.0, 1.0)
+        if return_coarse:
+            return _unflatten_time(refined, nt), _unflatten_time(coarse_f, nt)
         return _unflatten_time(refined, nt)
 
 
@@ -222,7 +231,7 @@ def _selftest_losses(
 
     n, t, c, hr_h, hr_w = gt.shape
     gt_f = gt.reshape(n * t, c, hr_h, hr_w)
-    residual_target = (gt_f - out["coarse_f"]).detach()
+    residual_target = ((gt_f - out["coarse_f"]) * net.cfg.residual_scale).detach()
 
     loss_pix = CharbonnierLoss()(out["coarse"], gt)
     loss_detect = HoleDetectionLoss()(out["hole_logits_f"], out["hole_mask_f"])
