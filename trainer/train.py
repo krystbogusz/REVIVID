@@ -44,7 +44,7 @@ def _dry_run_config(path):
             "refine_steps": 2,
         }
     )
-    cfg.setdefault("training", {}).update({"num_frame": 3, "use_amp": False})
+    cfg.setdefault("training", {}).update({"num_frame": 3})
     return cfg
 
 

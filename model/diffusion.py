@@ -43,9 +43,16 @@ class GaussianDiffusion(nn.Module):
     The denoiser is supplied externally as ``model_fn(x_t, t, **cond) -> v_pred``.
     """
 
-    def __init__(self, num_timesteps: int = 1000, schedule: str = "cosine"):
+    def __init__(
+        self,
+        num_timesteps: int = 1000,
+        schedule: str = "cosine",
+        min_snr_gamma: float = 0.0,
+    ):
         super().__init__()
         self.num_timesteps = int(num_timesteps)
+        # Min-SNR-gamma loss weighting (Hang et al. 2023). 0 disables it.
+        self.min_snr_gamma = float(min_snr_gamma)
 
         if schedule == "cosine":
             betas = cosine_beta_schedule(self.num_timesteps)
@@ -109,8 +116,11 @@ class GaussianDiffusion(nn.Module):
     ):
         """Return (v_loss, info) for a v-prediction objective.
 
-        ``loss_mask`` optionally restricts the loss to certain spatial regions
-        (used by the inpainting head to focus on the holes).
+        ``loss_mask`` optionally re-weights spatial regions (e.g. boost holes).
+        With ``min_snr_gamma > 0`` each sample is additionally weighted by
+        ``min(SNR(t), gamma) / (SNR(t) + 1)`` — the v-prediction form of the
+        Min-SNR strategy, which down-weights uninformative high-noise timesteps
+        and speeds up convergence.
         """
         model_kwargs = model_kwargs or {}
         b = x_start.shape[0]
@@ -123,12 +133,23 @@ class GaussianDiffusion(nn.Module):
         v_target = self.get_v_target(x_start, noise, t)
         v_pred = model_fn(x_t, t, **model_kwargs)
 
+        diff = (v_pred - v_target) ** 2
         if loss_mask is not None:
-            diff = (v_pred - v_target) ** 2 * loss_mask
-            denom = loss_mask.sum().clamp(min=1.0)
-            v_loss = diff.sum() / denom
+            mask = loss_mask.expand_as(diff)
+            per_sample = (diff * mask).flatten(1).sum(1) / mask.flatten(1).sum(
+                1
+            ).clamp(min=1.0)
         else:
-            v_loss = ((v_pred - v_target) ** 2).mean()
+            per_sample = diff.flatten(1).mean(1)
+
+        if self.min_snr_gamma > 0:
+            acp = self.alphas_cumprod.to(x_start.device)[t]
+            snr = acp / (1.0 - acp).clamp(min=1e-8)
+            per_sample = per_sample * (
+                snr.clamp(max=self.min_snr_gamma) / (snr + 1.0)
+            )
+
+        v_loss = per_sample.mean()
 
         x0_pred = self.predict_start_from_v(x_t, t, v_pred)
         return v_loss, {"x0_pred": x0_pred, "x_t": x_t, "t": t, "v_pred": v_pred}

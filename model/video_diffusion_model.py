@@ -1,22 +1,22 @@
-"""DiffMambaOFR — Unified Masked Frame Prediction network.
+"""DiffMambaOFR — diffusion restoration network.
 
-One diffusion head handles all three tasks:
+One diffusion head handles two tasks:
 
-    Restoration  : observed (degraded) frames → clean HR frames
-    VFI          : masked (missing) frames    → interpolated HR frames
-    Inpainting   : persistent spatial holes   → hallucinated content
+    Restoration + SR : degraded LR frames    → clean HR frames
+    Inpainting       : persistent spatial holes → hallucinated content
 
 Pipeline (per clip ``lq`` of shape (N, T, 3, h, w), values in [-1, 1]):
 
-    frame_mask (N, T) bool  — True = observed, False = masked for VFI
-    lq[:, mask==False] = 0  — zeros at VFI positions
-
-    backbone(lq, frame_mask) → coarse (N,T,3,H,W), cond (N,T,C,H,W),
-                                hole_logits (N,T,1,H,W)
+    backbone(lq) → coarse (N,T,3,H,W), cond (N,T,C,H,W),
+                   hole_logits (N,T,1,H,W)
     hole_mask = sigmoid(hole_logits) > threshold
 
-    cond_refine = cat[coarse, hole_mask, cond, frame_mask_emb]
+    cond_refine = cat[coarse_t, coarse_{t-1}, coarse_{t+1}, hole_mask, cond]
     DDIM(refine_unet, cond_refine) → residual → refined = coarse + residual
+
+The refiner is conditioned on the previous/next coarse frames (temporal
+context) and DDIM starts from the SAME noise for every frame of a clip, both
+of which suppress frame-to-frame flicker in the refined detail.
 
 ``compute_losses`` is called by the trainer; ``restore`` runs DDIM at inference.
 
@@ -51,7 +51,7 @@ def _unflatten_time(x: torch.Tensor, nt) -> torch.Tensor:
 
 
 class Video_Backbone(nn.Module):
-    """Unified Masked Frame Prediction model (restoration + SR + VFI)."""
+    """Diffusion restoration model (restoration + SR + hole inpainting)."""
 
     def __init__(self, config: Optional[ModelConfig] = None, **kwargs):
         super().__init__()
@@ -76,12 +76,13 @@ class Video_Backbone(nn.Module):
         )
 
         self.diffusion = GaussianDiffusion(
-            config.num_timesteps, schedule=config.schedule
+            config.num_timesteps,
+            schedule=config.schedule,
+            min_snr_gamma=config.min_snr_gamma,
         )
 
-        self.mask_embed = nn.Embedding(2, config.mask_embed_dim)
-
-        cond_ch = 3 + 1 + config.cond_dim + config.mask_embed_dim
+        # coarse_t + coarse_{t-1} + coarse_{t+1} + hole_mask + backbone features
+        cond_ch = 3 * 3 + 1 + config.cond_dim
 
         self.refine_unet = ConditionalUNet(
             in_channels=3,
@@ -96,38 +97,34 @@ class Video_Backbone(nn.Module):
 
     def _build_cond(
         self,
-        coarse_f: torch.Tensor,
+        coarse: torch.Tensor,
         hole_mask_f: torch.Tensor,
         cond_f: torch.Tensor,
-        frame_mask_f: torch.Tensor,
     ) -> torch.Tensor:
-        """Concatenate all conditioning signals for the refine_unet."""
-        h, w = coarse_f.shape[-2:]
+        """Concatenate all conditioning signals for the refine_unet.
 
-        mask_emb = self.mask_embed(frame_mask_f.long())
-        mask_emb = mask_emb[:, :, None, None].expand(-1, -1, h, w)
-        return torch.cat([coarse_f, hole_mask_f, cond_f, mask_emb], dim=1)
+        ``coarse`` is the UNFLATTENED (N, T, 3, H, W) coarse output — the
+        previous/next frames are appended as temporal context (edge frames
+        repeat themselves).
+        """
+        prev = torch.cat([coarse[:, :1], coarse[:, :-1]], dim=1)
+        nxt = torch.cat([coarse[:, 1:], coarse[:, -1:]], dim=1)
+        coarse_f, _ = _flatten_time(coarse)
+        prev_f, _ = _flatten_time(prev)
+        nxt_f, _ = _flatten_time(nxt)
+        return torch.cat([coarse_f, prev_f, nxt_f, hole_mask_f, cond_f], dim=1)
 
-    def forward(
-        self,
-        lq: torch.Tensor,
-        frame_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, lq: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training.
         Returns unweighted predictions and building blocks for the loss functions.
         """
-        if frame_mask is None:
-            frame_mask = lq.new_ones(lq.shape[:2], dtype=torch.bool)
-
-        out = self.backbone(lq, frame_mask=frame_mask)
+        out = self.backbone(lq)
         coarse, cond, hole_logits = out["coarse"], out["cond"], out["hole_logits"]
 
         coarse_f, nt = _flatten_time(coarse)
         cond_f, _ = _flatten_time(cond)
         logits_f, _ = _flatten_time(hole_logits)
-
-        frame_mask_f = frame_mask.reshape(-1)
 
         lq_f, _ = _flatten_time(lq)
         lq_hr = (
@@ -137,9 +134,7 @@ class Video_Backbone(nn.Module):
         )
         hole_mask_f = (lq_hr.mean(dim=1, keepdim=True) < -0.95).float()
 
-        refine_cond = self._build_cond(
-            coarse_f.detach(), hole_mask_f, cond_f, frame_mask_f
-        )
+        refine_cond = self._build_cond(coarse.detach(), hole_mask_f, cond_f)
 
         return {
             "coarse": coarse,
@@ -153,36 +148,29 @@ class Video_Backbone(nn.Module):
     def restore(
         self,
         lq: torch.Tensor,
-        frame_mask: Optional[torch.Tensor] = None,
         refine_steps: Optional[int] = None,
         return_coarse: bool = False,
     ) -> torch.Tensor:
-        """Run DDIM restoration / interpolation on a clip.
+        """Run DDIM restoration on a clip.
 
         Args:
-            lq:         (N, T, 3, h, w) LQ input; zeros at VFI positions.
-            frame_mask: (N, T) bool — True = observed, False = masked.
-                        None → all frames observed (pure restoration mode).
+            lq:         (N, T, 3, h, w) LQ input.
             refine_steps: DDIM steps (default: cfg.refine_steps).
             return_coarse: also return the backbone's coarse output (before
                         diffusion refinement) for diagnostics.
 
         Returns:
-            (N, T, 3, H, W) restored/interpolated HR clip in [-1, 1];
+            (N, T, 3, H, W) restored HR clip in [-1, 1];
             with ``return_coarse=True`` a tuple ``(refined, coarse)``.
         """
         refine_steps = refine_steps or self.cfg.refine_steps
 
-        if frame_mask is None:
-            frame_mask = lq.new_ones(lq.shape[:2], dtype=torch.bool)
-
-        out = self.backbone(lq, frame_mask=frame_mask)
+        out = self.backbone(lq)
         coarse, cond, hole_logits = out["coarse"], out["cond"], out["hole_logits"]
 
         coarse_f, nt = _flatten_time(coarse)
         cond_f, _ = _flatten_time(cond)
         logits_f, _ = _flatten_time(hole_logits)
-        frame_mask_f = frame_mask.reshape(-1)
 
         device = coarse_f.device
         shape = coarse_f.shape
@@ -199,13 +187,22 @@ class Video_Backbone(nn.Module):
         fill_holes = (lq_hr.mean(dim=1, keepdim=True) < -0.95).float()
         hole_mask_f = torch.maximum(hole_mask_f, fill_holes)
 
-        refine_cond = self._build_cond(coarse_f, hole_mask_f, cond_f, frame_mask_f)
+        refine_cond = self._build_cond(coarse, hole_mask_f, cond_f)
+
+        # Share the initial DDIM noise across all frames of a clip: with the
+        # deterministic (eta=0) sampler this makes the hallucinated detail
+        # consistent between frames instead of flickering.
+        n, t = nt
+        noise = torch.randn((n, 1, *shape[1:]), device=device)
+        noise = noise.expand(n, t, *shape[1:]).reshape(shape)
+
         residual = self.diffusion.ddim_sample(
             self.refine_unet,
             shape,
             refine_steps,
             model_kwargs={"cond": refine_cond},
             device=device,
+            x_init=noise,
         )
         # The diffusion operates on the residual scaled by cfg.residual_scale
         # (see trainer) — undo that scaling before compositing.
@@ -224,10 +221,9 @@ def _selftest_losses(
     net: "Video_Backbone",
     lq: torch.Tensor,
     gt: torch.Tensor,
-    frame_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Mirror the trainer's loss wiring for a quick forward/backward smoke test."""
-    out = net(lq, frame_mask)
+    out = net(lq)
 
     n, t, c, hr_h, hr_w = gt.shape
     gt_f = gt.reshape(n * t, c, hr_h, hr_w)
@@ -264,20 +260,6 @@ if __name__ == "__main__":
         {k: float(v.detach()) for k, v in losses.items()},
     )
 
-    mask = torch.ones(n, t, dtype=torch.bool)
-    mask[0, 2] = False
-    lq_vfi = lq.clone()
-    lq_vfi[:, 2] = 0.0
-
-    net.zero_grad()
-    losses_vfi = _selftest_losses(net, lq_vfi, gt, frame_mask=mask)
-    total_vfi = losses_vfi["pix"] + losses_vfi["detect"] + losses_vfi["v"]
-    total_vfi.backward()
-    print(
-        "VFI losses:",
-        {k: float(v.detach()) for k, v in losses_vfi.items()},
-    )
-
     with torch.no_grad():
-        y = net.restore(lq_vfi, frame_mask=mask)
+        y = net.restore(lq)
     print("restore output:", tuple(y.shape))

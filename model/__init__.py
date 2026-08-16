@@ -1,4 +1,4 @@
-"""REVIVID — Unified Masked Frame Prediction model (restoration + SR + VFI)."""
+"""REVIVID — diffusion restoration model (restoration + SR + hole inpainting)."""
 
 from .config import ModelConfig
 from .video_diffusion_model import Video_Backbone, build_model

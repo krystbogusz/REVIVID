@@ -1,27 +1,19 @@
-# REVIVID configuration — Unified Masked Frame Prediction model.
+# REVIVID configuration — diffusion restoration model.
 #
-# One diffusion network handles all three tasks simultaneously:
-#   1. Restoration  — remove degradations (scratches, noise, blur, compression)
-#   2. SR           — 4× super-resolution via PixelShuffle in the backbone
-#   3. VFI          — generate masked intermediate frames (temporal inpainting)
+# One diffusion network handles all tasks simultaneously:
+#   1. Restoration — remove degradations (scratches, noise, blur, compression)
+#   2. SR          — 4× super-resolution via PixelShuffle in the backbone
+#   3. Inpainting  — hallucinate content in large burned-in holes
 #
 # Persistent spatial holes (baked by DatasetCreator for test clips and a fraction
 # of train clips) are detected on-the-fly from the LQ fill value (-1.0) and fed
 # as an explicit conditioning channel to the single refine UNet.
 #
-# ============================================================================ #
-# CURRICULUM — training from scratch in two phases (this file = PHASE 1)
-# ---------------------------------------------------------------------------- #
-# PHASE 1 (ACTIVE): restoration + SR only.
-#   * holes OFF  (model.hole_prob = 0.0, loss_weights.detect = 0.0)
-#   * VFI   OFF  (model.vfi_prob  = 0.0, loss_weights.vfi    = 0.0)
-#   Trains the backbone + diffusion head on degraded->clean HR pairs.
-#
-# PHASE 2 (later): add inpainting of large holes + VFI, resuming PHASE 1 weights.
-#   Flip the values marked "PHASE 2" below, keep training (latest.pth is resumed
-#   automatically). No dataset regeneration needed — holes/VFI are applied
-#   on-the-fly by the DataLoader from these probabilities.
-# ============================================================================ #
+# SINGLE-PHASE TRAINING: all tasks (restoration, SR, holes) are on from the
+# first iteration. During training the hole conditioning comes from the LQ
+# fill-value threshold (ground truth), not from the detector, so there is no
+# warmup dependency. The only internal schedule is the RAFT flow warmup
+# (training.raft_unfreeze_iter), handled automatically by the trainer.
 #
 # Data locations are fixed by the pipeline and NOT configured here:
 #   sources.yaml → downloader → data/raw/
@@ -33,40 +25,39 @@ seed: 2026
 # Model architecture
 # --------------------------------------------------------------------------- #
 model:
-  # Recurrent conditioning backbone (MambaOFR-inspired)
-  num_feat: 16            # propagation feature channels
+  # Recurrent conditioning backbone (MambaOFR-inspired). The coarse branch is
+  # the metric-critical part of the model — keep it larger than the refiner.
+  num_feat: 32            # propagation feature channels
   num_block: 6            # SSM blocks per propagation branch
   embed_dim: 64           # internal width of SSM blocks
   cond_dim: 64            # conditioning features fed to the diffusion head
   d_state: 16             # SSM state dimension
   ssm_expand: 2           # SSM inner expansion factor
-  # RAFT optical flow is always frozen — no fine-tuning parameter exists
+  # RAFT warmup/fine-tune is configured in training.raft_unfreeze_iter
 
   # Super-resolution upscale factor in the backbone (PixelShuffle)
   # and LR downscale factor for dataset generation.
   # Powers of two only: 1 (no SR), 2 (2×), 4 (4×).
   sr_scale: 4
 
-  # Single unified diffusion UNet (no attn — Mamba backbone provides global context)
-  refiner_base: 64
-  channel_mult: [1, 2, 4]
+  # Diffusion UNet refiner (no down/up attn — Mamba backbone provides global
+  # context; conditioning is re-injected at every encoder level).
+  refiner_base: 48
+  channel_mult: [1, 2, 3]
   num_res_blocks: 2
-  mask_embed_dim: 16      # dim of temporal frame-mask embedding fed to UNet
 
   # Diffusion process
   num_timesteps: 1000
   schedule: cosine
   refine_steps: 8         # DDIM steps at inference
+  residual_scale: 0.5     # scales the (gt - coarse) residual into ~[-1, 1]
+  min_snr_gamma: 5.0      # Min-SNR loss weighting (0 = off); speeds up convergence
 
   # Spatial hole detection (inference only — training uses on-the-fly threshold)
   hole_threshold: 0.5
 
-  # VFI — temporal masked frame prediction (on-the-fly in DataLoader)
-  vfi_prob: 0.0           # PHASE 1: OFF. PHASE 2: 0.5 (prob a clip has ≥1 masked frames)
-  vfi_mask_ratio: 0.3     # max fraction of inner frames that may be masked (PHASE 2)
-
   # Persistent spatial holes (baked per window by DatasetCreator / DataLoader)
-  hole_prob: 0.0          # PHASE 1: OFF. PHASE 2: 0.2 (prob a window has holes burned in)
+  hole_prob: 0.25         # prob a training window has holes burned in
 
 # --------------------------------------------------------------------------- #
 # Training
@@ -79,19 +70,37 @@ training:
   # Random GT crop for training (LR crop = patch_size / sr_scale).
   patch_size: 400
 
-  lr: 0.0002              # constant learning rate (no scheduler)
+  lr: 0.0002              # linear decay from lr to lr_min over all epochs
+  lr_min: 0.000001
   beta1: 0.9
   beta2: 0.99
 
+  # Optimizer steps every `grad_accum` batches (effective batch = batch_size * grad_accum).
+  grad_accum: 8
+
+  # EMA of the weights, used for validation and checkpointed inference.
+  ema_decay: 0.999
+
+  # RAFT flow warmup: frozen for the first N iterations, then fine-tuned at
+  # lr * flow_lr_mul (MambaOFR recipe). Set raft_unfreeze_iter: -1 to keep frozen.
+  raft_unfreeze_iter: 20000
+  flow_lr_mul: 0.125
+
+  # Loss re-weighting inside persistent holes: pixels under the hole mask get
+  # weight (1 + hole_loss_boost) in the coarse pixel loss and diffusion v-loss.
+  hole_loss_boost: 3.0
+
+  # BCE pos_weight for the hole detector — holes are a tiny pixel minority,
+  # so the positive class is up-weighted to keep the detector sensitive.
+  hole_pos_weight: 10.0
+
   use_perceptual: true
-  use_amp: false
 
   loss_weights:
     pix: 1.0              # Charbonnier on coarse restoration (backbone)
     perceptual: 0.1       # VGG perceptual on coarse
-    detect: 0.0           # PHASE 1: OFF (no holes). PHASE 2: 0.05 — BCE on hole_head
-    v: 1.0                # v-prediction diffusion loss (restoration + SR now, + VFI/inpaint later)
-    vfi: 0.0              # PHASE 1: OFF. PHASE 2: 0.05+ — targeted Charbonnier on masked frames
+    detect: 0.05          # BCE on hole_head (hole detector)
+    v: 1.0                # v-prediction diffusion loss (restoration + SR + inpaint)
     # Sharpness losses on the FINAL refined output (coarse + predicted residual):
     refine_perceptual: 0.1 # VGG perceptual on refined
     refine_fft: 0.5        # frequency-domain loss on refined (recover fine texture)
@@ -126,4 +135,4 @@ validation:
 logging:
   log_every: 120
   exp_dir: ./experiments/revivid
-  save_checkpoint_every: 100   # numbered + latest checkpoints (not every epoch)
+  save_checkpoint_every: 10   # numbered + latest checkpoints (not every epoch)

@@ -5,14 +5,6 @@ Reads the paired clips produced by :class:`dataset.dataset_creator.DatasetCreato
 window, upscales the low-quality input to the GT resolution and normalizes
 everything to ``[-1, 1]``.
 
-VFI frame masking
------------------
-During training, with probability ``vfi_prob`` a subset of middle frames is
-masked out (set to all-zeros) to simulate Video Frame Interpolation supervision.
-The first and last frames are always kept as anchor frames. The ``frame_mask``
-boolean tensor returned in the sample indicates which frames are visible
-(True = visible, False = masked / VFI-interpolated).
-
 Training reads clean GT clips and applies :func:`dataset.degradation.process_video_frames`
 on-the-fly (textures served from ``data/training/noise_textures/*.bin`` mmap cache).
 Flip / rotation augmentations run only on that on-the-fly path.
@@ -91,40 +83,6 @@ def _to_tensor(frame_rgb: np.ndarray, normalize: bool) -> torch.Tensor:
     return t
 
 
-def _sample_frame_mask(
-    num_frame: int,
-    mask_ratio: float,
-    vfi_prob: float,
-    is_train: bool,
-) -> torch.Tensor:
-    """Return a boolean visibility mask for a temporal window.
-
-    True  = frame is visible (use real pixel values).
-    False = frame is masked for VFI supervision (fill with zeros).
-
-    The first and last frames are always visible (anchor frames).
-    Internal frames (indices 1..num_frame-2) are randomly masked when
-    training is active and ``random.random() < vfi_prob``.
-    """
-    if not is_train or vfi_prob <= 0 or random.random() >= vfi_prob:
-        return torch.ones(num_frame, dtype=torch.bool)
-
-    mask = torch.ones(num_frame, dtype=torch.bool)
-    num_internal = num_frame - 2
-    if num_internal <= 0:
-        return mask
-
-    num_to_mask = round(num_internal * mask_ratio)
-    if num_to_mask <= 0:
-        return mask
-
-    internal_indices = list(range(1, num_frame - 1))
-    chosen = random.sample(internal_indices, min(num_to_mask, len(internal_indices)))
-    for idx in chosen:
-        mask[idx] = False
-    return mask
-
-
 class VideoFrameDataset(Dataset):
     def __init__(
         self,
@@ -132,8 +90,6 @@ class VideoFrameDataset(Dataset):
         gt_dir: str | Path,
         num_frame: int = 7,
         is_train: bool = True,
-        vfi_prob: float = 0.5,
-        vfi_mask_ratio: float = 0.3,
         hole_prob: float = 0.15,
         normalize: bool = True,
         sr_scale: int = 1,
@@ -147,8 +103,6 @@ class VideoFrameDataset(Dataset):
         self.gt_dir = Path(gt_dir)
         self.num_frame = num_frame
         self.is_train = is_train
-        self.vfi_prob = vfi_prob
-        self.vfi_mask_ratio = vfi_mask_ratio
         self.hole_prob = hole_prob
         self.normalize = normalize
         self.sr_scale = max(1, int(sr_scale))
@@ -236,10 +190,6 @@ class VideoFrameDataset(Dataset):
             ph, pw, gy, gx = gh, gw, 0, 0
         ly, lx, lph, lpw = gy // sr, gx // sr, ph // sr, pw // sr
 
-        frame_mask = _sample_frame_mask(
-            len(window), self.vfi_mask_ratio, self.vfi_prob, self.is_train
-        )
-
         window_gt_bgrs = []
         for frame_idx in window:
             gt_bgr = gt_map[frame_idx]
@@ -284,36 +234,29 @@ class VideoFrameDataset(Dataset):
 
         lqs = []
         for pos_idx, frame_idx in enumerate(window):
-            if not frame_mask[pos_idx]:
-
-                lq_t = torch.zeros(3, lph, lpw)
+            if self.is_train and deg_bgrs is not None:
+                deg_bgr = deg_bgrs[pos_idx]
             else:
-                if self.is_train and deg_bgrs is not None:
-                    deg_bgr = deg_bgrs[pos_idx]
-                else:
-                    if deg_map:
-                        deg_bgr = deg_map[frame_idx]
-                        if deg_bgr.shape[:2] != (lh, lw):
-                            deg_bgr = cv2.resize(
-                                deg_bgr, (lw, lh), interpolation=cv2.INTER_LINEAR
-                            )
-                    else:
+                if deg_map:
+                    deg_bgr = deg_map[frame_idx]
+                    if deg_bgr.shape[:2] != (lh, lw):
                         deg_bgr = cv2.resize(
-                            window_gt_bgrs[pos_idx],
-                            (lw, lh),
-                            interpolation=cv2.INTER_AREA,
+                            deg_bgr, (lw, lh), interpolation=cv2.INTER_LINEAR
                         )
-                    deg_bgr = deg_bgr[ly : ly + lph, lx : lx + lpw]
+                else:
+                    deg_bgr = cv2.resize(
+                        window_gt_bgrs[pos_idx],
+                        (lw, lh),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                deg_bgr = deg_bgr[ly : ly + lph, lx : lx + lpw]
 
-                deg_rgb = cv2.cvtColor(deg_bgr, cv2.COLOR_BGR2RGB)
-                lq_t = _to_tensor(deg_rgb, self.normalize)
-
-            lqs.append(lq_t)
+            deg_rgb = cv2.cvtColor(deg_bgr, cv2.COLOR_BGR2RGB)
+            lqs.append(_to_tensor(deg_rgb, self.normalize))
 
         return {
             "lq": torch.stack(lqs, 0),
             "gt": torch.stack(gts, 0),
-            "frame_mask": frame_mask,
             "key": deg_path.stem,
         }
 
@@ -338,11 +281,9 @@ class SyntheticHoleVideoDataset(Dataset):
         gt = torch.rand(t, 3, hs, hs) * 2 - 1
         lq = torch.rand(t, 3, s, s) * 2 - 1
 
-        frame_mask = torch.ones(t, dtype=torch.bool)
         return {
             "lq": lq,
             "gt": gt,
-            "frame_mask": frame_mask,
             "key": f"synthetic_{index:04d}",
         }
 
@@ -378,8 +319,6 @@ def get_loader(
     batch_size: int = 1,
     num_frame: int = 7,
     num_workers: int = 0,
-    vfi_prob: float = 0.5,
-    vfi_mask_ratio: float = 0.3,
     hole_prob: float = 0.15,
     root: Optional[str] = None,
     shuffle: Optional[bool] = None,
@@ -396,8 +335,6 @@ def get_loader(
         gt_dir=root / split / "gt",
         num_frame=num_frame,
         is_train=is_train,
-        vfi_prob=vfi_prob,
-        vfi_mask_ratio=vfi_mask_ratio,
         hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
@@ -428,8 +365,6 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     tc = trainer.train_cfg
     val_cfg = trainer.val_cfg
     num_frame = int(tc.get("num_frame", 7))
-    vfi_prob = float(trainer.model_cfg.vfi_prob)
-    vfi_mask_ratio = float(trainer.model_cfg.vfi_mask_ratio)
     hole_prob = float(trainer.model_cfg.hole_prob)
     sr_scale = int(trainer.model_cfg.sr_scale)
     patch_size = int(tc.get("patch_size", 0))
@@ -443,8 +378,6 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
         batch_size=int(tc.get("batch_size", 1)),
         num_frame=num_frame,
         num_workers=int(tc.get("num_workers", 0)),
-        vfi_prob=vfi_prob,
-        vfi_mask_ratio=vfi_mask_ratio,
         hole_prob=hole_prob,
         sr_scale=sr_scale,
         patch_size=patch_size,
@@ -456,8 +389,6 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
         val_loader = get_valid_loader(
             num_frame=num_frame,
             num_workers=val_num_workers,
-            vfi_prob=vfi_prob,
-            vfi_mask_ratio=vfi_mask_ratio,
             sr_scale=sr_scale,
             patch_size=val_patch_size,
         )
@@ -478,5 +409,4 @@ def get_valid_loader(**kwargs) -> DataLoader:
 def get_test_loader(**kwargs) -> DataLoader:
 
     kwargs.setdefault("batch_size", 1)
-    kwargs.setdefault("vfi_prob", 0.0)
     return get_loader(split="test", **kwargs)

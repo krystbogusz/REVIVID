@@ -2,18 +2,17 @@
 
 Reads raw video/image sources, applies the degradation pipeline to the ENTIRE
 clip, then divides the clip into non-overlapping windows of ``num_frame`` frames.
-Holes and VFI masking are decided independently for each window so the model sees
-diverse augmentations within a single source video. Finally, the entire sequence
-is written as a SINGLE paired MP4 clip (degraded LR, clean HR).
+Holes are decided independently for each window so the model sees diverse
+augmentations within a single source video. Finally, the entire sequence is
+written as a SINGLE paired MP4 clip (degraded LR, clean HR).
 
 Pipeline per clip:
     1. Read all frames → resize to target GT resolution.
     2. Convert GT frames to greyscale (MambaOFR-style).
     3. Apply base degradations to the full clip via ``process_video_frames``
-       (blur, noise, JPEG, texture overlay, color jitter — no holes/VFI).
-    4. Chunk the clip into blocks of ``num_frame``. For each chunk:
-         a. Randomly apply persistent holes (prob = ``hole_prob``).
-         b. Randomly apply VFI masking (prob = ``vfi_prob``).
+       (blur, noise, JPEG, texture overlay, color jitter — no holes).
+    4. Chunk the clip into blocks of ``num_frame``; randomly apply persistent
+       holes per chunk (prob = ``hole_prob``).
     5. Write all the chunked frames sequentially into one paired MP4 file.
 """
 
@@ -22,7 +21,7 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -49,8 +48,6 @@ class DatasetCreator:
         self,
         sr_scale: int = 4,
         num_frame: int = 7,
-        vfi_prob: float = 0.5,
-        vfi_mask_ratio: float = 0.3,
         hole_prob: float = 0.15,
     ):
         self.project_root = Path(__file__).parent.parent
@@ -62,8 +59,6 @@ class DatasetCreator:
 
         self.sr_scale = sr_scale
         self.num_frame = num_frame
-        self.vfi_prob = vfi_prob
-        self.vfi_mask_ratio = vfi_mask_ratio
         self.hole_prob = hole_prob
 
         self.size_multiple = 8
@@ -74,8 +69,7 @@ class DatasetCreator:
     ) -> "DatasetCreator":
         """Build a DatasetCreator from ``config/REVIVID.yaml``.
 
-        Reads ``model.sr_scale``, ``training.num_frame``,
-        ``model.vfi_prob``, ``model.vfi_mask_ratio``, ``model.hole_prob``.
+        Reads ``model.sr_scale``, ``training.num_frame``, ``model.hole_prob``.
         """
         if config_path is None:
             config_path = Path(__file__).parent.parent / "config" / "REVIVID.yaml"
@@ -87,20 +81,16 @@ class DatasetCreator:
 
         sr_scale = int(model_cfg.get("sr_scale", 4))
         num_frame = int(train_cfg.get("num_frame", 7))
-        vfi_prob = float(model_cfg.get("vfi_prob", 0.5))
-        vfi_mask_ratio = float(model_cfg.get("vfi_mask_ratio", 0.3))
         hole_prob = float(model_cfg.get("hole_prob", 0.15))
 
         creator = cls(
             sr_scale=sr_scale,
             num_frame=num_frame,
-            vfi_prob=vfi_prob,
-            vfi_mask_ratio=vfi_mask_ratio,
             hole_prob=hole_prob,
         )
         print(
             f"[DatasetCreator] sr_scale={sr_scale}, num_frame={num_frame}, "
-            f"vfi_prob={vfi_prob}, vfi_mask_ratio={vfi_mask_ratio}, hole_prob={hole_prob}"
+            f"hole_prob={hole_prob}"
         )
         return creator
 
@@ -172,27 +162,6 @@ class DatasetCreator:
                 if frame is not None:
                     yield frame
 
-    def _sample_vfi_mask(self, window_size: int) -> Optional[List[bool]]:
-        """Return a per-frame visibility list (True = visible) or None if no VFI.
-
-        First and last frames are always visible (anchor frames).
-        Internal frames are randomly masked up to ``vfi_mask_ratio``.
-        """
-        if self.vfi_prob <= 0.0 or random.random() >= self.vfi_prob:
-            return None
-
-        n = window_size
-        mask = [True] * n
-        num_internal = n - 2
-        if num_internal <= 0:
-            return None
-
-        num_to_mask = max(1, round(num_internal * self.vfi_mask_ratio))
-        internal = list(range(1, n - 1))
-        for idx in random.sample(internal, min(num_to_mask, len(internal))):
-            mask[idx] = False
-        return mask
-
     def _degrade_item(
         self,
         item: tuple,
@@ -250,15 +219,8 @@ class DatasetCreator:
         for start in range(0, total, n):
             gt_chunk = all_gt_frames[start : start + n]
             deg_chunk = all_deg_frames[start : start + n]
-            chunk_len = len(gt_chunk)
 
             deg_chunk = apply_holes_to_window(deg_chunk, self.hole_prob)
-
-            vfi_mask = self._sample_vfi_mask(chunk_len)
-            if vfi_mask is not None:
-                for fi, visible in enumerate(vfi_mask):
-                    if not visible:
-                        deg_chunk[fi] = np.zeros_like(deg_chunk[fi])
 
             for gt_f, deg_f in zip(gt_chunk, deg_chunk):
                 writer_gt.write(gt_f)

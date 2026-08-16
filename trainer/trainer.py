@@ -14,13 +14,14 @@ The learning rate decays linearly from ``training.lr`` to ``training.lr_min``
 over the configured number of epochs (MambaOFR recipe). Gradients are
 accumulated over ``training.grad_accum`` batches before each optimizer step,
 and an exponential moving average (EMA) of the weights is maintained and used
-for validation / checkpointed inference. Training uses AMP mixed precision,
-checkpointing and PSNR/SSIM validation (DDIM sampling). This is a pure diffusion
-model - there is no adversarial / GAN component.
+for validation / checkpointed inference. Training runs in full precision
+(float32) with checkpointing and PSNR/SSIM validation (DDIM sampling). This is
+a pure diffusion model - there is no adversarial / GAN component.
 """
 
 from __future__ import annotations
 
+import csv
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,7 +43,6 @@ from model.losses import (
     FocalFrequencyLoss,
     GradientLoss,
     HoleDetectionLoss,
-    MaskedReconstructionLoss,
     VGGPerceptualLoss,
 )
 
@@ -139,9 +139,8 @@ class Trainer:
         default_w = {
             "pix": 1.0,
             "perceptual": 0.1,
-            "detect": 2.0,
+            "detect": 0.05,
             "v": 1.0,
-            "vfi": 2.0,
             "refine_perceptual": 0.1,
             "refine_fft": 0.5,
             "refine_grad": 0.5,
@@ -155,19 +154,41 @@ class Trainer:
         self.loss_perceptual = (
             VGGPerceptualLoss().to(self.device) if self.use_perceptual else None
         )
-        self.loss_detect = HoleDetectionLoss().to(self.device)
+        hole_pos_weight = float(self.train_cfg.get("hole_pos_weight", 10.0))
+        self.loss_detect = HoleDetectionLoss(pos_weight=hole_pos_weight).to(self.device)
         self.loss_diffusion = DiffusionLoss().to(self.device)
         self.loss_fft = FocalFrequencyLoss().to(self.device)
         self.loss_grad = GradientLoss().to(self.device)
-        self.loss_vfi = MaskedReconstructionLoss().to(self.device)
 
         lr = float(self.train_cfg.get("lr", 2e-4))
         betas = (
             float(self.train_cfg.get("beta1", 0.9)),
             float(self.train_cfg.get("beta2", 0.999)),
         )
-        self.optimizer_g = torch.optim.AdamW(self._param_groups(lr), lr=lr, betas=betas)
+        self.optimizer_g = torch.optim.AdamW(
+            [
+                {
+                    "params": [p for p in self.net.parameters() if p.requires_grad],
+                    "lr": lr,
+                    "lr_mult": 1.0,
+                }
+            ],
+            lr=lr,
+            betas=betas,
+        )
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
+
+        # RAFT warmup (MambaOFR recipe): the flow starts frozen and is unfrozen
+        # after `raft_unfreeze_iter` iterations at `flow_lr_mul` * base LR.
+        # Set raft_unfreeze_iter < 0 to keep the flow frozen forever.
+        self.raft_unfreeze_iter = int(self.train_cfg.get("raft_unfreeze_iter", 20000))
+        self.flow_lr_mul = float(self.train_cfg.get("flow_lr_mul", 0.125))
+        self._raft_unfrozen = False
+
+        # Pixels inside persistent holes are re-weighted by (1 + hole_loss_boost)
+        # in the coarse pixel loss and the diffusion v-loss, so the few hole
+        # pixels are not drowned out by the full-frame average.
+        self.hole_loss_boost = float(self.train_cfg.get("hole_loss_boost", 3.0))
 
         # Linear LR decay: lr (epoch 1) -> lr_min (last epoch).
         self.base_lr = lr
@@ -181,11 +202,14 @@ class Trainer:
         ema_decay = float(self.train_cfg.get("ema_decay", 0.999))
         self.ema = ModelEMA(self.net, ema_decay) if ema_decay > 0 else None
 
-        self.use_amp = bool(self.train_cfg.get("use_amp", True))
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.iteration = 0
         self.best_psnr = -1.0
         self.best_epoch = 0
+
+        # Per-epoch mean losses (+ val metrics when available). Stored inside
+        # every checkpoint and mirrored to <exp_dir>/loss_history.csv so loss
+        # curves can be plotted without loading the .pth files.
+        self.loss_history: list[dict] = []
 
     def _set_epoch_lr(self, epoch: int, total_epochs: int) -> float:
         """Linearly decay the LR from ``base_lr`` (epoch 1) to ``lr_min`` (last epoch)."""
@@ -195,8 +219,32 @@ class Trainer:
             frac = min(max((epoch - 1) / (total_epochs - 1), 0.0), 1.0)
             lr = self.base_lr + (self.lr_min - self.base_lr) * frac
         for group in self.optimizer_g.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * group.get("lr_mult", 1.0)
         return lr
+
+    def _maybe_unfreeze_raft(self, force: bool = False) -> None:
+        """Unfreeze RAFT once ``iteration`` reaches ``raft_unfreeze_iter``."""
+        if self._raft_unfrozen:
+            return
+        if not force and (
+            self.raft_unfreeze_iter < 0 or self.iteration < self.raft_unfreeze_iter
+        ):
+            return
+        flow = self.net.backbone.flow_net
+        flow.set_trainable(True)
+        base_lr = self.optimizer_g.param_groups[0]["lr"]
+        self.optimizer_g.add_param_group(
+            {
+                "params": list(flow.parameters()),
+                "lr": base_lr * self.flow_lr_mul,
+                "lr_mult": self.flow_lr_mul,
+            }
+        )
+        self._raft_unfrozen = True
+        print(
+            f"[iter {self.iteration}] RAFT unfrozen for fine-tuning "
+            f"(lr mult {self.flow_lr_mul})"
+        )
 
     @contextmanager
     def _ema_weights(self):
@@ -209,9 +257,6 @@ class Trainer:
             if self.ema is not None:
                 self.ema.restore(self.net)
 
-    def _param_groups(self, lr: float):
-        return [p for p in self.net.parameters() if p.requires_grad]
-
     def _coarse_perceptual(
         self, coarse: torch.Tensor, gt: torch.Tensor
     ) -> torch.Tensor:
@@ -222,14 +267,9 @@ class Trainer:
 
     def train_step(self, batch) -> dict:
         self.net.train()
+        self._maybe_unfreeze_raft()
         lq = batch["lq"].to(self.device, non_blocking=True)
         gt = batch["gt"].to(self.device, non_blocking=True)
-        frame_mask = batch.get("frame_mask")
-        frame_mask = (
-            frame_mask.to(self.device, non_blocking=True)
-            if frame_mask is not None
-            else None
-        )
         w = self.weights
 
         if not (torch.isfinite(lq).all() and torch.isfinite(gt).all()):
@@ -239,104 +279,97 @@ class Trainer:
             self.iteration += 1
             return {"loss_total": float("nan"), "skipped": 1.0}
 
-        if self.use_amp and self.scaler.get_scale() < 1.0:
-            self.scaler._scale.fill_(128.0)
-            print(
-                f"[iter {self.iteration}] AMP scaler reset to 128.0 (was stuck at ~{self.scaler.get_scale():.2e})"
+        out = self.net(lq)
+
+        coarse = out["coarse"]
+        coarse_f = out["coarse_f"]
+
+        n_b, t_b, c_b, h_b, w_b = gt.shape
+        gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
+        # Scale the residual into the noise schedule's native ~[-1, 1]
+        # range (gt - coarse spans [-2, 2]); inverted below and in restore().
+        res_scale = float(self.net.cfg.residual_scale)
+        residual_target = ((gt_f - coarse_f) * res_scale).detach()
+
+        # Boost the loss inside persistent holes so the sparse hole pixels are
+        # not averaged away (hole_mask_f comes from the LQ fill-value threshold,
+        # i.e. it is ground truth during training).
+        pix_weight = (1.0 + self.hole_loss_boost * out["hole_mask_f"]).expand(
+            -1, 3, -1, -1
+        )
+
+        loss_pix = self.loss_pix(coarse_f, gt_f, weight=pix_weight)
+        loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
+        loss_v, diff_info = self.loss_diffusion(
+            self.net.diffusion,
+            self.net.refine_unet,
+            residual_target,
+            out["refine_cond"],
+            loss_mask=pix_weight,
+        )
+
+        # Sharpness losses on the FINAL refiner output (coarse + predicted
+        # residual). x0_pred is the diffusion estimate of the clean residual;
+        # coarse is detached so these losses train the refiner (and the
+        # backbone `cond` features), not the coarse branch.
+        refined_pred = torch.clamp(
+            coarse_f.detach() + diff_info["x0_pred"] / res_scale, -1.0, 1.0
+        )
+        loss_r_fft = self.loss_fft(refined_pred, gt_f)
+        loss_r_grad = self.loss_grad(refined_pred, gt_f)
+        if self.use_perceptual:
+            loss_r_perc = self.loss_perceptual(refined_pred, gt_f)
+        else:
+            loss_r_perc = coarse_f.new_zeros(())
+
+        # Down-weight the refined losses when x0_pred is unreliable (high
+        # noise / large timestep); alphas_cumprod[t] ~ 1 at low noise, ~ 0
+        # at high noise.
+        if self.refine_snr_weight:
+            w_snr = self.net.diffusion.alphas_cumprod[
+                diff_info["t"]
+            ].float().mean()
+        else:
+            w_snr = coarse_f.new_ones(())
+
+        total = (
+            w["pix"] * loss_pix
+            + w["detect"] * loss_detect
+            + w["v"] * loss_v
+            + w_snr
+            * (
+                w["refine_perceptual"] * loss_r_perc
+                + w["refine_fft"] * loss_r_fft
+                + w["refine_grad"] * loss_r_grad
             )
+        )
 
-        with torch.amp.autocast("cuda", enabled=self.use_amp):
-            out = self.net(lq, frame_mask)
+        log = {
+            "loss_pix": float(loss_pix.detach()),
+            "loss_detect": float(loss_detect.detach()),
+            "loss_v": float(loss_v.detach()),
+            "loss_r_fft": float(loss_r_fft.detach()),
+            "loss_r_grad": float(loss_r_grad.detach()),
+        }
+        if self.use_perceptual:
+            log["loss_r_perc"] = float(loss_r_perc.detach())
 
-            coarse = out["coarse"]
-            coarse_f = out["coarse_f"]
-
-            n_b, t_b, c_b, h_b, w_b = gt.shape
-            gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
-            # Scale the residual into the noise schedule's native ~[-1, 1]
-            # range (gt - coarse spans [-2, 2]); inverted below and in restore().
-            res_scale = float(self.net.cfg.residual_scale)
-            residual_target = ((gt_f - coarse_f) * res_scale).detach()
-
-            loss_pix = self.loss_pix(coarse, gt)
-            loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
-            loss_v, diff_info = self.loss_diffusion(
-                self.net.diffusion,
-                self.net.refine_unet,
-                residual_target,
-                out["refine_cond"],
-            )
-            loss_vfi = self.loss_vfi(coarse, gt, frame_mask)
-
-            # Sharpness losses on the FINAL refiner output (coarse + predicted
-            # residual). x0_pred is the diffusion estimate of the clean residual;
-            # coarse is detached so these losses train the refiner (and the
-            # backbone `cond` features), not the coarse branch.
-            refined_pred = torch.clamp(
-                coarse_f.detach() + diff_info["x0_pred"] / res_scale, -1.0, 1.0
-            )
-            loss_r_fft = self.loss_fft(refined_pred, gt_f)
-            loss_r_grad = self.loss_grad(refined_pred, gt_f)
-            if self.use_perceptual:
-                loss_r_perc = self.loss_perceptual(refined_pred, gt_f)
-            else:
-                loss_r_perc = coarse_f.new_zeros(())
-
-            # Down-weight the refined losses when x0_pred is unreliable (high
-            # noise / large timestep); alphas_cumprod[t] ~ 1 at low noise, ~ 0
-            # at high noise.
-            if self.refine_snr_weight:
-                w_snr = self.net.diffusion.alphas_cumprod[
-                    diff_info["t"]
-                ].float().mean()
-            else:
-                w_snr = coarse_f.new_ones(())
-
-            total = (
-                w["pix"] * loss_pix
-                + w["detect"] * loss_detect
-                + w["v"] * loss_v
-                + w["vfi"] * loss_vfi
-                + w_snr
-                * (
-                    w["refine_perceptual"] * loss_r_perc
-                    + w["refine_fft"] * loss_r_fft
-                    + w["refine_grad"] * loss_r_grad
-                )
-            )
-
-            log = {
-                "loss_pix": float(loss_pix.detach()),
-                "loss_detect": float(loss_detect.detach()),
-                "loss_v": float(loss_v.detach()),
-                "loss_vfi": float(loss_vfi.detach()),
-                "loss_r_fft": float(loss_r_fft.detach()),
-                "loss_r_grad": float(loss_r_grad.detach()),
-            }
-            if self.use_perceptual:
-                log["loss_r_perc"] = float(loss_r_perc.detach())
-
-            if self.use_perceptual:
-                loss_perc = self._coarse_perceptual(coarse, gt)
-                total = total + w["perceptual"] * loss_perc
-                log["loss_perc"] = float(loss_perc.detach())
+        if self.use_perceptual:
+            loss_perc = self._coarse_perceptual(coarse, gt)
+            total = total + w["perceptual"] * loss_perc
+            log["loss_perc"] = float(loss_perc.detach())
 
         # Accumulate gradients over `grad_accum` batches, then step once.
-        self.scaler.scale(total / self.grad_accum).backward()
+        (total / self.grad_accum).backward()
         self._accum_count += 1
 
-        scale_before = self.scaler.get_scale()
-        scale_after = scale_before
         if self._accum_count >= self.grad_accum:
             self._accum_count = 0
-            self.scaler.unscale_(self.optimizer_g)
             if self.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.net.parameters(), max_norm=self.grad_clip
                 )
-            self.scaler.step(self.optimizer_g)
-            self.scaler.update()
-            scale_after = self.scaler.get_scale()
+            self.optimizer_g.step()
             self.optimizer_g.zero_grad(set_to_none=True)
             if self.ema is not None:
                 self.ema.update(self.net)
@@ -350,17 +383,7 @@ class Trainer:
                 for k, v in log.items()
                 if not (isinstance(v, float) and v == v and v < float("inf"))
             }
-            print(
-                f"\n[WARN iter {self.iteration}] NaN/Inf loss detected! "
-                f"Culprits: {bad} | "
-                f"AMP scale: {scale_before:.3g} -> {scale_after:.3g}"
-            )
-
-        elif scale_after < scale_before:
-            print(
-                f"[iter {self.iteration}] AMP scale dropped "
-                f"{scale_before:.3g} -> {scale_after:.3g} (overflow, step skipped)"
-            )
+            print(f"\n[WARN iter {self.iteration}] NaN/Inf loss detected! Culprits: {bad}")
 
         return log
 
@@ -421,10 +444,9 @@ class Trainer:
                 end = min(i + window_size, all_len)
                 part_lq = lq[:, i:end].to(self.device, non_blocking=True)
 
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    part_out, part_coarse = self.net.restore(
-                        part_lq, refine_steps=refine_steps, return_coarse=True
-                    )
+                part_out, part_coarse = self.net.restore(
+                    part_lq, refine_steps=refine_steps, return_coarse=True
+                )
 
                 all_output.append(part_out.detach().cpu())
                 all_coarse.append(part_coarse.detach().clamp(-1.0, 1.0).cpu())
@@ -476,7 +498,7 @@ class Trainer:
         lq = batch["lq"][:, :window_size].to(self.device, non_blocking=True)
         gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
 
-        with self._ema_weights(), torch.amp.autocast("cuda", enabled=self.use_amp):
+        with self._ema_weights():
             out = self.net.restore(lq)
 
         def _to_grid(clip: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -538,8 +560,15 @@ class Trainer:
                 unit="batch",
                 dynamic_ncols=True,
             )
+            epoch_sums: dict[str, float] = {}
+            epoch_count = 0
             for batch in pbar:
                 log = self.train_step(batch)
+                if not log.get("skipped"):
+                    for k, v in log.items():
+                        if isinstance(v, float) and v == v:  # skip NaN
+                            epoch_sums[k] = epoch_sums.get(k, 0.0) + v
+                    epoch_count += 1
                 pbar.set_postfix(loss=f"{log['loss_total']:.4f}")
                 if self.iteration % log_every == 0:
                     msg = " ".join(f"{k}:{v:.4f}" for k, v in log.items())
@@ -558,8 +587,30 @@ class Trainer:
                     f"psnr:{metrics['psnr_coarse']:.3f} "
                     f"ssim:{metrics['ssim_coarse']:.4f}"
                 )
-                if metrics["psnr"] > self.best_psnr:
-                    self.best_psnr = metrics["psnr"]
+
+            # Record the epoch's mean losses (and val metrics when available)
+            # BEFORE saving any checkpoint, so every checkpoint carries the
+            # loss history up to and including its own epoch.
+            entry = {"epoch": epoch, "lr": lr_now}
+            if epoch_count > 0:
+                entry.update({k: v / epoch_count for k, v in epoch_sums.items()})
+            if metrics is not None:
+                entry.update(
+                    {
+                        "val_psnr": metrics["psnr"],
+                        "val_ssim": metrics["ssim"],
+                        "val_psnr_coarse": metrics["psnr_coarse"],
+                        "val_ssim_coarse": metrics["ssim_coarse"],
+                    }
+                )
+            self.loss_history.append(entry)
+            self._write_loss_history()
+
+            if do_validate:
+                # Select best on the coarse PSNR: it is the stable measure of
+                # restoration progress (refined has DDIM sampling variance).
+                if metrics["psnr_coarse"] > self.best_psnr:
+                    self.best_psnr = metrics["psnr_coarse"]
                     self.best_epoch = epoch
                     self._save_checkpoint_file("best.pth", epoch, metrics)
                     self._save_validation_sample(epoch, val_loader, tag="best")
@@ -580,11 +631,12 @@ class Trainer:
             "model": self.net.state_dict(),
             "ema": self.ema.state_dict() if self.ema is not None else None,
             "optimizer_g": self.optimizer_g.state_dict(),
-            "scaler": self.scaler.state_dict(),
+            "raft_unfrozen": self._raft_unfrozen,
             "model_config": self.model_cfg.to_dict(),
             "config": self.cfg,
             "best_psnr": self.best_psnr,
             "best_epoch": self.best_epoch,
+            "loss_history": self.loss_history,
         }
         if metrics is not None:
             state["val_metrics"] = metrics
@@ -600,6 +652,21 @@ class Trainer:
     def _save_checkpoint(self, epoch: int, metrics: Optional[dict] = None):
         self._save_checkpoint_file(f"revivid_epoch{epoch:03d}.pth", epoch, metrics)
         self._save_checkpoint_file("latest.pth", epoch, metrics)
+
+    def _write_loss_history(self) -> None:
+        """Mirror the loss history to <exp_dir>/loss_history.csv for plotting."""
+        if not self.loss_history:
+            return
+        fieldnames: list[str] = []
+        for entry in self.loss_history:
+            for k in entry:
+                if k not in fieldnames:
+                    fieldnames.append(k)
+        path = self.exp_dir / "loss_history.csv"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+            writer.writeheader()
+            writer.writerows(self.loss_history)
 
     def save_training_config(self) -> Path:
         """Persist the active config when starting a fresh training run."""
@@ -619,11 +686,14 @@ class Trainer:
                 # Older checkpoint without EMA — seed the shadow from the
                 # freshly loaded weights instead of the random init.
                 self.ema = ModelEMA(self.net, self.ema.decay)
+        self.iteration = state.get("iteration", 0)
+        self.loss_history = list(state.get("loss_history") or [])
+        if state.get("raft_unfrozen"):
+            # Recreate the flow param group BEFORE loading the optimizer state
+            # so the group structure matches the checkpoint.
+            self._maybe_unfreeze_raft(force=True)
         if "optimizer_g" in state:
             self.optimizer_g.load_state_dict(state["optimizer_g"])
-        if "scaler" in state and self.use_amp:
-            self.scaler.load_state_dict(state["scaler"])
-        self.iteration = state.get("iteration", 0)
         self.best_psnr = float(state.get("best_psnr", -1.0))
         stored_epoch = int(state.get("epoch", 0))
         if state.get("epoch_numbering") == 1:

@@ -9,7 +9,6 @@ functions:
 * ``DiffusionLoss`` - wrapper for V-prediction diffusion step.
 * ``FocalFrequencyLoss`` - L1 distance in spectral/frequency domain to combat oversmoothing.
 * ``GradientLoss`` - L1 on Sobel gradients; penalises soft/blurry edges directly.
-* ``MaskedReconstructionLoss`` - targeted Charbonnier for missing VFI frames.
 """
 
 from __future__ import annotations
@@ -20,45 +19,42 @@ import torch.nn.functional as F
 
 
 class CharbonnierLoss(nn.Module):
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
+    """Robust L1. ``weight`` optionally re-weights pixels (e.g. boost holes);
+    the result is a weighted mean so the loss scale stays comparable."""
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt((pred - target) ** 2 + self.eps * self.eps).mean()
-
-
-class HoleDetectionLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, logits: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
-        return F.binary_cross_entropy_with_logits(logits, target_mask)
-
-
-class MaskedReconstructionLoss(nn.Module):
     def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
     def forward(
-        self, pred: torch.Tensor, target: torch.Tensor, frame_mask: torch.Tensor
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        n, t, c, h, w = pred.shape
-        pred_f = pred.reshape(n * t, c, h, w)
-        target_f = target.reshape(n * t, c, h, w)
-        mask_f = frame_mask.reshape(-1)
+        loss = torch.sqrt((pred - target) ** 2 + self.eps * self.eps)
+        if weight is None:
+            return loss.mean()
+        w = weight.expand_as(loss)
+        return (loss * w).sum() / w.sum().clamp(min=1.0)
 
-        missing = ~mask_f
-        if not missing.any():
-            return pred.new_zeros(())
 
-        pred_missing = pred_f[missing]
-        target_missing = target_f[missing]
+class HoleDetectionLoss(nn.Module):
+    """BCE for the persistent-hole detector.
 
-        return torch.sqrt(
-            (pred_missing - target_missing) ** 2 + self.eps * self.eps
-        ).mean()
+    Holes cover only a small fraction of pixels, so plain BCE is dominated by
+    the background and the detector ends up under-firing. ``pos_weight``
+    up-weights the positive (hole) class to compensate.
+    """
+
+    def __init__(self, pos_weight: float = 10.0):
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor(float(pos_weight)))
+
+    def forward(self, logits: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(
+            logits, target_mask, pos_weight=self.pos_weight
+        )
 
 
 class DiffusionLoss(nn.Module):
@@ -71,11 +67,13 @@ class DiffusionLoss(nn.Module):
         refine_unet,
         residual_target: torch.Tensor,
         cond: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         loss, info = diffusion_obj.training_losses(
             refine_unet,
             residual_target,
             model_kwargs={"cond": cond},
+            loss_mask=loss_mask,
         )
         return loss, info
 
@@ -84,7 +82,6 @@ class FocalFrequencyLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.autocast("cuda", enabled=False)
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_fft = torch.fft.rfft2(pred.float(), norm="ortho")
         target_fft = torch.fft.rfft2(target.float(), norm="ortho")
@@ -166,7 +163,6 @@ class VGGPerceptualLoss(nn.Module):
             x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
         return x
 
-    @torch.autocast("cuda", enabled=False)
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
         pred = self._prep(pred.float())

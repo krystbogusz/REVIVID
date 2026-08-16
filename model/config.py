@@ -14,7 +14,7 @@ from typing import Sequence
 @dataclass
 class ModelConfig:
 
-    num_feat: int = 16
+    num_feat: int = 32
     num_block: int = 6
     embed_dim: int = 64
     cond_dim: int = 64
@@ -22,20 +22,22 @@ class ModelConfig:
     ssm_expand: int = 2
     sr_scale: int = 1
 
-    refiner_base: int = 64
-    channel_mult: Sequence[int] = (1, 2, 4)
+    refiner_base: int = 48
+    channel_mult: Sequence[int] = (1, 2, 3)
     num_res_blocks: int = 2
-
-    mask_embed_dim: int = 16
 
     num_timesteps: int = 1000
     schedule: str = "cosine"
     refine_steps: int = 8
 
-    hole_threshold: float = 0.5
+    # Min-SNR-gamma weighting of the diffusion loss (0 = off, 5.0 = paper value)
+    min_snr_gamma: float = 5.0
 
-    vfi_prob: float = 0.5
-    vfi_mask_ratio: float = 0.3
+    # The diffusion residual (gt - coarse, range [-2, 2]) is multiplied by this
+    # before entering the noise schedule and divided back out at sampling time.
+    residual_scale: float = 0.5
+
+    hole_threshold: float = 0.5
 
     hole_prob: float = 0.15
 

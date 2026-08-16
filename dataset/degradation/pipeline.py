@@ -4,10 +4,10 @@ Applies a randomised sequence of classical film-degradation operations
 (blur, noise, JPEG compression, resampling, texture overlay) to a list of
 BGR frames and returns the degraded frames at the requested output size.
 
-Holes (persistent spatial damage) and VFI masking are intentionally NOT
-applied here — they are added at the window level by the caller (DatasetCreator
-or DataLoader) so that the same base-degraded clip can be windowed into many
-training samples with independent hole/VFI decisions per window.
+Holes (persistent spatial damage) are intentionally NOT applied here — they are
+added at the window level by the caller (DatasetCreator or DataLoader) so that
+the same base-degraded clip can be windowed into many training samples with
+independent hole decisions per window.
 
 Order of operations per frame (matches MambaOFR degradation_video_list_5):
     1. BGR → greyscale → JPEG na greyscale (uint8 H×W) → z powrotem do 3-kanałowego RGB
@@ -143,8 +143,7 @@ def process_video_frames(
     """Degrade frames at their native resolution and resize them at the very end.
 
     Applies blur, downsampling, texture overlay, noise and color jitter — but
-    NOT holes (use ``apply_holes_to_window`` after windowing) and NOT VFI
-    masking (handled by the caller).
+    NOT holes (use ``apply_holes_to_window`` after windowing).
 
     All degradations run on the original resolution. The final size is either an
     explicit ``out_size=(height, width)`` (takes precedence) or the native size

@@ -1,8 +1,10 @@
 """Optical-flow estimation and warping.
 
 REVIVID uses a single, real optical-flow estimator: torchvision's RAFT
-(``raft_small``) with pretrained weights. The estimator is always frozen
-and run under ``no_grad`` for speed and memory efficiency.
+(``raft_small``) with pretrained weights. The estimator starts frozen and is
+unfrozen by the trainer after a warmup (MambaOFR recipe: fine-tune the flow on
+degraded frames at a reduced learning rate once the rest of the network has
+stabilised).
 """
 
 from __future__ import annotations
@@ -43,7 +45,8 @@ def flow_warp(
 class RAFTFlow(nn.Module):
     """torchvision RAFT wrapper returning flow_{a->b} as (n, 2, h, w).
 
-    Always frozen — weights are never updated during training.
+    Frozen by default; the trainer calls :meth:`set_trainable` after the
+    warmup phase to fine-tune the flow at a reduced learning rate.
     """
 
     def __init__(self):
@@ -57,9 +60,16 @@ class RAFTFlow(nn.Module):
         except Exception:
             self.raft = raft_small(weights=None)
 
+        self._trainable = False
         for p in self.raft.parameters():
             p.requires_grad_(False)
         self.eval()
+
+    def set_trainable(self, flag: bool = True) -> None:
+        """Enable/disable fine-tuning of the RAFT weights."""
+        self._trainable = bool(flag)
+        for p in self.raft.parameters():
+            p.requires_grad_(self._trainable)
 
     _MIN_SIZE = 128
 
@@ -78,7 +88,8 @@ class RAFTFlow(nn.Module):
             a = F.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
-        with torch.no_grad():
+        grad_ok = self._trainable and torch.is_grad_enabled()
+        with torch.set_grad_enabled(grad_ok):
             flow = self.raft(a.contiguous(), b.contiguous())[-1]
 
         if (H, W) != (h, w):

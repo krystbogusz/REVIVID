@@ -1,12 +1,13 @@
 """Conditional 2D U-Net denoiser.
 
-A single unified v-prediction denoiser used for all three tasks (restoration,
-VFI, inpainting). It denoises a high-frequency residual conditioned on the
-coarse backbone output (coarse frame, hole mask, backbone features, and the
-temporal frame-mask embedding).
+A single unified v-prediction denoiser used for restoration + SR and hole
+inpainting. It denoises a high-frequency residual conditioned on the coarse
+backbone output (coarse frame, hole mask, backbone features).
 
-Conditioning is fed by channel-concatenation at the input; the timestep is
-injected via FiLM inside every residual block.
+Conditioning is fed by channel-concatenation at the input AND re-injected at
+every encoder level (1x1 projection of the downscaled conditioning added to the
+features), so backbone information survives deep into the network; the timestep
+is injected via FiLM inside every residual block.
 """
 
 from __future__ import annotations
@@ -51,6 +52,21 @@ class ConditionalUNet(nn.Module):
         self.time_embed = TimestepEmbedding(base_channels, time_dim)
 
         self.conv_in = nn.Conv2d(in_channels + cond_channels, base_channels, 3, 1, 1)
+
+        # Multi-scale conditioning: re-inject the (downscaled) conditioning at
+        # each encoder level below the input resolution. Zero-initialised so
+        # the injection starts as a no-op.
+        self.cond_projs = None
+        if cond_channels > 0 and len(channel_mult) > 1:
+            projs = []
+            # After the downsampler leaving level i, features still carry
+            # base*mult[i] channels — that is the width at the injection point.
+            for mult in channel_mult[:-1]:
+                proj = nn.Conv2d(cond_channels, base_channels * mult, 1)
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+                projs.append(proj)
+            self.cond_projs = nn.ModuleList(projs)
 
         self.down_blocks = nn.ModuleList()
         self.down_samplers = nn.ModuleList()
@@ -118,8 +134,14 @@ class ConditionalUNet(nn.Module):
 
         h = self.conv_in(x)
 
+        # Padded conditioning for the multi-scale re-injection (the pad above
+        # was applied to the concatenated [x, cond] tensor).
+        cond_p = x[:, self.in_channels :] if self.cond_channels > 0 else None
+
         skips = [h]
-        for blocks, sampler in zip(self.down_blocks, self.down_samplers):
+        for level, (blocks, sampler) in enumerate(
+            zip(self.down_blocks, self.down_samplers)
+        ):
             for block in blocks:
                 if isinstance(block, TimeConditionedResBlock):
                     if self.use_checkpoint:
@@ -131,6 +153,14 @@ class ConditionalUNet(nn.Module):
                     h = block(h)
             if sampler is not None:
                 h = sampler(h)
+                if self.cond_projs is not None:
+                    c = F.interpolate(
+                        cond_p,
+                        size=h.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    h = h + self.cond_projs[level](c)
                 skips.append(h)
 
         if self.use_checkpoint:
