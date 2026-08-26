@@ -1,0 +1,61 @@
+seed: 2026
+model:
+  num_feat: 32
+  num_block: 6
+  embed_dim: 64
+  cond_dim: 64
+  d_state: 16
+  ssm_expand: 2
+  sr_scale: 4
+  refiner_base: 48
+  channel_mult:
+  - 1
+  - 2
+  - 3
+  num_res_blocks: 2
+  num_timesteps: 1000
+  schedule: cosine
+  refine_steps: 8
+  residual_scale: 0.5
+  min_snr_gamma: 5.0
+  hole_threshold: 0.5
+  hole_prob: 0.25
+training:
+  epochs: 2010
+  batch_size: 1
+  num_frame: 7
+  patch_size: 400
+  lr: 0.0002
+  lr_min: 1.0e-06
+  beta1: 0.9
+  beta2: 0.99
+  grad_accum: 8
+  ema_decay: 0.999
+  raft_unfreeze_iter: 20000
+  flow_lr_mul: 0.125
+  hole_loss_boost: 3.0
+  hole_pos_weight: 10.0
+  use_perceptual: true
+  loss_weights:
+    pix: 1.0
+    perceptual: 0.1
+    detect: 0.05
+    v: 1.0
+    refine_perceptual: 0.1
+    refine_fft: 0.5
+    refine_grad: 0.5
+  refine_snr_weight: true
+  num_workers: 10
+  use_flip: true
+  use_rot: true
+validation:
+  patch_size: 400
+  val_every: 10
+  max_clips: 0
+  max_frames: 35
+  refine_steps: 0
+  num_workers: 5
+logging:
+  log_every: 120
+  exp_dir: ./experiments/revivid
+  save_checkpoint_every: 10
