@@ -157,7 +157,7 @@ validation:
   #                  (slowest; watch host RAM at num_workers > 2).
   # Both sides are snapped to a multiple of sr_scale*4 so the LQ stays integral
   # and the refiner UNet needs no padding. Set gt_size: ~ for native size.
-  gt_size: [640, 368]
+  gt_size: [640, 360]
 
   val_every: 10          # run validation every N epochs (1 = every epoch)
   max_clips: 0           # cap number of validation clips (0 = all)
