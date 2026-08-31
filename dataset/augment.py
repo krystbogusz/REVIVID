@@ -12,14 +12,21 @@ def augment_frames(
     imgs: list[np.ndarray],
     hflip: bool = True,
     rotation: bool = True,
+    transpose: bool = True,
 ) -> list[np.ndarray]:
-    """Apply the same hflip / vflip / 90° rotation to every frame in *imgs*."""
+    """Apply the same hflip / vflip / 90° rotation to every frame in *imgs*.
+
+    ``transpose`` gates only the 90° rotation, which swaps H and W. It must be
+    off for non-square crops: otherwise the sample shape flips at random, which
+    breaks collation for ``batch_size > 1`` and feeds the model an aspect ratio
+    it will never see at inference. Flips are unaffected.
+    """
     if not imgs:
         return imgs
 
     do_hflip = hflip and random.random() < 0.5
     do_vflip = rotation and random.random() < 0.5
-    do_rot90 = rotation and random.random() < 0.5
+    do_rot90 = rotation and transpose and random.random() < 0.5
 
     if not (do_hflip or do_vflip or do_rot90):
         return imgs

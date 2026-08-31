@@ -38,7 +38,10 @@ model:
   # Super-resolution upscale factor in the backbone (PixelShuffle)
   # and LR downscale factor for dataset generation.
   # Powers of two only: 1 (no SR), 2 (2×), 4 (4×).
-  sr_scale: 4
+  # NOTE: changing this changes the backbone (build_upsampler adds/removes a
+  # PixelShuffle stage), so old checkpoints will not load. It also invalidates
+  # the baked valid/degraded clips - regenerate that split after changing it.
+  sr_scale: 2
 
   # Diffusion UNet refiner (no down/up attn — Mamba backbone provides global
   # context; conditioning is re-injected at every encoder level).
@@ -50,7 +53,19 @@ model:
   num_timesteps: 1000
   schedule: cosine
   refine_steps: 8         # DDIM steps at inference
-  residual_scale: 0.5     # scales the (gt - coarse) residual into ~[-1, 1]
+
+  # The diffusion works on (gt - coarse) divided by a RUNNING estimate of that
+  # residual's std, so the target always lands in the schedule's native
+  # ~N(0, 1) range. A fixed scale does not survive training: as the coarse
+  # branch improves the residual shrinks, the target collapses towards zero,
+  # v becomes a closed form of x_t and the refiner stops learning (this is
+  # exactly what happened in revivid_v3 - loss_v stuck at 0.0027 and the
+  # refiner cost -0.9 dB on every one of 307 validations).
+  residual_std_init: 0.15     # seed, only used before the first train step
+  residual_std_momentum: 0.99 # EMA momentum of the running std
+  residual_std_warmup: 200    # iters using the raw batch std (fast lock-on)
+  residual_std_min: 0.001     # floor, guards against dividing by ~0
+
   min_snr_gamma: 5.0      # Min-SNR loss weighting (0 = off); speeds up convergence
 
   # Spatial hole detection (inference only — training uses on-the-fly threshold)
@@ -67,8 +82,15 @@ training:
   batch_size: 1
   num_frame: 7
 
-  # Random GT crop for training (LR crop = patch_size / sr_scale).
-  patch_size: 400
+  # Fixed-size random GT crop, [width, height], taken at the clips' native
+  # resolution — MambaOFR's paired_random_crop (their train `gt_size`). Only
+  # the crop position is random; the size the model sees is always this.
+  # The LQ crop is always gt_size / sr_scale, so with sr_scale 4:
+  #   [400, 400] -> GT 400×400, LQ 100×100
+  #   [512, 288] -> GT 512×288, LQ 128×72
+  # Snapped to a multiple of sr_scale*4 (see validation.gt_size).
+  # Set gt_size: ~ to train on whole frames at native resolution.
+  gt_size: [256, 256]
 
   lr: 0.0002              # linear decay from lr to lr_min over all epochs
   lr_min: 0.000001
@@ -101,7 +123,9 @@ training:
     perceptual: 0.1       # VGG perceptual on coarse
     detect: 0.05          # BCE on hole_head (hole detector)
     v: 1.0                # v-prediction diffusion loss (restoration + SR + inpaint)
-    # Sharpness losses on the FINAL refined output (coarse + predicted residual):
+    # Losses on the FINAL refined output (coarse + predicted residual):
+    refine_pix: 1.0        # Charbonnier on refined - anchors it to GT in pixel
+                           # space, which is what val_psnr measures
     refine_perceptual: 0.1 # VGG perceptual on refined
     refine_fft: 0.5        # frequency-domain loss on refined (recover fine texture)
     refine_grad: 0.5       # Sobel gradient loss on refined (crisp edges)
@@ -118,18 +142,26 @@ training:
 # Validation / logging
 # --------------------------------------------------------------------------- #
 validation:
-  # NOTE: this is a diffusion model — each validation window costs `refine_steps`
-  # DDIM forward passes, so full-resolution validation every epoch is very slow.
-  # The knobs below trade a bit of metric fidelity for a big speedup.
-
-  # HR crop for validation (center crop). 0 = full frames — DDIM at native
-  # REDS resolution (~1280×720) is very slow / may OOM. A crop is MUCH faster.
-  patch_size: 400        # e.g. 256; set 0 for full-frame validation
+  # MambaOFR validation protocol: never a crop. Whole frames, whole clips, and
+  # the model's own `model.refine_steps` — the trainer chunks each clip by
+  # num_frame and concatenates before computing metrics, exactly like
+  # MambaOFR's val_frame_num loop. Validation therefore always measures the
+  # same path as real inference; the only knob is the resolution below.
+  #
+  # gt_size is [width, height] in GT pixels — pick whatever you can afford.
+  # The LQ fed to the network is always gt_size / sr_scale, so with sr_scale 4:
+  #   [640, 368]  -> GT 640×368,  LQ 160×92   (matches MambaOFR's REDS4 val)
+  #   [960, 544]  -> GT 960×544,  LQ 240×136
+  #   [1280, 720] -> native REDS resolution — LQ 320×180 matches the baked
+  #                  degraded clips exactly, so the LQ is not resampled at all
+  #                  (slowest; watch host RAM at num_workers > 2).
+  # Both sides are snapped to a multiple of sr_scale*4 so the LQ stays integral
+  # and the refiner UNet needs no padding. Set gt_size: ~ for native size.
+  gt_size: [640, 368]
 
   val_every: 10          # run validation every N epochs (1 = every epoch)
   max_clips: 0           # cap number of validation clips (0 = all)
-  max_frames: 35          # cap frames evaluated per clip (0 = all)
-  refine_steps: 0        # DDIM steps during validation (0 = model default, e.g. 8)
+  max_frames: 0          # cap frames evaluated per clip (0 = all)
   num_workers: 5         # DataLoader workers for validation (0 = main process)
 
 logging:

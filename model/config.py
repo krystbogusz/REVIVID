@@ -33,9 +33,19 @@ class ModelConfig:
     # Min-SNR-gamma weighting of the diffusion loss (0 = off, 5.0 = paper value)
     min_snr_gamma: float = 5.0
 
-    # The diffusion residual (gt - coarse, range [-2, 2]) is multiplied by this
-    # before entering the noise schedule and divided back out at sampling time.
-    residual_scale: float = 0.5
+    # The diffusion residual (gt - coarse) is normalised by a running estimate
+    # of its own standard deviation before entering the noise schedule, and
+    # scaled back out at sampling time. A FIXED scale does not work here: the
+    # coarse branch keeps improving, so the residual keeps shrinking, and any
+    # constant tuned today drifts into a degenerate target (v becomes a closed
+    # form of x_t, the loss collapses to ~0 and the refiner learns nothing).
+    # `residual_std_init` only seeds the buffer before the first train step;
+    # during `residual_std_warmup` iterations the raw batch std is used, so the
+    # scale locks on immediately while the coarse output is still random.
+    residual_std_init: float = 0.15
+    residual_std_momentum: float = 0.99
+    residual_std_warmup: int = 200
+    residual_std_min: float = 1e-3
 
     hole_threshold: float = 0.5
 

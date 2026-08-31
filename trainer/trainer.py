@@ -118,11 +118,13 @@ class Trainer:
         self.log_cfg = cfg.get("logging", {})
 
         # Validation cost controls (validation on a diffusion model is expensive:
-        # every window costs `refine_steps` DDIM forward passes).
+        # every window costs `model.refine_steps` DDIM forward passes). The
+        # protocol itself is fixed: full frames at `validation.gt_size`, whole
+        # clips, and the model's own refine_steps — never a crop or a reduced
+        # step count, so val numbers always describe the real inference path.
         self.val_every = max(1, int(self.val_cfg.get("val_every", 1)))
         self.val_max_clips = int(self.val_cfg.get("max_clips", 0))
         self.val_max_frames = int(self.val_cfg.get("max_frames", 0))
-        self.val_refine_steps = int(self.val_cfg.get("refine_steps", 0))
 
         self.device = torch.device("cuda")
         if not torch.cuda.is_available():
@@ -141,6 +143,7 @@ class Trainer:
             "perceptual": 0.1,
             "detect": 0.05,
             "v": 1.0,
+            "refine_pix": 1.0,
             "refine_perceptual": 0.1,
             "refine_fft": 0.5,
             "refine_grad": 0.5,
@@ -286,10 +289,15 @@ class Trainer:
 
         n_b, t_b, c_b, h_b, w_b = gt.shape
         gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
-        # Scale the residual into the noise schedule's native ~[-1, 1]
-        # range (gt - coarse spans [-2, 2]); inverted below and in restore().
-        res_scale = float(self.net.cfg.residual_scale)
-        residual_target = ((gt_f - coarse_f) * res_scale).detach()
+        # Normalise the residual by a running estimate of its own std so the
+        # diffusion target always sits in the schedule's native ~N(0, 1) range.
+        # A fixed scale collapses as `coarse` improves: the target shrinks, v
+        # becomes a closed form of x_t, the loss falls to ~0 and the refiner
+        # stops learning anything about the image. Inverted below and in
+        # restore().
+        residual = gt_f - coarse_f
+        res_std = self.net.update_residual_std(residual)
+        residual_target = (residual / res_std).detach()
 
         # Boost the loss inside persistent holes so the sparse hole pixels are
         # not averaged away (hole_mask_f comes from the LQ fill-value threshold,
@@ -313,8 +321,12 @@ class Trainer:
         # coarse is detached so these losses train the refiner (and the
         # backbone `cond` features), not the coarse branch.
         refined_pred = torch.clamp(
-            coarse_f.detach() + diff_info["x0_pred"] / res_scale, -1.0, 1.0
+            coarse_f.detach() + diff_info["x0_pred"] * res_std, -1.0, 1.0
         )
+        # Pixel loss on the FINAL output: without it nothing anchors the
+        # refined image to the GT in pixel space, which is exactly what
+        # val_psnr measures.
+        loss_r_pix = self.loss_pix(refined_pred, gt_f, weight=pix_weight)
         loss_r_fft = self.loss_fft(refined_pred, gt_f)
         loss_r_grad = self.loss_grad(refined_pred, gt_f)
         if self.use_perceptual:
@@ -338,7 +350,8 @@ class Trainer:
             + w["v"] * loss_v
             + w_snr
             * (
-                w["refine_perceptual"] * loss_r_perc
+                w["refine_pix"] * loss_r_pix
+                + w["refine_perceptual"] * loss_r_perc
                 + w["refine_fft"] * loss_r_fft
                 + w["refine_grad"] * loss_r_grad
             )
@@ -348,8 +361,10 @@ class Trainer:
             "loss_pix": float(loss_pix.detach()),
             "loss_detect": float(loss_detect.detach()),
             "loss_v": float(loss_v.detach()),
+            "loss_r_pix": float(loss_r_pix.detach()),
             "loss_r_fft": float(loss_r_fft.detach()),
             "loss_r_grad": float(loss_r_grad.detach()),
+            "residual_std": float(res_std.detach()),
         }
         if self.use_perceptual:
             log["loss_r_perc"] = float(loss_r_perc.detach())
@@ -407,7 +422,6 @@ class Trainer:
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
         c_psnr_sum, c_ssim_sum = 0.0, 0.0
         window_size = int(self.train_cfg.get("num_frame", 7))
-        refine_steps = self.val_refine_steps or None
 
         try:
             total_clips = len(val_loader)
@@ -445,7 +459,7 @@ class Trainer:
                 part_lq = lq[:, i:end].to(self.device, non_blocking=True)
 
                 part_out, part_coarse = self.net.restore(
-                    part_lq, refine_steps=refine_steps, return_coarse=True
+                    part_lq, return_coarse=True
                 )
 
                 all_output.append(part_out.detach().cpu())
@@ -581,11 +595,20 @@ class Trainer:
             )
             if do_validate:
                 metrics = self.validate(val_loader, epoch=epoch)
+                # `delta` is the whole point of the refiner: positive means the
+                # diffusion head improved on the coarse output, negative means
+                # it is actively damaging it. Printed explicitly so a broken
+                # refiner is visible within the first few validations instead
+                # of thousands of epochs later.
+                delta = metrics["psnr"] - metrics["psnr_coarse"]
+                verdict = "refiner POMAGA" if delta > 0 else "refiner SZKODZI"
                 print(
                     f"[epoch {epoch}] VAL refined psnr:{metrics['psnr']:.3f} "
                     f"ssim:{metrics['ssim']:.4f} | coarse "
                     f"psnr:{metrics['psnr_coarse']:.3f} "
-                    f"ssim:{metrics['ssim_coarse']:.4f}"
+                    f"ssim:{metrics['ssim_coarse']:.4f} "
+                    f"| delta:{delta:+.3f} dB ({verdict}) "
+                    f"| residual_std:{float(self.net.residual_std):.4f}"
                 )
 
             # Record the epoch's mean losses (and val metrics when available)

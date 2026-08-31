@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -93,7 +93,7 @@ class VideoFrameDataset(Dataset):
         hole_prob: float = 0.15,
         normalize: bool = True,
         sr_scale: int = 1,
-        patch_size: int = 0,
+        gt_size: Optional[Sequence[int]] = None,
         texture_dir: str | None = None,
         use_flip: bool = True,
         use_rot: bool = True,
@@ -106,9 +106,20 @@ class VideoFrameDataset(Dataset):
         self.hole_prob = hole_prob
         self.normalize = normalize
         self.sr_scale = max(1, int(sr_scale))
-        self.patch_size = int(patch_size)
+        self.gt_size = self._resolve_gt_size(gt_size)
         self.use_flip = use_flip
         self.use_rot = use_rot
+        if (
+            self.is_train
+            and self.use_rot
+            and self.gt_size is not None
+            and self.gt_size[0] != self.gt_size[1]
+        ):
+            print(
+                f"[dataset] train gt_size {self.gt_size[1]}x{self.gt_size[0]} is not "
+                f"square - 90 deg rotation disabled (it would swap H/W); "
+                f"flips still applied"
+            )
 
         self.texture_dir = (
             str(resolve_texture_dir(texture_dir).resolve()) if self.is_train else None
@@ -137,6 +148,42 @@ class VideoFrameDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.pairs)
+
+    def _resolve_gt_size(
+        self, gt_size: Optional[Sequence[int]]
+    ) -> Optional[Tuple[int, int]]:
+        """Validate/snap the configured GT resolution, as ``[width, height]``.
+
+        ``gt_size`` is always given in **GT** pixels and the LQ fed to the
+        network is always that divided by ``sr_scale`` — the same relation as
+        MambaOFR's ``lq_patch_size = gt_patch_size // scale``. Both sides are
+        snapped to a multiple of ``sr_scale * 4`` so LR = GT / sr_scale stays
+        integral and the refiner UNet (size_factor 4) needs no padding.
+
+        The meaning differs per split, mirroring MambaOFR's ``Film_dataset_1``:
+
+        * training   - size of a random crop taken at *native* resolution
+          (``paired_random_crop``); only the crop position is random.
+        * validation - size the whole frame is resized to; validation never
+          crops (``paired_random_crop`` sits under ``if self.is_train``).
+
+        Returns ``None`` for native resolution / no crop.
+        """
+        if not gt_size:
+            return None
+        w, h = int(gt_size[0]), int(gt_size[1])
+        if w <= 0 or h <= 0:
+            return None
+        m = self.sr_scale * 4
+        gw = max(m, int(round(w / m)) * m)
+        gh = max(m, int(round(h / m)) * m)
+        if (gw, gh) != (w, h):
+            split = "train" if self.is_train else "valid"
+            print(
+                f"[dataset] {split} gt_size {w}x{h} snapped to {gw}x{gh} "
+                f"(multiple of sr_scale*4 = {m})"
+            )
+        return gh, gw
 
     def _sample_window(self, total: int) -> List[int]:
         if total <= 0:
@@ -173,19 +220,23 @@ class VideoFrameDataset(Dataset):
 
         first_gt = gt_map[sorted_window[0]]
         nh, nw = first_gt.shape[:2]
-        gh = max(sr, nh // sr * sr)
-        gw = max(sr, nw // sr * sr)
+        if not self.is_train and self.gt_size is not None:
+            # Validation: the whole frame is resized to the configured GT
+            # resolution — no crop, ever.
+            gh, gw = self.gt_size
+        else:
+            gh = max(sr, nh // sr * sr)
+            gw = max(sr, nw // sr * sr)
         lh, lw = gh // sr, gw // sr
 
-        if self.patch_size > 0:
-            ph = min(self.patch_size, gh) // sr * sr
-            pw = min(self.patch_size, gw) // sr * sr
-            if self.is_train:
-                gy = (random.randint(0, gh - ph) // sr) * sr
-                gx = (random.randint(0, gw - pw) // sr) * sr
-            else:
-                gy = ((gh - ph) // 2 // sr) * sr
-                gx = ((gw - pw) // 2 // sr) * sr
+        if self.is_train and self.gt_size is not None:
+            # Training: fixed-size random crop at native resolution, the
+            # equivalent of MambaOFR's paired_random_crop — the size is always
+            # gt_size (LR crop = gt_size / sr_scale), only the position moves.
+            ph = min(self.gt_size[0], gh)
+            pw = min(self.gt_size[1], gw)
+            gy = (random.randint(0, gh - ph) // sr) * sr
+            gx = (random.randint(0, gw - pw) // sr) * sr
         else:
             ph, pw, gy, gx = gh, gw, 0, 0
         ly, lx, lph, lpw = gy // sr, gx // sr, ph // sr, pw // sr
@@ -220,6 +271,7 @@ class VideoFrameDataset(Dataset):
                     window_gt_bgrs + deg_bgrs,
                     hflip=self.use_flip,
                     rotation=self.use_rot,
+                    transpose=(ph == pw),
                 )
                 window_gt_bgrs = combined[:n_gt]
                 deg_bgrs = combined[n_gt:]
@@ -323,7 +375,7 @@ def get_loader(
     root: Optional[str] = None,
     shuffle: Optional[bool] = None,
     sr_scale: int = 1,
-    patch_size: int = 0,
+    gt_size: Optional[Sequence[int]] = None,
     texture_dir: str | None = None,
     use_flip: bool = True,
     use_rot: bool = True,
@@ -337,7 +389,7 @@ def get_loader(
         is_train=is_train,
         hole_prob=hole_prob,
         sr_scale=sr_scale,
-        patch_size=patch_size,
+        gt_size=gt_size,
         texture_dir=texture_dir,
         use_flip=use_flip,
         use_rot=use_rot,
@@ -367,8 +419,8 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
     num_frame = int(tc.get("num_frame", 7))
     hole_prob = float(trainer.model_cfg.hole_prob)
     sr_scale = int(trainer.model_cfg.sr_scale)
-    patch_size = int(tc.get("patch_size", 0))
-    val_patch_size = int(val_cfg.get("patch_size", patch_size))
+    train_gt_size = tc.get("gt_size")
+    val_gt_size = val_cfg.get("gt_size")
     val_num_workers = int(val_cfg.get("num_workers", 0))
     texture_dir = tc.get("texture_dir")
 
@@ -380,7 +432,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
         num_workers=int(tc.get("num_workers", 0)),
         hole_prob=hole_prob,
         sr_scale=sr_scale,
-        patch_size=patch_size,
+        gt_size=train_gt_size,
         texture_dir=texture_dir,
         use_flip=bool(tc.get("use_flip", True)),
         use_rot=bool(tc.get("use_rot", True)),
@@ -390,7 +442,7 @@ def build_training_loaders(trainer) -> tuple[DataLoader, Optional[DataLoader]]:
             num_frame=num_frame,
             num_workers=val_num_workers,
             sr_scale=sr_scale,
-            patch_size=val_patch_size,
+            gt_size=val_gt_size,
         )
     except FileNotFoundError:
         val_loader = None

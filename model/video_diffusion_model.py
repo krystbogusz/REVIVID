@@ -95,6 +95,39 @@ class Video_Backbone(nn.Module):
             use_checkpoint=True,
         )
 
+        # Running estimate of std(gt - coarse). The diffusion works on the
+        # residual divided by this, so the target always lands in the noise
+        # schedule's native ~N(0, 1) range no matter how good `coarse` gets.
+        # Registered as a buffer so it rides along in state_dict() -> it is
+        # saved with every checkpoint and tracked by ModelEMA for free.
+        self.register_buffer(
+            "residual_std", torch.tensor(float(config.residual_std_init))
+        )
+        self.register_buffer("residual_std_steps", torch.tensor(0, dtype=torch.long))
+
+    @torch.no_grad()
+    def update_residual_std(self, residual: torch.Tensor) -> torch.Tensor:
+        """Update the residual scale from a training batch, return it.
+
+        For the first `residual_std_warmup` iterations the batch std is used
+        directly instead of the EMA. Early on the coarse branch is random, so
+        the residual is far larger than its steady state; an EMA seeded at
+        `residual_std_init` would lag badly behind and mis-scale the target in
+        the opposite direction. The batch std is computed over millions of
+        pixels, so it is a low-variance estimate and safe to use raw.
+        """
+        cfg = self.cfg
+        self.residual_std_steps += 1
+        batch_std = residual.detach().float().std()
+        if torch.isfinite(batch_std) and batch_std > 0:
+            if self.residual_std_steps <= cfg.residual_std_warmup:
+                self.residual_std.copy_(batch_std)
+            else:
+                m = float(cfg.residual_std_momentum)
+                self.residual_std.mul_(m).add_(batch_std, alpha=1.0 - m)
+            self.residual_std.clamp_(min=float(cfg.residual_std_min))
+        return self.residual_std
+
     def _build_cond(
         self,
         coarse: torch.Tensor,
@@ -204,9 +237,9 @@ class Video_Backbone(nn.Module):
             device=device,
             x_init=noise,
         )
-        # The diffusion operates on the residual scaled by cfg.residual_scale
-        # (see trainer) — undo that scaling before compositing.
-        residual = residual / self.cfg.residual_scale
+        # The diffusion operates on the residual normalised by residual_std
+        # (see trainer) — undo that normalisation before compositing.
+        residual = residual * self.residual_std
         refined = torch.clamp(coarse_f + residual, -1.0, 1.0)
         if return_coarse:
             return _unflatten_time(refined, nt), _unflatten_time(coarse_f, nt)
@@ -227,7 +260,8 @@ def _selftest_losses(
 
     n, t, c, hr_h, hr_w = gt.shape
     gt_f = gt.reshape(n * t, c, hr_h, hr_w)
-    residual_target = ((gt_f - out["coarse_f"]) * net.cfg.residual_scale).detach()
+    residual = gt_f - out["coarse_f"]
+    residual_target = (residual / net.update_residual_std(residual)).detach()
 
     loss_pix = CharbonnierLoss()(out["coarse"], gt)
     loss_detect = HoleDetectionLoss()(out["hole_logits_f"], out["hole_mask_f"])
