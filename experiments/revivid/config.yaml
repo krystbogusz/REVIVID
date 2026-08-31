@@ -21,7 +21,7 @@ model:
   hole_threshold: 0.5
   hole_prob: 0.25
 training:
-  epochs: 2010
+  epochs: 4000
   batch_size: 1
   num_frame: 7
   patch_size: 400

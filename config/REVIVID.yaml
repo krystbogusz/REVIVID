@@ -63,7 +63,7 @@ model:
 # Training
 # --------------------------------------------------------------------------- #
 training:
-  epochs: 2010
+  epochs: 4000
   batch_size: 1
   num_frame: 7
 
