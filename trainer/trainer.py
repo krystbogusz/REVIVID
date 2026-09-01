@@ -329,6 +329,18 @@ class Trainer:
         loss_r_pix = self.loss_pix(refined_pred, gt_f, weight=pix_weight)
         loss_r_fft = self.loss_fft(refined_pred, gt_f)
         loss_r_grad = self.loss_grad(refined_pred, gt_f)
+
+        # DIAGNOSTICS ONLY — never added to `total`, computed under no_grad so
+        # they cannot influence training. The coarse branch is trained purely
+        # by Charbonnier + a weak VGG term, and Charbonnier tolerates blur, so
+        # nothing currently pushes it towards GT-level sharpness. These two
+        # measure exactly that gap: loss_grad is L1 on Sobel gradients vs GT
+        # and loss_fft is L1 on FFT amplitude vs GT, so comparing loss_c_* with
+        # loss_r_* answers "is the refiner adding sharpness the coarse branch
+        # is missing, and how far is either from GT?".
+        with torch.no_grad():
+            loss_c_fft = self.loss_fft(coarse_f, gt_f)
+            loss_c_grad = self.loss_grad(coarse_f, gt_f)
         if self.use_perceptual:
             loss_r_perc = self.loss_perceptual(refined_pred, gt_f)
         else:
@@ -364,6 +376,8 @@ class Trainer:
             "loss_r_pix": float(loss_r_pix.detach()),
             "loss_r_fft": float(loss_r_fft.detach()),
             "loss_r_grad": float(loss_r_grad.detach()),
+            "loss_c_fft": float(loss_c_fft),
+            "loss_c_grad": float(loss_c_grad),
             "residual_std": float(res_std.detach()),
         }
         if self.use_perceptual:
@@ -421,6 +435,11 @@ class Trainer:
 
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
         c_psnr_sum, c_ssim_sum = 0.0, 0.0
+        # Sharpness vs GT, measured on the REAL inference path (full DDIM from
+        # noise), unlike the training-time loss_c_*/loss_r_* which see an
+        # x0_pred derived from a noised copy of the true residual and are
+        # therefore optimistic about the refiner. Lower = closer to GT.
+        grad_sum = c_grad_sum = fft_sum = c_fft_sum = 0.0
         window_size = int(self.train_cfg.get("num_frame", 7))
 
         try:
@@ -479,6 +498,26 @@ class Trainer:
             mc = evaluate_clip(full_coarse[0].float(), gt[0].float())
             c_psnr_sum += mc["psnr"] if mc["psnr"] != float("inf") else 0.0
             c_ssim_sum += mc["ssim"]
+
+            # Sharpness gap vs GT, chunked to keep the peak allocation small.
+            gt_f_cpu = gt[0].float()
+            n_fr = gt_f_cpu.shape[0]
+            g_r = g_c = f_r = f_c = 0.0
+            for i in range(0, n_fr, window_size):
+                j = min(i + window_size, n_fr)
+                g_ref = gt_f_cpu[i:j].to(self.device)
+                o = full_out[0, i:j].float().to(self.device)
+                c = full_coarse[0, i:j].float().to(self.device)
+                w = (j - i) / n_fr
+                g_r += w * float(self.loss_grad(o, g_ref))
+                g_c += w * float(self.loss_grad(c, g_ref))
+                f_r += w * float(self.loss_fft(o, g_ref))
+                f_c += w * float(self.loss_fft(c, g_ref))
+                del g_ref, o, c
+            grad_sum += g_r
+            c_grad_sum += g_c
+            fft_sum += f_r
+            c_fft_sum += f_c
             count += 1
 
             vbar.set_postfix(
@@ -497,13 +536,23 @@ class Trainer:
             "ssim": ssim_sum / count,
             "psnr_coarse": c_psnr_sum / count,
             "ssim_coarse": c_ssim_sum / count,
+            "grad": grad_sum / count,
+            "grad_coarse": c_grad_sum / count,
+            "fft": fft_sum / count,
+            "fft_coarse": c_fft_sum / count,
         }
 
     @torch.no_grad()
     def _save_validation_sample(
         self, epoch: int, val_loader, tag: str = "checkpoint"
     ) -> None:
-        """Save LQ / restored / GT frames from the first validation clip."""
+        """Save LQ / coarse / refined / GT frames from the first validation clip.
+
+        The coarse row is what the backbone produces on its own; the refined
+        row is that plus the diffusion residual. Having both side by side is
+        the only way to see whether the refiner is adding real detail or just
+        noise — the metrics alone cannot tell those apart.
+        """
         self.net.eval()
         batch = next(iter(val_loader))
 
@@ -513,7 +562,7 @@ class Trainer:
         gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
 
         with self._ema_weights():
-            out = self.net.restore(lq)
+            out, coarse = self.net.restore(lq, return_coarse=True)
 
         def _to_grid(clip: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
             frames = clip[0].float().clamp(-1.0, 1.0)
@@ -528,6 +577,7 @@ class Trainer:
         grid = torch.cat(
             [
                 _to_grid(lq, target_hw),
+                _to_grid(coarse, target_hw),
                 _to_grid(out, target_hw),
                 _to_grid(gt, target_hw),
             ],
@@ -610,6 +660,18 @@ class Trainer:
                     f"| delta:{delta:+.3f} dB ({verdict}) "
                     f"| residual_std:{float(self.net.residual_std):.4f}"
                 )
+                # Sharpness vs GT (lower = closer to GT, i.e. less blur).
+                sharper = (
+                    "refined ostrzejszy"
+                    if metrics["grad"] < metrics["grad_coarse"]
+                    else "coarse ostrzejszy"
+                )
+                print(
+                    f"[epoch {epoch}] OSTROSC vs GT  grad refined:"
+                    f"{metrics['grad']:.4f} coarse:{metrics['grad_coarse']:.4f}"
+                    f" | fft refined:{metrics['fft']:.4f} "
+                    f"coarse:{metrics['fft_coarse']:.4f}  ({sharper})"
+                )
 
             # Record the epoch's mean losses (and val metrics when available)
             # BEFORE saving any checkpoint, so every checkpoint carries the
@@ -624,6 +686,10 @@ class Trainer:
                         "val_ssim": metrics["ssim"],
                         "val_psnr_coarse": metrics["psnr_coarse"],
                         "val_ssim_coarse": metrics["ssim_coarse"],
+                        "val_grad": metrics["grad"],
+                        "val_grad_coarse": metrics["grad_coarse"],
+                        "val_fft": metrics["fft"],
+                        "val_fft_coarse": metrics["fft_coarse"],
                     }
                 )
             self.loss_history.append(entry)
