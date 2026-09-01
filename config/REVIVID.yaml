@@ -123,6 +123,16 @@ training:
     perceptual: 0.1       # VGG perceptual on coarse
     detect: 0.05          # BCE on hole_head (hole detector)
     v: 1.0                # v-prediction diffusion loss (restoration + SR + inpaint)
+    # Anti-blur losses on the COARSE branch. Charbonnier tolerates blur (a soft
+    # edge is only slightly wrong per pixel), so with `pix` as the only real
+    # supervision the coarse branch settles on the safe, blurry posterior mean.
+    # Measured at epoch 350 without them: coarse had gained +2.5 dB PSNR but had
+    # closed only 14% of the sharpness gap to GT, and was on track to stall at
+    # ~16%. The raw values differ by ~10x (grad ~0.43, fft ~0.045), hence the
+    # different weights - both contribute roughly half of `pix` at these values.
+    # Set both to 0 to disable (they are still logged as diagnostics).
+    coarse_fft: 0.5
+    coarse_grad: 0.15
     # Losses on the FINAL refined output (coarse + predicted residual):
     refine_pix: 1.0        # Charbonnier on refined - anchors it to GT in pixel
                            # space, which is what val_psnr measures

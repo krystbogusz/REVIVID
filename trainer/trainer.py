@@ -143,6 +143,8 @@ class Trainer:
             "perceptual": 0.1,
             "detect": 0.05,
             "v": 1.0,
+            "coarse_fft": 0.5,
+            "coarse_grad": 0.15,
             "refine_pix": 1.0,
             "refine_perceptual": 0.1,
             "refine_fft": 0.5,
@@ -330,15 +332,15 @@ class Trainer:
         loss_r_fft = self.loss_fft(refined_pred, gt_f)
         loss_r_grad = self.loss_grad(refined_pred, gt_f)
 
-        # DIAGNOSTICS ONLY — never added to `total`, computed under no_grad so
-        # they cannot influence training. The coarse branch is trained purely
-        # by Charbonnier + a weak VGG term, and Charbonnier tolerates blur, so
-        # nothing currently pushes it towards GT-level sharpness. These two
-        # measure exactly that gap: loss_grad is L1 on Sobel gradients vs GT
-        # and loss_fft is L1 on FFT amplitude vs GT, so comparing loss_c_* with
-        # loss_r_* answers "is the refiner adding sharpness the coarse branch
-        # is missing, and how far is either from GT?".
-        with torch.no_grad():
+        # Sharpness losses on the COARSE branch. Charbonnier alone tolerates
+        # blur — a soft edge is only slightly wrong per pixel — so with `pix`
+        # as the only real supervision the coarse branch settles on the safe,
+        # blurry posterior mean. These two penalise that directly: loss_grad is
+        # L1 on Sobel gradients vs GT, loss_fft is L1 on FFT amplitude vs GT.
+        # Set both weights to 0 to fall back to diagnostics-only (no gradient,
+        # no cost) — the values are logged either way.
+        coarse_sharp_on = w["coarse_fft"] > 0 or w["coarse_grad"] > 0
+        with torch.set_grad_enabled(coarse_sharp_on and torch.is_grad_enabled()):
             loss_c_fft = self.loss_fft(coarse_f, gt_f)
             loss_c_grad = self.loss_grad(coarse_f, gt_f)
         if self.use_perceptual:
@@ -360,6 +362,8 @@ class Trainer:
             w["pix"] * loss_pix
             + w["detect"] * loss_detect
             + w["v"] * loss_v
+            + w["coarse_fft"] * loss_c_fft
+            + w["coarse_grad"] * loss_c_grad
             + w_snr
             * (
                 w["refine_pix"] * loss_r_pix
@@ -376,8 +380,8 @@ class Trainer:
             "loss_r_pix": float(loss_r_pix.detach()),
             "loss_r_fft": float(loss_r_fft.detach()),
             "loss_r_grad": float(loss_r_grad.detach()),
-            "loss_c_fft": float(loss_c_fft),
-            "loss_c_grad": float(loss_c_grad),
+            "loss_c_fft": float(loss_c_fft.detach()),
+            "loss_c_grad": float(loss_c_grad.detach()),
             "residual_std": float(res_std.detach()),
         }
         if self.use_perceptual:
