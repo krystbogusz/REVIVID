@@ -16,6 +16,8 @@ def augment_frames(
 ) -> list[np.ndarray]:
     """Apply the same hflip / vflip / 90° rotation to every frame in *imgs*.
 
+    Items may be (H, W, C) frames or (H, W) masks — both get the same transform.
+
     ``transpose`` gates only the 90° rotation, which swaps H and W. It must be
     off for non-square crops: otherwise the sample shape flips at random, which
     breaks collation for ``batch_size > 1`` and feeds the model an aspect ratio
@@ -39,6 +41,6 @@ def augment_frames(
         if do_vflip:
             aug = cv2.flip(aug, 0)
         if do_rot90:
-            aug = aug.transpose(1, 0, 2)
+            aug = np.ascontiguousarray(aug.swapaxes(0, 1))
         out.append(aug)
     return out

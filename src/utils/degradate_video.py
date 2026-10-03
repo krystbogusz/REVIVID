@@ -18,6 +18,8 @@ def main():
     parser.add_argument("-t", "--textures", type=str, default="./data/raw/noise_data")
     parser.add_argument("-b", "--batch_size", type=int, default=30)
     parser.add_argument("--downscale_factor", type=int, default=1)
+    parser.add_argument("--hole-prob", type=float, default=0.25, help="chance of a persistent hole per window")
+    parser.add_argument("--hole-window", type=int, default=7, help="frames sharing one hole mask")
 
     args = parser.parse_args()
 
@@ -66,7 +68,8 @@ def main():
                     degree=args.degree,
                     downscale_factor=args.downscale_factor,
                     device=device,
-                    bake_holes=True,
+                    hole_prob=args.hole_prob,
+                    hole_window=args.hole_window,
                 )
                 for df in degraded_batch:
                     out.write(df)
@@ -80,7 +83,8 @@ def main():
                 degree=args.degree,
                 downscale_factor=args.downscale_factor,
                 device=device,
-                bake_holes=True,
+                hole_prob=args.hole_prob,
+                hole_window=args.hole_window,
             )
             for df in degraded_batch:
                 out.write(df)

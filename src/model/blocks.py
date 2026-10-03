@@ -102,14 +102,13 @@ class AttnBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
-        q = q.reshape(b, c, h * w).permute(0, 2, 1)
-        k = k.reshape(b, c, h * w)
-        v = v.reshape(b, c, h * w).permute(0, 2, 1)
-
-        attn = torch.softmax(torch.bmm(q.float(), k.float()) / math.sqrt(c), dim=-1).to(
-            q.dtype
-        )
-        out = torch.bmm(attn, v).permute(0, 2, 1).reshape(b, c, h, w)
+        # (b, 1 head, h*w, c), contiguous: only this layout lets PyTorch pick the
+        # memory-efficient kernel, which never materialises the (h*w) x (h*w)
+        # attention matrix (tens of GB at full HD). 3-D or strided inputs silently
+        # fall back to that matrix.
+        q, k, v = (t.reshape(b, 1, c, h * w).transpose(2, 3).contiguous() for t in (q, k, v))
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(2, 3).reshape(b, c, h, w)
         return x + self.proj(out)
 
 

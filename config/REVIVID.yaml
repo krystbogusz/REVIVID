@@ -1,23 +1,26 @@
-# REVIVID configuration — diffusion restoration model.
+# REVIVID configuration — v4: restoration + 2x SR + hole inpainting.
 #
-# One diffusion network handles all tasks simultaneously:
 #   1. Restoration — remove degradations (scratches, noise, blur, compression)
-#   2. SR          — 4× super-resolution via PixelShuffle in the backbone
-#   3. Inpainting  — hallucinate content in large burned-in holes
+#   2. SR          — 2× super-resolution via PixelShuffle in the backbone
+#   3. Inpainting  — fill large persistent holes (burned in for a whole window)
 #
-# Persistent spatial holes (baked by DatasetCreator for test clips and a fraction
-# of train clips) are detected on-the-fly from the LQ fill value (-1.0) and fed
-# as an explicit conditioning channel to the single refine UNet.
+# Holes: the model DETECTS them itself (learned detector on the frames and
+# their temporal statistics). The true hole mask of a training sample is only a
+# target (detector BCE, loss weighting, where the refiner is trained) — never
+# an input. Validation runs on the stored .mp4 pairs, without any mask.
+# Inside holes the backbone first tries to bring the real content in from
+# other frames (flow completed inside holes, second-order propagation that
+# carries its state through holes); the diffusion refiner acts ONLY inside the
+# detected holes, everywhere else the output is the coarse restoration.
 #
-# SINGLE-PHASE TRAINING: all tasks (restoration, SR, holes) are on from the
-# first iteration. During training the hole conditioning comes from the LQ
-# fill-value threshold (ground truth), not from the detector, so there is no
-# warmup dependency. The only internal schedule is the RAFT flow warmup
-# (training.raft_unfreeze_iter), handled automatically by the trainer.
+# SINGLE-PHASE TRAINING: all tasks are on from the first iteration. The only
+# internal schedule is the RAFT flow warmup (training.raft_unfreeze_iter).
+#
+# Start training (no arguments needed):  python src/trainer/trainer.py
 #
 # Data locations are fixed by the pipeline and NOT configured here:
 #   sources.yaml → downloader → data/raw/
-#   data/raw/    → dataset_creator → data/training/{train,valid,test}/{degraded,gt}
+#   dataset.create_dataset → data/training/train/*.mp4, data/training/valid/{gt,degraded}
 
 seed: 2026
 
@@ -33,11 +36,12 @@ model:
   cond_dim: 64            # conditioning features fed to the diffusion head
   d_state: 16             # SSM state dimension
   ssm_expand: 2           # SSM inner expansion factor
+  deg_dim: 64             # self-learned degradation code (FiLM on every SSM block)
+  dcn_groups: 8           # groups of the second-order flow-guided DCN (divides 2*num_feat)
   # RAFT warmup/fine-tune is configured in training.raft_unfreeze_iter
 
   # Super-resolution upscale factor in the backbone (PixelShuffle)
-  # and LR downscale factor for dataset generation.
-  # Powers of two only: 1 (no SR), 2 (2×), 4 (4×).
+  # and LR downscale factor for dataset generation. The model is designed for 2.
   # NOTE: changing this changes the backbone (build_upsampler adds/removes a
   # PixelShuffle stage), so old checkpoints will not load. It also invalidates
   # the baked valid/degraded clips - regenerate that split after changing it.
@@ -68,8 +72,17 @@ model:
 
   min_snr_gamma: 5.0      # Min-SNR loss weighting (0 = off); speeds up convergence
 
-  # Spatial hole detection (inference only — training uses on-the-fly threshold)
-  hole_threshold: 0.5
+  # Hole detector probability above which a pixel counts as a hole. The BCE's
+  # pos_weight (training.hole_pos_weight = 10) inflates the probabilities:
+  # 0.9 here ~ a true 50 % hole probability. Measured on synthetic samples
+  # after 2000 detector steps: 0.5 -> precision 0.92 / recall 0.998,
+  # 0.9 -> 0.97 / 0.977 (the old "lq < -0.95" rule: 0.78 / 1.00). A false hole
+  # lets the refiner hallucinate where it should not, a missed edge pixel is
+  # covered by refine_mask_dilate - hence the high threshold.
+  hole_threshold: 0.9
+  # The refiner acts only inside detected holes, dilated by this many HR px
+  # (and feathered); outside them the output is the coarse restoration.
+  refine_mask_dilate: 8
 
   # Persistent spatial holes (baked per window by DatasetCreator / DataLoader)
   hole_prob: 0.25         # prob a training window has holes burned in
@@ -108,8 +121,8 @@ training:
   raft_unfreeze_iter: 20000
   flow_lr_mul: 0.125
 
-  # Loss re-weighting inside persistent holes: pixels under the hole mask get
-  # weight (1 + hole_loss_boost) in the coarse pixel loss and diffusion v-loss.
+  # Loss re-weighting inside the true holes: those pixels get weight
+  # (1 + hole_loss_boost) in the coarse pixel loss.
   hole_loss_boost: 3.0
 
   # BCE pos_weight for the hole detector — holes are a tiny pixel minority,
@@ -121,8 +134,8 @@ training:
   loss_weights:
     pix: 1.0              # Charbonnier on coarse restoration (backbone)
     perceptual: 0.1       # VGG perceptual on coarse
-    detect: 0.05          # BCE on hole_head (hole detector)
-    v: 1.0                # v-prediction diffusion loss (restoration + SR + inpaint)
+    detect: 0.05          # BCE of the hole detector vs the true hole mask
+    v: 1.0                # v-prediction diffusion loss (inside the true holes only)
     # Anti-blur losses on the COARSE branch. Charbonnier tolerates blur (a soft
     # edge is only slightly wrong per pixel), so with `pix` as the only real
     # supervision the coarse branch settles on the safe, blurry posterior mean.
@@ -133,7 +146,8 @@ training:
     # Set both to 0 to disable (they are still logged as diagnostics).
     coarse_fft: 0.5
     coarse_grad: 0.15
-    # Losses on the FINAL refined output (coarse + predicted residual):
+    # Losses on the FINAL refined output (coarse + predicted residual inside
+    # the holes), on the frames that have a hole:
     refine_pix: 1.0        # Charbonnier on refined - anchors it to GT in pixel
                            # space, which is what val_psnr measures
     refine_perceptual: 0.1 # VGG perceptual on refined
@@ -176,5 +190,6 @@ validation:
 
 logging:
   log_every: 120
-  exp_dir: ./experiments/revivid
+  # New architecture: old checkpoints (experiments/revivid) do not load into it.
+  exp_dir: ./experiments/revivid_v4
   save_checkpoint_every: 10   # numbered + latest checkpoints (not every epoch)

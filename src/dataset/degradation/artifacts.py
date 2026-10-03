@@ -4,7 +4,7 @@ All functions operate on single frames (torch tensors in [0, 1] or [0, 255]
 depending on convention — see each function's docstring). They are called by
 ``pipeline.process_video_frames`` which handles batching and normalisation.
 
-Conventions that match MambaOFR (degradation_video_list_5):
+Conventions that match MambaOFR (degradation_v3 / degradation_video_list_4):
   - ``random_scaling`` supports bilinear / bicubic / lanczos (OpenCV for lanczos).
   - ``apply_jpeg_artifact`` receives and returns a **greyscale uint8 ndarray** (H, W),
     matching MambaOFR's PIL.convert("L") → BytesIO JPEG path.

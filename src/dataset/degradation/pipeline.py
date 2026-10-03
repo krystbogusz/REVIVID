@@ -1,24 +1,28 @@
 """Degradation pipeline for REVIVID dataset creation.
 
 Applies a randomised sequence of classical film-degradation operations
-(blur, noise, JPEG compression, resampling, texture overlay) to a list of
-BGR frames and returns the degraded frames at the requested output size.
+(blur, noise, JPEG compression, resampling, texture overlay, holes) to a list
+of BGR frames and returns the degraded frames at the requested output size.
 
-Holes (persistent spatial damage) are intentionally NOT applied here — they are
-added at the window level by the caller (DatasetCreator or DataLoader) so that
-the same base-degraded clip can be windowed into many training samples with
-independent hole decisions per window.
+Order of operations per frame — the one MambaOFR actually trains with
+(``degradation_video_list_4`` → ``degradation_v3``), on a single grey channel:
+    1. BGR → greyscale
+    2. Textures (static or moving-line, random blend mode), at native resolution
+    3. Blur
+    4. Resampling (down / up / none) — the frame STAYS at the resampled size
+    5. Gaussian / speckle noise  (at the resampled size)
+    6. JPEG on greyscale uint8   (at the resampled size)
+    7. Resize back to native resolution
+    8. Color jitter (50 % probability)
+    9. Final resize to LR resolution (LR = GT / sr_scale), replicate to 3 channels
+   10. Persistent holes: the frames are split into windows of ``hole_window``
+       and each window gets, with probability ``hole_prob``, one hole mask
+       shared by all its frames.
 
-Order of operations per frame (matches MambaOFR degradation_video_list_5):
-    1. BGR → greyscale → JPEG na greyscale (uint8 H×W) → z powrotem do 3-kanałowego RGB
-    2. Blur i downsampling (losowa kolejność, przywrócenie rozdzielczości po)
-    3. Tekstury (statyczne lub moving-line, random blend mode)
-    4. Gaussian / speckle noise
-    5. Color jitter (50 % probability, zawsze włączony)
-    6. Luminance collapse → greyscale 3-channel
-    7. Final resize to LR resolution (LR = GT / sr_scale)
-
-Holes are applied separately via ``apply_holes_to_window()`` after windowing.
+Do not follow ``degradation_video_list_5`` (MambaOFR's ``degradation.py``):
+it passes ``distortion_probability = [1, 1, 1, 1]`` and ``degradation_v3``
+tests ``p < 1.0``, so blur, noise and JPEG never run there. Its per-degree
+parameter ranges are still the ones used in ``_DEG_PARAMS`` below.
 """
 
 from __future__ import annotations
@@ -91,45 +95,40 @@ def sample_degree() -> int:
     return random.choices([0, 1, 2], weights=_DEGREE_WEIGHTS, k=1)[0]
 
 
-def _to_luminance_rgb(frame_chw: torch.Tensor) -> torch.Tensor:
-    """Collapse RGB to greyscale and broadcast back to 3 channels (MambaOFR-style)."""
-    luma = 0.299 * frame_chw[0] + 0.587 * frame_chw[1] + 0.114 * frame_chw[2]
-    return luma.unsqueeze(0).repeat(3, 1, 1)
-
-
 def apply_holes_to_window(
     frames_bgr: list,
     hole_prob: float,
-) -> list:
+) -> tuple[list, np.ndarray | None]:
     """Optionally overlay a persistent spatial hole mask on every frame of a window.
 
     With probability ``hole_prob`` a single hole mask is generated for the
     window's native resolution and applied to every frame (consistent damage
     across the whole window, as if the film strip was torn).  Hole pixels are
-    set to 0 in uint8 space, which becomes -1.0 after [-1, 1] normalisation —
-    the sentinel value the model uses to detect holes.
+    set to 0 in uint8 space, which becomes -1.0 after [-1, 1] normalisation.
+    The model is NOT told where they are — it has to detect them; the returned
+    mask is only a training target.
 
     Args:
         frames_bgr: list of BGR uint8 ndarrays, all same spatial size.
         hole_prob:  probability in [0, 1] that holes are applied to this window.
 
     Returns:
-        The same list (potentially with holes burned in — modified in-place copies).
+        ``(frames, mask)``: the frames (copies with holes burned in, or the
+        input list untouched) and the (H, W) uint8 {0, 1} hole mask, or ``None``
+        when this window got no holes.
     """
     if not frames_bgr or hole_prob <= 0.0 or random.random() >= hole_prob:
-        return frames_bgr
+        return frames_bgr, None
 
     h, w = frames_bgr[0].shape[:2]
-    hole_mask = generate_persistent_hole_mask(h, w)
-
-    mask_bool = hole_mask > 127
+    mask_bool = generate_persistent_hole_mask(h, w) > 127
 
     result = []
     for frame in frames_bgr:
         f = frame.copy()
         f[mask_bool] = 0
         result.append(f)
-    return result
+    return result, mask_bool.astype(np.uint8)
 
 
 def process_video_frames(
@@ -139,15 +138,20 @@ def process_video_frames(
     downscale_factor: int = 4,
     device: torch.device | None = None,
     out_size: tuple | None = None,
-) -> list:
+    hole_prob: float = 0.0,
+    hole_window: int | None = None,
+    return_masks: bool = False,
+) -> list | tuple[list, list]:
     """Degrade frames at their native resolution and resize them at the very end.
-
-    Applies blur, downsampling, texture overlay, noise and color jitter — but
-    NOT holes (use ``apply_holes_to_window`` after windowing).
 
     All degradations run on the original resolution. The final size is either an
     explicit ``out_size=(height, width)`` (takes precedence) or the native size
-    divided by ``downscale_factor``.
+    divided by ``downscale_factor``. Holes are burned in last, at the output
+    size, per window of ``hole_window`` frames (default: all frames are one window).
+
+    With ``return_masks=True`` it returns ``(frames, masks)``, where ``masks``
+    holds one (h, w) uint8 {0, 1} hole mask per output frame — the training
+    target for the hole detector. Without it, only the frames (as before).
     """
     if not frame_list_cv2:
         return []
@@ -157,8 +161,6 @@ def process_video_frames(
 
     first_frame = frame_list_cv2[0]
     original_h, original_w = first_frame.shape[:2]
-
-    dist_sequence = list(np.random.permutation(["blur", "noise", "jpeg", "downsample"]))
 
     _p = _DEG_PARAMS[degree]
     deg_params = {
@@ -186,32 +188,15 @@ def process_video_frames(
 
     for frame_cv2 in frame_list_cv2:
 
-        gray_frame = cv2.cvtColor(frame_cv2.copy(), cv2.COLOR_BGR2GRAY)
-
-        if "jpeg" in dist_sequence:
-            gray_frame = apply_jpeg_artifact(gray_frame, deg_params["jpeg_quality"])
-
-        current_frame = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB)
+        gray_frame = cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2GRAY)
         frame_tensor = (
-            torch.from_numpy(current_frame)
+            torch.from_numpy(cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB))
             .float()
-            .permute(2, 0, 1)
-            .unsqueeze(0)
             .to(device)
-            / 255.0
         )
 
-        for dist_type in dist_sequence:
-            if dist_type == "downsample":
-                frame_tensor = apply_downsampling(frame_tensor, deg_params)
-            elif dist_type == "blur":
-                frame_tensor = apply_blur(frame_tensor, deg_params)
-
-        if frame_tensor.shape[2:] != (original_h, original_w):
-            frame_tensor = random_scaling(frame_tensor, original_w, original_h)
-
-        frame_tensor = frame_tensor.squeeze(0).permute(1, 2, 0) * 255.0
-
+        # 1. Textures, on the clean frame at native resolution — so the
+        #    scratches go through blur / resampling / noise / JPEG like the content.
         selected_key = random.choice(available_keys)
         texture_img, folder_name = texture_cache.get_texture(selected_key)
         blend_mode = 0 if folder_name == "011" else random.randint(0, 2)
@@ -234,14 +219,25 @@ def process_video_frames(
 
         effective_blend = blend_mode if not use_moving_line else moving_line_mode
         if effective_blend == 0:
-            frame_tensor = addition(frame_rgba, texture_rgba, opacity)
+            blended = addition(frame_rgba, texture_rgba, opacity)
         elif effective_blend == 1:
-            frame_tensor = subtract(frame_rgba, texture_rgba, opacity)
+            blended = subtract(frame_rgba, texture_rgba, opacity)
         else:
-            frame_tensor = multiply(frame_rgba, texture_rgba, opacity)
+            blended = multiply(frame_rgba, texture_rgba, opacity)
 
+        # Frame and texture are both grey replicated to RGB, so the blend has
+        # three identical channels. Continue on one (1, 1, H, W) channel: the
+        # noise must be drawn once per pixel, as on MambaOFR's PIL "L" image —
+        # per-channel noise would be averaged down ~33% by the final luma.
+        frame_tensor = blended[:, :, :1].permute(2, 0, 1).unsqueeze(0) / 255.0
+
+        # 2. Blur, 3. resample. The frame stays at the resampled size, so
+        #    noise and JPEG below act at that scale and get resized with it.
+        frame_tensor = apply_blur(frame_tensor, deg_params)
+        frame_tensor = apply_downsampling(frame_tensor, deg_params)
+
+        # 4. Noise
         noise_type = "gaussian" if random.choice([1, 2]) == 1 else "speckle"
-        frame_tensor = frame_tensor / 255.0
         std_variance = random.uniform(-0.5, 0.5)
         new_std = float(
             np.clip(
@@ -251,11 +247,19 @@ def process_video_frames(
             )
         )
         frame_tensor = apply_noise(frame_tensor, new_std, noise_type)
-        frame_tensor = frame_tensor * 255.0
 
-        frame_tensor = frame_tensor.permute(2, 0, 1)
-        frame_tensor = apply_color_jitter(frame_tensor / 255.0) * 255.0
-        frame_tensor = _to_luminance_rgb(frame_tensor)
+        # 5. JPEG (greyscale uint8)
+        small = (frame_tensor[0, 0] * 255.0).round().byte().cpu().numpy()
+        small = apply_jpeg_artifact(small, deg_params["jpeg_quality"])
+        frame_tensor = torch.from_numpy(small).float().to(device)[None, None] / 255.0
+
+        # 6. Back to native resolution
+        if frame_tensor.shape[2:] != (original_h, original_w):
+            frame_tensor = random_scaling(frame_tensor, original_w, original_h)
+
+        # 7. Color jitter, then back to 3 identical channels
+        frame_tensor = apply_color_jitter(frame_tensor.squeeze(0).clamp(0.0, 1.0))
+        frame_tensor = frame_tensor.repeat(3, 1, 1) * 255.0
 
         if out_size is not None:
             target_h, target_w = int(out_size[0]), int(out_size[1])
@@ -273,7 +277,17 @@ def process_video_frames(
                 align_corners=False,
             ).squeeze(0)
 
-        current_frame = frame_tensor.permute(1, 2, 0).byte().cpu().numpy()
+        current_frame = (
+            frame_tensor.clamp(0.0, 255.0).round().permute(1, 2, 0).byte().cpu().numpy()
+        )
         degraded_frames.append(cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR))
 
-    return degraded_frames
+    window = hole_window or len(degraded_frames)
+    with_holes, masks = [], []
+    for start in range(0, len(degraded_frames), window):
+        chunk, mask = apply_holes_to_window(degraded_frames[start : start + window], hole_prob)
+        with_holes.extend(chunk)
+        if mask is None:
+            mask = np.zeros(chunk[0].shape[:2], np.uint8)
+        masks.extend([mask] * len(chunk))
+    return (with_holes, masks) if return_masks else with_holes

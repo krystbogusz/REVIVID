@@ -1,29 +1,21 @@
-"""Texture cache backed by a memory-mapped pixel archive.
-
-The mmap files live under ``data/training/noise_textures/`` and are built by
-:class:`dataset.dataset_creator.DatasetCreator`.  All training processes mmap
-the same read-only file; the OS shares physical RAM pages across workers.
-"""
-
-from __future__ import annotations
-
 import glob
 import json
 import os
 import time
-from pathlib import Path
-from typing import Iterator
-
 import cv2
 import numpy as np
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+from pathlib import Path
+from typing import Iterator
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _DEFAULT_TEXTURE_DIR = _PROJECT_ROOT / "data" / "raw" / "noise_data"
 _DEFAULT_MMAP_CACHE_DIR = _PROJECT_ROOT / "data" / "training" / "noise_textures"
 _MANIFEST_NAME = "noise_textures_manifest.json"
 _PIXELS_NAME = "noise_textures_pixels.bin"
 _SOURCE_NAME = "noise_textures_source.txt"
 _BUILD_LOCK_NAME = ".building.lock"
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 _process_caches: dict[str, "TextureCache"] = {}
@@ -38,7 +30,6 @@ def default_mmap_cache_dir() -> Path:
 
 
 def resolve_texture_dir(texture_dir: str | Path | None) -> Path:
-    """Return an absolute source texture directory."""
     if texture_dir is None or str(texture_dir).strip() == "":
         return _DEFAULT_TEXTURE_DIR
     path = Path(texture_dir)
@@ -48,16 +39,12 @@ def resolve_texture_dir(texture_dir: str | Path | None) -> Path:
 
 
 def resolve_mmap_cache_dir(cache_dir: str | Path | None) -> Path:
-    """Return the mmap archive directory under ``data/training`` by default."""
     if cache_dir is None or str(cache_dir).strip() == "":
         return _DEFAULT_MMAP_CACHE_DIR
     path = Path(cache_dir)
     if not path.is_absolute():
         path = _PROJECT_ROOT / path
     return path
-
-
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def _iter_texture_files(texture_dir: Path) -> Iterator[str]:

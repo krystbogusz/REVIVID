@@ -1,11 +1,3 @@
-"""Alpha-compositing blend modes (addition, subtract, multiply).
-
-Operates on RGBA tensors in [0, 255]. Used by the degradation pipeline to
-composite film-grain textures over video frames.
-"""
-
-from __future__ import annotations
-
 import torch
 
 

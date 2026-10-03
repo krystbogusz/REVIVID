@@ -136,9 +136,8 @@ class GaussianDiffusion(nn.Module):
         diff = (v_pred - v_target) ** 2
         if loss_mask is not None:
             mask = loss_mask.expand_as(diff)
-            per_sample = (diff * mask).flatten(1).sum(1) / mask.flatten(1).sum(
-                1
-            ).clamp(min=1.0)
+            mask_sum = mask.flatten(1).sum(1)
+            per_sample = (diff * mask).flatten(1).sum(1) / mask_sum.clamp(min=1.0)
         else:
             per_sample = diff.flatten(1).mean(1)
 
@@ -149,7 +148,12 @@ class GaussianDiffusion(nn.Module):
                 snr.clamp(max=self.min_snr_gamma) / (snr + 1.0)
             )
 
-        v_loss = per_sample.mean()
+        if loss_mask is not None:
+            # Average over the samples the mask selects anything in, so frames
+            # with an all-zero mask (no hole) do not dilute the loss.
+            v_loss = per_sample.sum() / (mask_sum > 0).sum().clamp(min=1)
+        else:
+            v_loss = per_sample.mean()
 
         x0_pred = self.predict_start_from_v(x_t, t, v_pred)
         return v_loss, {"x0_pred": x0_pred, "x_t": x_t, "t": t, "v_pred": v_pred}

@@ -22,7 +22,7 @@ class DatasetDownloader:
     """Download raw video datasets listed in ``config/sources.yaml``."""
 
     def __init__(self):
-        self.project_root = Path(__file__).parent.parent
+        self.project_root = Path(__file__).parent.parent.parent
         self.download_dir = self.project_root / "data" / "raw"
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.yaml_source_file = self.project_root / "config" / "sources.yaml"

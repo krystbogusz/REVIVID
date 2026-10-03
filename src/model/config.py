@@ -20,7 +20,13 @@ class ModelConfig:
     cond_dim: int = 64
     d_state: int = 16
     ssm_expand: int = 2
-    sr_scale: int = 1
+    sr_scale: int = 2
+
+    # Self-learned degradation code (FiLM on every SS2D block) and the number
+    # of deformable groups of the second-order flow-guided DCN alignment
+    # (must divide 2 * num_feat).
+    deg_dim: int = 64
+    dcn_groups: int = 8
 
     refiner_base: int = 48
     channel_mult: Sequence[int] = (1, 2, 3)
@@ -47,7 +53,12 @@ class ModelConfig:
     residual_std_warmup: int = 200
     residual_std_min: float = 1e-3
 
-    hole_threshold: float = 0.5
+    # Hole detector probability above which a pixel counts as a hole (high,
+    # because the BCE pos_weight inflates the probabilities — see REVIVID.yaml).
+    hole_threshold: float = 0.9
+    # The refiner only acts inside holes: the hole mask is dilated by this
+    # many HR pixels (and feathered) before it gates the refiner's residual.
+    refine_mask_dilate: int = 8
 
     hole_prob: float = 0.15
 

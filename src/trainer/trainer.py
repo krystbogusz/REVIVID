@@ -1,32 +1,52 @@
-"""Training loop for the REVIVID DiffMambaOFR model.
+"""Training loop for REVIVID (restoration + 2x SR + hole inpainting).
+
+Run it and it trains — no arguments needed (from anywhere, or an IDE "Run"):
+
+    python src/trainer/trainer.py                    # train, or continue from latest.pth
+    python src/trainer/trainer.py --resume path.pth  # continue from a given checkpoint
+    python src/trainer/trainer.py --config my.yaml   # another config
 
 The trainer is driven entirely by ``config/REVIVID.yaml`` (model + training
-hyper-parameters only). Data locations are fixed by the pipeline, so no paths
-are configured here.
+hyper-parameters only). Data locations are fixed by the pipeline
+(``dataset.create_dataset``):
+
+    data/training/train/*.mp4                   clean clips, degraded on the fly
+    data/training/valid/{gt,degraded}/*.mp4     validation pairs (holes baked in)
 
 It performs joint optimization of:
-    * the coarse restoration (charbonnier + optional VGG perceptual),
-    * the persistent-hole detector (BCE),
-    * the v-prediction diffusion head,
-    * sharpness losses (perceptual / frequency / gradient) on the final refined
-      output to combat over-smoothing.
+    * the coarse restoration (charbonnier + optional VGG perceptual + sharpness),
+    * the hole detector (BCE against the TRUE hole mask of the training sample —
+      the mask is a target only; the model never receives it as input),
+    * the v-prediction diffusion refiner, trained inside the true holes only,
+      plus pixel / perceptual / frequency / gradient losses on its output there.
 The learning rate decays linearly from ``training.lr`` to ``training.lr_min``
 over the configured number of epochs (MambaOFR recipe). Gradients are
 accumulated over ``training.grad_accum`` batches before each optimizer step,
 and an exponential moving average (EMA) of the weights is maintained and used
-for validation / checkpointed inference. Training runs in full precision
-(float32) with checkpointing and PSNR/SSIM validation (DDIM sampling). This is
-a pure diffusion model - there is no adversarial / GAN component.
+for validation / checkpointed inference. Validation runs the real inference
+path on the stored .mp4 pairs only: the model detects the holes itself.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import os
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
 
+if __package__ in (None, ""):
+    # Run as a script (python src/trainer/trainer.py, IDE "Run"): make the
+    # packages under src/ importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+if os.name != "nt":
+    # Less fragmentation of the CUDA caching allocator (not supported on Windows).
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +54,9 @@ import yaml
 from torchvision.utils import save_image
 from tqdm import tqdm
 
-from dataset.dataset_loader import warmup_dataloader
+from dataset.dataset_loader import eval_loader as build_eval_loader
+from dataset.dataset_loader import list_mp4, to_tensor
+from dataset.dataset_loader import train_loader as build_train_loader
 from evaluator.metrics import evaluate_clip
 from model import ModelConfig, Video_Backbone
 from model.losses import (
@@ -46,8 +68,9 @@ from model.losses import (
     VGGPerceptualLoss,
 )
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
+DATA_DIR = PROJECT_ROOT / "data" / "training"
 
 
 class ModelEMA:
@@ -132,6 +155,8 @@ class Trainer:
         torch.manual_seed(int(cfg.get("seed", 2026)))
 
         self.exp_dir = Path(self.log_cfg.get("exp_dir", "./experiments/revivid"))
+        if not self.exp_dir.is_absolute():
+            self.exp_dir = PROJECT_ROOT / self.exp_dir
         (self.exp_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.exp_dir / "samples").mkdir(parents=True, exist_ok=True)
 
@@ -190,9 +215,9 @@ class Trainer:
         self.flow_lr_mul = float(self.train_cfg.get("flow_lr_mul", 0.125))
         self._raft_unfrozen = False
 
-        # Pixels inside persistent holes are re-weighted by (1 + hole_loss_boost)
-        # in the coarse pixel loss and the diffusion v-loss, so the few hole
-        # pixels are not drowned out by the full-frame average.
+        # Pixels inside the TRUE holes are re-weighted by (1 + hole_loss_boost)
+        # in the coarse pixel loss, so the few hole pixels are not drowned out
+        # by the full-frame average.
         self.hole_loss_boost = float(self.train_cfg.get("hole_loss_boost", 3.0))
 
         # Linear LR decay: lr (epoch 1) -> lr_min (last epoch).
@@ -275,6 +300,8 @@ class Trainer:
         self._maybe_unfreeze_raft()
         lq = batch["lq"].to(self.device, non_blocking=True)
         gt = batch["gt"].to(self.device, non_blocking=True)
+        # TRUE hole mask (B, T, 1, h, w): a training target only, never an input.
+        hole = batch["hole_mask"].to(self.device, non_blocking=True)
         w = self.weights
 
         if not (torch.isfinite(lq).all() and torch.isfinite(gt).all()):
@@ -291,46 +318,15 @@ class Trainer:
 
         n_b, t_b, c_b, h_b, w_b = gt.shape
         gt_f = gt.reshape(n_b * t_b, c_b, h_b, w_b)
-        # Normalise the residual by a running estimate of its own std so the
-        # diffusion target always sits in the schedule's native ~N(0, 1) range.
-        # A fixed scale collapses as `coarse` improves: the target shrinks, v
-        # becomes a closed form of x_t, the loss falls to ~0 and the refiner
-        # stops learning anything about the image. Inverted below and in
-        # restore().
-        residual = gt_f - coarse_f
-        res_std = self.net.update_residual_std(residual)
-        residual_target = (residual / res_std).detach()
+        hole_lr_f = hole.reshape(n_b * t_b, 1, *hole.shape[-2:])
+        hole_hr_f = F.interpolate(hole_lr_f, size=(h_b, w_b), mode="nearest")
 
-        # Boost the loss inside persistent holes so the sparse hole pixels are
-        # not averaged away (hole_mask_f comes from the LQ fill-value threshold,
-        # i.e. it is ground truth during training).
-        pix_weight = (1.0 + self.hole_loss_boost * out["hole_mask_f"]).expand(
-            -1, 3, -1, -1
-        )
-
+        # ---- coarse branch + hole detector ---------------------------------
+        # Boost the loss inside the true holes so the sparse hole pixels are
+        # not averaged away.
+        pix_weight = (1.0 + self.hole_loss_boost * hole_hr_f).expand(-1, 3, -1, -1)
         loss_pix = self.loss_pix(coarse_f, gt_f, weight=pix_weight)
-        loss_detect = self.loss_detect(out["hole_logits_f"], out["hole_mask_f"])
-        loss_v, diff_info = self.loss_diffusion(
-            self.net.diffusion,
-            self.net.refine_unet,
-            residual_target,
-            out["refine_cond"],
-            loss_mask=pix_weight,
-        )
-
-        # Sharpness losses on the FINAL refiner output (coarse + predicted
-        # residual). x0_pred is the diffusion estimate of the clean residual;
-        # coarse is detached so these losses train the refiner (and the
-        # backbone `cond` features), not the coarse branch.
-        refined_pred = torch.clamp(
-            coarse_f.detach() + diff_info["x0_pred"] * res_std, -1.0, 1.0
-        )
-        # Pixel loss on the FINAL output: without it nothing anchors the
-        # refined image to the GT in pixel space, which is exactly what
-        # val_psnr measures.
-        loss_r_pix = self.loss_pix(refined_pred, gt_f, weight=pix_weight)
-        loss_r_fft = self.loss_fft(refined_pred, gt_f)
-        loss_r_grad = self.loss_grad(refined_pred, gt_f)
+        loss_detect = self.loss_detect(out["hole_logits_f"], hole_lr_f)
 
         # Sharpness losses on the COARSE branch. Charbonnier alone tolerates
         # blur — a soft edge is only slightly wrong per pixel — so with `pix`
@@ -343,54 +339,91 @@ class Trainer:
         with torch.set_grad_enabled(coarse_sharp_on and torch.is_grad_enabled()):
             loss_c_fft = self.loss_fft(coarse_f, gt_f)
             loss_c_grad = self.loss_grad(coarse_f, gt_f)
-        if self.use_perceptual:
-            loss_r_perc = self.loss_perceptual(refined_pred, gt_f)
-        else:
-            loss_r_perc = coarse_f.new_zeros(())
-
-        # Down-weight the refined losses when x0_pred is unreliable (high
-        # noise / large timestep); alphas_cumprod[t] ~ 1 at low noise, ~ 0
-        # at high noise.
-        if self.refine_snr_weight:
-            w_snr = self.net.diffusion.alphas_cumprod[
-                diff_info["t"]
-            ].float().mean()
-        else:
-            w_snr = coarse_f.new_ones(())
 
         total = (
             w["pix"] * loss_pix
             + w["detect"] * loss_detect
-            + w["v"] * loss_v
             + w["coarse_fft"] * loss_c_fft
             + w["coarse_grad"] * loss_c_grad
-            + w_snr
-            * (
-                w["refine_pix"] * loss_r_pix
-                + w["refine_perceptual"] * loss_r_perc
-                + w["refine_fft"] * loss_r_fft
-                + w["refine_grad"] * loss_r_grad
-            )
         )
-
         log = {
             "loss_pix": float(loss_pix.detach()),
             "loss_detect": float(loss_detect.detach()),
-            "loss_v": float(loss_v.detach()),
-            "loss_r_pix": float(loss_r_pix.detach()),
-            "loss_r_fft": float(loss_r_fft.detach()),
-            "loss_r_grad": float(loss_r_grad.detach()),
             "loss_c_fft": float(loss_c_fft.detach()),
             "loss_c_grad": float(loss_c_grad.detach()),
-            "residual_std": float(res_std.detach()),
         }
-        if self.use_perceptual:
-            log["loss_r_perc"] = float(loss_r_perc.detach())
 
         if self.use_perceptual:
             loss_perc = self._coarse_perceptual(coarse, gt)
             total = total + w["perceptual"] * loss_perc
             log["loss_perc"] = float(loss_perc.detach())
+
+        # ---- refiner: only inside the true holes ----------------------------
+        # The refiner's residual is gated by the generation mask, so outside
+        # holes it has nothing to learn; batches without holes skip it (and its
+        # cost). Its losses are logged as NaN then, which the epoch means skip.
+        gen = self.net.generation_mask(hole_hr_f)
+        refine_keys = ("loss_v", "loss_r_pix", "loss_r_fft", "loss_r_grad", "loss_r_perc")
+        if bool((gen > 0).any()):
+            # Normalise the residual by a running estimate of its own std so the
+            # diffusion target always sits in the schedule's native ~N(0, 1)
+            # range. A fixed scale collapses as `coarse` improves: the target
+            # shrinks, v becomes a closed form of x_t and the refiner stops
+            # learning. Inverted in restore().
+            residual = gt_f - coarse_f
+            res_std = self.net.update_residual_std(residual, gen)
+            residual_target = (residual / res_std).detach()
+
+            loss_v, diff_info = self.loss_diffusion(
+                self.net.diffusion,
+                self.net.refine_unet,
+                residual_target,
+                out["refine_cond"],
+                loss_mask=gen,
+            )
+
+            # Losses on the FINAL output (coarse + gated predicted residual),
+            # on the frames that have a hole. x0_pred is the diffusion estimate
+            # of the clean residual; coarse is detached so these train the
+            # refiner (and the backbone `cond` features), not the coarse branch.
+            refined_pred = torch.clamp(
+                coarse_f.detach() + gen * diff_info["x0_pred"] * res_std, -1.0, 1.0
+            )
+            loss_r_pix = self.loss_pix(
+                refined_pred, gt_f, weight=gen.expand(-1, 3, -1, -1)
+            )
+            sel = gen.flatten(1).amax(1) > 0
+            loss_r_fft = self.loss_fft(refined_pred[sel], gt_f[sel])
+            loss_r_grad = self.loss_grad(refined_pred[sel], gt_f[sel])
+            if self.use_perceptual:
+                loss_r_perc = self.loss_perceptual(refined_pred[sel], gt_f[sel])
+            else:
+                loss_r_perc = coarse_f.new_zeros(())
+
+            # Down-weight the refined losses when x0_pred is unreliable (high
+            # noise / large timestep); alphas_cumprod[t] ~ 1 at low noise, ~ 0
+            # at high noise.
+            if self.refine_snr_weight:
+                w_snr = self.net.diffusion.alphas_cumprod[diff_info["t"]].float().mean()
+            else:
+                w_snr = coarse_f.new_ones(())
+
+            total = (
+                total
+                + w["v"] * loss_v
+                + w_snr
+                * (
+                    w["refine_pix"] * loss_r_pix
+                    + w["refine_perceptual"] * loss_r_perc
+                    + w["refine_fft"] * loss_r_fft
+                    + w["refine_grad"] * loss_r_grad
+                )
+            )
+            refine_vals = (loss_v, loss_r_pix, loss_r_fft, loss_r_grad, loss_r_perc)
+            log.update({k: float(v.detach()) for k, v in zip(refine_keys, refine_vals)})
+        else:
+            log.update({k: float("nan") for k in refine_keys})
+        log["residual_std"] = float(self.net.residual_std)
 
         # Accumulate gradients over `grad_accum` batches, then step once.
         (total / self.grad_accum).backward()
@@ -439,6 +472,10 @@ class Trainer:
 
         psnr_sum, ssim_sum, count = 0.0, 0.0, 0
         c_psnr_sum, c_ssim_sum = 0.0, 0.0
+        # Share of pixels the refiner acted on (= the model's own hole
+        # detection). The valid clips carry no mask, so this is the only view
+        # of the detector here: it should match the hole area, not the shadows.
+        hole_frac_sum = 0.0
         # Sharpness vs GT, measured on the REAL inference path (full DDIM from
         # noise), unlike the training-time loss_c_*/loss_r_* which see an
         # x0_pred derived from a noised copy of the true residual and are
@@ -462,32 +499,27 @@ class Trainer:
             leave=False,
         )
 
-        for batch in vbar:
+        for item in vbar:
             if self.val_max_clips > 0 and count >= self.val_max_clips:
                 break
 
-            lq = batch["lq"]
-            gt = batch["gt"]
-
+            lq, gt = self._val_clip(item, self.val_max_frames)
             all_len = lq.shape[1]
-            if self.val_max_frames > 0:
-                all_len = min(all_len, self.val_max_frames)
-                lq = lq[:, :all_len]
-                gt = gt[:, :all_len]
             all_output = []
             all_coarse = []
+            clip_hole = 0.0
 
             for i in range(0, all_len, window_size):
                 end = min(i + window_size, all_len)
                 part_lq = lq[:, i:end].to(self.device, non_blocking=True)
 
-                part_out, part_coarse = self.net.restore(
-                    part_lq, return_coarse=True
-                )
+                r = self.net.restore_full(part_lq)
 
-                all_output.append(part_out.detach().cpu())
-                all_coarse.append(part_coarse.detach().clamp(-1.0, 1.0).cpu())
-                del part_lq, part_out, part_coarse
+                all_output.append(r["refined"].detach().cpu())
+                all_coarse.append(r["coarse"].detach().clamp(-1.0, 1.0).cpu())
+                clip_hole += float((r["generation_mask"] > 0).float().mean()) * (end - i)
+                del part_lq, r
+            hole_frac_sum += clip_hole / max(all_len, 1)
 
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -544,29 +576,56 @@ class Trainer:
             "grad_coarse": c_grad_sum / count,
             "fft": fft_sum / count,
             "fft_coarse": c_fft_sum / count,
+            "hole_frac": hole_frac_sum / count,
         }
+
+    def _val_clip(self, item: dict, max_frames: int = 0):
+        """A validation item (lists of BGR frames, as stored) → CPU tensors
+        ``lq`` (1, T, 3, h, w) and ``gt`` (1, T, 3, H, W) in [-1, 1].
+
+        The pairs are written at ``validation.gt_size`` by the dataset creator;
+        clips stored at another size are resized to it (LQ to gt_size / sr).
+        """
+        lq_frames, gt_frames = item["lq"], item["gt"]
+        n = min(len(lq_frames), len(gt_frames))
+        if max_frames > 0:
+            n = min(n, max_frames)
+        lq_frames, gt_frames = lq_frames[:n], gt_frames[:n]
+
+        size = self.val_cfg.get("gt_size")
+        if size:
+            sr = int(self.model_cfg.sr_scale)
+            gw, gh = int(size[0]), int(size[1])
+            if gt_frames[0].shape[:2] != (gh, gw):
+                gt_frames = [cv2.resize(f, (gw, gh), interpolation=cv2.INTER_AREA) for f in gt_frames]
+            lw, lh = gw // sr, gh // sr
+            if lq_frames[0].shape[:2] != (lh, lw):
+                lq_frames = [cv2.resize(f, (lw, lh), interpolation=cv2.INTER_AREA) for f in lq_frames]
+        return to_tensor(lq_frames).unsqueeze(0), to_tensor(gt_frames, gray=True).unsqueeze(0)
 
     @torch.no_grad()
     def _save_validation_sample(
         self, epoch: int, val_loader, tag: str = "checkpoint"
     ) -> None:
-        """Save LQ / coarse / refined / GT frames from the first validation clip.
+        """Save LQ / coarse / refined / GT / refiner-mask rows from the first
+        validation clip.
 
         The coarse row is what the backbone produces on its own; the refined
-        row is that plus the diffusion residual. Having both side by side is
-        the only way to see whether the refiner is adding real detail or just
-        noise — the metrics alone cannot tell those apart.
+        row is that plus the diffusion residual inside the detected holes,
+        whose extent is the last row (white = the refiner acted there). Seeing
+        them side by side is the only way to tell whether the refiner adds
+        real content and whether the detector finds holes rather than shadows.
         """
         self.net.eval()
-        batch = next(iter(val_loader))
-
         window_size = int(self.train_cfg.get("num_frame", 7))
-
-        lq = batch["lq"][:, :window_size].to(self.device, non_blocking=True)
-        gt = batch["gt"][:, :window_size].to(self.device, non_blocking=True)
+        lq, gt = self._val_clip(next(iter(val_loader)), window_size)
+        lq = lq.to(self.device, non_blocking=True)
+        gt = gt.to(self.device, non_blocking=True)
 
         with self._ema_weights():
-            out, coarse = self.net.restore(lq, return_coarse=True)
+            r = self.net.restore_full(lq)
+        out, coarse = r["refined"], r["coarse"]
+        gen_rgb = r["generation_mask"].expand(-1, -1, 3, -1, -1) * 2.0 - 1.0
 
         def _to_grid(clip: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
             frames = clip[0].float().clamp(-1.0, 1.0)
@@ -584,6 +643,7 @@ class Trainer:
                 _to_grid(coarse, target_hw),
                 _to_grid(out, target_hw),
                 _to_grid(gt, target_hw),
+                _to_grid(gen_rgb, target_hw),
             ],
             dim=0,
         )
@@ -611,8 +671,6 @@ class Trainer:
                 f"Increase training.epochs in config to continue."
             )
             return
-
-        warmup_dataloader(train_loader, "train")
 
         for epoch in range(start_epoch, total_epochs + 1):
             t0 = time.time()
@@ -664,6 +722,10 @@ class Trainer:
                     f"| delta:{delta:+.3f} dB ({verdict}) "
                     f"| residual_std:{float(self.net.residual_std):.4f}"
                 )
+                print(
+                    f"[epoch {epoch}] DZIURY: refiner dzialal na "
+                    f"{100.0 * metrics['hole_frac']:.2f}% pikseli (wlasna detekcja modelu)"
+                )
                 # Sharpness vs GT (lower = closer to GT, i.e. less blur).
                 sharper = (
                     "refined ostrzejszy"
@@ -694,16 +756,18 @@ class Trainer:
                         "val_grad_coarse": metrics["grad_coarse"],
                         "val_fft": metrics["fft"],
                         "val_fft_coarse": metrics["fft_coarse"],
+                        "val_hole_frac": metrics["hole_frac"],
                     }
                 )
             self.loss_history.append(entry)
             self._write_loss_history()
 
             if do_validate:
-                # Select best on the coarse PSNR: it is the stable measure of
-                # restoration progress (refined has DDIM sampling variance).
-                if metrics["psnr_coarse"] > self.best_psnr:
-                    self.best_psnr = metrics["psnr_coarse"]
+                # Select best on the FINAL output's PSNR. The refiner only acts
+                # inside detected holes, so its sampling variance is confined
+                # there and the refined output is the stable, real measure.
+                if metrics["psnr"] > self.best_psnr:
+                    self.best_psnr = metrics["psnr"]
                     self.best_epoch = epoch
                     self._save_checkpoint_file("best.pth", epoch, metrics)
                     self._save_validation_sample(epoch, val_loader, tag="best")
@@ -820,3 +884,59 @@ class Trainer:
         self.save_training_config()
         print("[trainer] no checkpoint found — starting fresh training")
         return 1
+
+    def build_loaders(self):
+        """Train + validation loaders from the fixed data layout.
+
+        Train: ``data/training/train/*.mp4`` clean clips (the older layout
+        ``train/gt/*.mp4`` is accepted too), degraded on the fly with holes and
+        their true masks. Validation: ``data/training/valid/{gt,degraded}``
+        pairs as stored — no masks; ``None`` when there are none.
+        """
+        tc = self.train_cfg
+        train_dir = DATA_DIR / "train"
+        if not list_mp4(train_dir) and list_mp4(train_dir / "gt"):
+            train_dir = train_dir / "gt"
+        train = build_train_loader(
+            train_dir,
+            num_frame=int(tc.get("num_frame", 7)),
+            sr_scale=int(self.model_cfg.sr_scale),
+            crop_size=tc.get("gt_size"),
+            hole_prob=float(self.model_cfg.hole_prob),
+            batch_size=int(tc.get("batch_size", 1)),
+            num_workers=int(tc.get("num_workers", 0)),
+            augment=bool(tc.get("use_flip", True) or tc.get("use_rot", True)),
+            texture_cache_dir=tc.get("texture_cache_dir"),
+        )
+        print(f"[trainer] train clips: {len(train.dataset)} from {train_dir}")
+
+        valid_dir = DATA_DIR / "valid"
+        try:
+            val = build_eval_loader(
+                valid_dir, num_workers=int(self.val_cfg.get("num_workers", 0))
+            )
+            print(f"[trainer] validation clips: {len(val.dataset)} from {valid_dir}")
+        except FileNotFoundError:
+            print(f"[trainer] no validation pairs in {valid_dir} - training without validation")
+            val = None
+        return train, val
+
+
+def run(config: Union[str, Path, dict, None] = None, resume: Optional[str] = None) -> None:
+    """Build everything from the config and train (continuing from latest.pth)."""
+    trainer = Trainer(config=config)
+    start_epoch = trainer.maybe_resume(resume)
+    train_loader, val_loader = trainer.build_loaders()
+    trainer.fit(train_loader, val_loader=val_loader, start_epoch=start_epoch)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Train REVIVID (no arguments needed).")
+    p.add_argument("--config", type=str, default=None, help="YAML config (default: config/REVIVID.yaml)")
+    p.add_argument("--resume", type=str, default=None, help="checkpoint to resume from (default: <exp_dir>/checkpoints/latest.pth)")
+    args = p.parse_args()
+    run(args.config, args.resume)
+
+
+if __name__ == "__main__":
+    main()

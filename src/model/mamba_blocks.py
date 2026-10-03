@@ -129,10 +129,21 @@ class SS2D(nn.Module):
 
 
 class SSBlock(nn.Module):
-    """Residual SS2D block with a feed-forward mixer."""
+    """Residual SS2D block with a feed-forward mixer.
+
+    With ``cond_dim > 0`` the normalised input of the SS2D branch is modulated
+    (FiLM: per-channel scale and shift) by a conditioning vector ``z`` — the
+    degradation code learned by the backbone. The projection is zero-initialised,
+    so the block starts out as the plain, unconditioned one.
+    """
 
     def __init__(
-        self, dim: int, d_state: int = 16, expand: int = 2, mlp_ratio: float = 2.0
+        self,
+        dim: int,
+        d_state: int = 16,
+        expand: int = 2,
+        mlp_ratio: float = 2.0,
+        cond_dim: int = 0,
     ):
         super().__init__()
 
@@ -143,9 +154,18 @@ class SSBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Conv2d(dim, hidden, 1), nn.GELU(), nn.Conv2d(hidden, dim, 1)
         )
+        self.film = None
+        if cond_dim > 0:
+            self.film = nn.Linear(cond_dim, 2 * dim)
+            nn.init.zeros_(self.film.weight)
+            nn.init.zeros_(self.film.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.ss2d(self.norm1(x))
+    def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        h = self.norm1(x)
+        if self.film is not None and z is not None:
+            scale, shift = self.film(z)[:, :, None, None].chunk(2, dim=1)
+            h = h * (1 + scale) + shift
+        x = x + self.ss2d(h)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -160,19 +180,23 @@ class MambaFeatureBlocks(nn.Module):
         depth: int = 6,
         d_state: int = 16,
         expand: int = 2,
+        cond_dim: int = 0,
     ):
         super().__init__()
         self.conv_in = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)
         self.blocks = nn.ModuleList(
-            [SSBlock(embed_dim, d_state=d_state, expand=expand) for _ in range(depth)]
+            [
+                SSBlock(embed_dim, d_state=d_state, expand=expand, cond_dim=cond_dim)
+                for _ in range(depth)
+            ]
         )
         self.conv_out = nn.Conv2d(embed_dim, in_chans, 3, 1, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
         identity = x
         h = self.conv_in(x)
         for blk in self.blocks:
-            h = blk(h)
+            h = blk(h, z)
         return identity + self.conv_out(h)
 
 
@@ -182,7 +206,13 @@ def build_feature_blocks(
     depth: int = 6,
     d_state: int = 16,
     expand: int = 2,
+    cond_dim: int = 0,
 ) -> nn.Module:
     return MambaFeatureBlocks(
-        in_chans, embed_dim=embed_dim, depth=depth, d_state=d_state, expand=expand
+        in_chans,
+        embed_dim=embed_dim,
+        depth=depth,
+        d_state=d_state,
+        expand=expand,
+        cond_dim=cond_dim,
     )
