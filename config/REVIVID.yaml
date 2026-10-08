@@ -55,7 +55,7 @@ model:
 
 training:
   epochs: 4000
-  batch_size: 1
+  batch_size: 2
   num_frame: 7
   gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
   augment: true           # random flips / 90° rotation
@@ -65,7 +65,10 @@ training:
   lr_min: 0.000001
   beta1: 0.9
   beta2: 0.99
-  grad_accum: 8           # effective batch = batch_size * grad_accum
+  # Optimizer steps every grad_accum batches (effective batch = batch_size * grad_accum).
+  # 1 = an update every batch, effective batch 2 as in MambaOFR. With 8 an epoch
+  # of 240 clips was only 15 updates - the model barely moved in 70 epochs.
+  grad_accum: 1
   grad_clip: 1.0
   ema_decay: 0.999        # EMA weights are used for validation and inference
 

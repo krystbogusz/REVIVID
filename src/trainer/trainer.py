@@ -65,10 +65,17 @@ def load_config(path=None) -> dict:
 
 class ModelEMA:
     """Exponential moving average of the model weights: used for validation and
-    saved in checkpoints (``restore_video.py`` reads its ``shadow``)."""
+    saved in checkpoints (``restore_video.py`` reads its ``shadow``).
+
+    With warmup: the effective decay is ``min(decay, (1 + n) / (10 + n))`` after
+    ``n`` updates, so early on the average follows the weights closely instead
+    of being dominated by the random init (with a plain 0.999, ~35 % of the
+    average is still the init after 1000 optimizer steps).
+    """
 
     def __init__(self, model: torch.nn.Module, decay: float):
         self.decay = decay
+        self.updates = 0
         self.shadow = {
             k: v.detach().clone().float()
             for k, v in model.state_dict().items()
@@ -77,9 +84,11 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        d = min(self.decay, (1 + self.updates) / (10 + self.updates))
         for k, v in model.state_dict().items():
             if k in self.shadow:
-                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
 
     @contextmanager
     def applied(self, model: torch.nn.Module):
@@ -92,10 +101,11 @@ class ModelEMA:
             model.load_state_dict(backup, strict=False)
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay, "shadow": self.shadow}
+        return {"decay": self.decay, "updates": self.updates, "shadow": self.shadow}
 
     def load_state_dict(self, state: dict) -> None:
         self.shadow = {k: v.float() for k, v in state["shadow"].items()}
+        self.updates = int(state.get("updates", 0))
 
 
 class Trainer:
