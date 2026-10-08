@@ -17,7 +17,7 @@ model:
   # Backbone
   num_feat: 32            # propagation feature channels
   num_block: 6            # SS2D blocks per propagation direction
-  embed_dim: 64           # internal width of the SS2D blocks
+  embed_dim: 128          # internal width of the SS2D blocks (core 3.17 M params ~ MambaOFR's 3.42 M)
   d_state: 16             # SSM state dimension
   ssm_expand: 2           # SSM inner expansion factor
   cond_dim: 64            # backbone features handed to the refiner
@@ -103,6 +103,6 @@ validation:
   num_workers: 5
 
 logging:
-  exp_dir: ./experiments/revivid_v5
+  exp_dir: ./experiments/revivid_v6   # wider SS2D core (embed_dim 128): v5 checkpoints do not fit
   log_every: 120          # iterations
   save_checkpoint_every: 10   # epochs (numbered + latest.pth)

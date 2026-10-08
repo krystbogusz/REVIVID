@@ -14,7 +14,7 @@ class ModelConfig:
     # Backbone
     num_feat: int = 32          # propagation feature channels
     num_block: int = 6          # SS2D blocks per propagation direction
-    embed_dim: int = 64         # internal width of the SS2D blocks
+    embed_dim: int = 128        # internal width of the SS2D blocks
     d_state: int = 16           # SSM state dimension
     ssm_expand: int = 2         # SSM inner expansion factor
     cond_dim: int = 64          # backbone features handed to the refiner
