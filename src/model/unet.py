@@ -1,13 +1,15 @@
-"""Conditional 2D U-Net denoiser.
+"""Conditional 2D U-Net denoiser of the refiner (inpainting inside holes).
 
-A single unified v-prediction denoiser used for restoration + SR and hole
-inpainting. It denoises a high-frequency residual conditioned on the coarse
-backbone output (coarse frame, hole mask, backbone features).
+It denoises the residual (gt - coarse) conditioned on the coarse frames, the
+hole / validity maps and the backbone features. Conditioning is fed by
+channel-concatenation at the input AND re-injected after every downsampler
+(zero-initialised 1x1 projections); the timestep enters every residual block
+through FiLM.
 
-Conditioning is fed by channel-concatenation at the input AND re-injected at
-every encoder level (1x1 projection of the downscaled conditioning added to the
-features), so backbone information survives deep into the network; the timestep
-is injected via FiLM inside every residual block.
+Frames of a clip arrive as consecutive batch items; ``num_frames`` groups them,
+and on ``temporal_levels`` (and in the bottleneck) every residual block is
+followed by attention ACROSS the frames, so a window is generated jointly
+instead of frame by frame.
 """
 
 from __future__ import annotations
@@ -17,81 +19,82 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from torch.utils.checkpoint import checkpoint
 
 from .blocks import (
     AttnBlock,
     Downsample,
     Normalize,
+    TemporalAttention,
     TimeConditionedResBlock,
     TimestepEmbedding,
     Upsample,
 )
 
 
+class UNetBlock(nn.Module):
+    """Timestep-conditioned residual block, optionally followed by attention
+    across the frames of the clip."""
+
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, temporal: bool):
+        super().__init__()
+        self.res = TimeConditionedResBlock(in_ch, out_ch, time_dim)
+        self.temporal = TemporalAttention(out_ch) if temporal else None
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, num_frames: int) -> torch.Tensor:
+        x = self.res(x, t_emb)
+        if self.temporal is not None:
+            x = self.temporal(x, num_frames)
+        return x
+
+
 class ConditionalUNet(nn.Module):
     def __init__(
         self,
-        in_channels: int = 3,
-        cond_channels: int = 0,
-        out_channels: int = 3,
-        base_channels: int = 64,
-        channel_mult: Sequence[int] = (1, 2, 4),
+        in_channels: int,
+        cond_channels: int,
+        out_channels: int,
+        base_channels: int = 48,
+        channel_mult: Sequence[int] = (1, 2, 3),
         num_res_blocks: int = 2,
-        attn_levels: Sequence[int] = (2,),
-        dropout: float = 0.0,
-        use_checkpoint: bool = False,
+        temporal_levels: Sequence[int] = (1, 2),
     ):
         super().__init__()
         self.in_channels = in_channels
-        self.cond_channels = cond_channels
-        self.use_checkpoint = use_checkpoint
         self.size_factor = 2 ** (len(channel_mult) - 1)
-
         time_dim = base_channels * 4
         self.time_embed = TimestepEmbedding(base_channels, time_dim)
-
         self.conv_in = nn.Conv2d(in_channels + cond_channels, base_channels, 3, 1, 1)
 
-        # Multi-scale conditioning: re-inject the (downscaled) conditioning at
-        # each encoder level below the input resolution. Zero-initialised so
-        # the injection starts as a no-op.
-        self.cond_projs = None
-        if cond_channels > 0 and len(channel_mult) > 1:
-            projs = []
-            # After the downsampler leaving level i, features still carry
-            # base*mult[i] channels — that is the width at the injection point.
-            for mult in channel_mult[:-1]:
-                proj = nn.Conv2d(cond_channels, base_channels * mult, 1)
-                nn.init.zeros_(proj.weight)
-                nn.init.zeros_(proj.bias)
-                projs.append(proj)
-            self.cond_projs = nn.ModuleList(projs)
+        # Conditioning re-injected after the downsampler leaving each level
+        # (zero-initialised, so it starts as a no-op).
+        self.cond_projs = nn.ModuleList()
+        for mult in channel_mult[:-1]:
+            proj = nn.Conv2d(cond_channels, base_channels * mult, 1)
+            nn.init.zeros_(proj.weight)
+            nn.init.zeros_(proj.bias)
+            self.cond_projs.append(proj)
 
         self.down_blocks = nn.ModuleList()
         self.down_samplers = nn.ModuleList()
         chans = [base_channels]
         cur = base_channels
-        num_levels = len(channel_mult)
         for level, mult in enumerate(channel_mult):
             out_ch = base_channels * mult
             blocks = nn.ModuleList()
             for _ in range(num_res_blocks):
-                blocks.append(TimeConditionedResBlock(cur, out_ch, time_dim, dropout))
+                blocks.append(UNetBlock(cur, out_ch, time_dim, level in temporal_levels))
                 cur = out_ch
-                if level in attn_levels:
-                    blocks.append(AttnBlock(cur))
                 chans.append(cur)
             self.down_blocks.append(blocks)
-            if level != num_levels - 1:
-                self.down_samplers.append(Downsample(cur))
+            last = level == len(channel_mult) - 1
+            self.down_samplers.append(None if last else Downsample(cur))
+            if not last:
                 chans.append(cur)
-            else:
-                self.down_samplers.append(None)
 
-        self.mid_block1 = TimeConditionedResBlock(cur, cur, time_dim, dropout)
+        self.mid1 = UNetBlock(cur, cur, time_dim, temporal=bool(temporal_levels))
         self.mid_attn = AttnBlock(cur)
-        self.mid_block2 = TimeConditionedResBlock(cur, cur, time_dim, dropout)
+        self.mid2 = UNetBlock(cur, cur, time_dim, temporal=False)
 
         self.up_blocks = nn.ModuleList()
         self.up_samplers = nn.ModuleList()
@@ -99,95 +102,56 @@ class ConditionalUNet(nn.Module):
             out_ch = base_channels * mult
             blocks = nn.ModuleList()
             for _ in range(num_res_blocks + 1):
-                blocks.append(
-                    TimeConditionedResBlock(
-                        cur + chans.pop(), out_ch, time_dim, dropout
-                    )
-                )
+                blocks.append(UNetBlock(cur + chans.pop(), out_ch, time_dim, level in temporal_levels))
                 cur = out_ch
-                if level in attn_levels:
-                    blocks.append(AttnBlock(cur))
             self.up_blocks.append(blocks)
-            if level != 0:
-                self.up_samplers.append(Upsample(cur))
-            else:
-                self.up_samplers.append(None)
+            self.up_samplers.append(Upsample(cur) if level != 0 else None)
 
         self.out_norm = Normalize(cur)
         self.conv_out = nn.Conv2d(cur, out_channels, 3, 1, 1)
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
+    @staticmethod
+    def _run(block: UNetBlock, h, t_emb, num_frames):
+        # Gradient checkpointing: the refiner runs on full HR frames.
+        return checkpoint(block, h, t_emb, num_frames, use_reentrant=False)
+
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor = None
+        self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor, num_frames: int = 1
     ) -> torch.Tensor:
+        """``x`` (N*T, C, H, W) with the T frames of each clip consecutive."""
         t_emb = self.time_embed(t)
-        if cond is not None:
-            x = torch.cat([x, cond], dim=1)
+        x = torch.cat([x, cond], dim=1)
 
         h0, w0 = x.shape[-2:]
         f = self.size_factor
-        pad_h = (f - h0 % f) % f
-        pad_w = (f - w0 % f) % f
+        pad_h, pad_w = (f - h0 % f) % f, (f - w0 % f) % f
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        cond_p = x[:, self.in_channels :]
 
         h = self.conv_in(x)
-
-        # Padded conditioning for the multi-scale re-injection (the pad above
-        # was applied to the concatenated [x, cond] tensor).
-        cond_p = x[:, self.in_channels :] if self.cond_channels > 0 else None
-
         skips = [h]
-        for level, (blocks, sampler) in enumerate(
-            zip(self.down_blocks, self.down_samplers)
-        ):
+        for level, (blocks, sampler) in enumerate(zip(self.down_blocks, self.down_samplers)):
             for block in blocks:
-                if isinstance(block, TimeConditionedResBlock):
-                    if self.use_checkpoint:
-                        h = grad_checkpoint(block, h, t_emb, use_reentrant=False)
-                    else:
-                        h = block(h, t_emb)
-                    skips.append(h)
-                else:
-                    h = block(h)
+                h = self._run(block, h, t_emb, num_frames)
+                skips.append(h)
             if sampler is not None:
                 h = sampler(h)
-                if self.cond_projs is not None:
-                    c = F.interpolate(
-                        cond_p,
-                        size=h.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    h = h + self.cond_projs[level](c)
+                c = F.interpolate(cond_p, size=h.shape[-2:], mode="bilinear", align_corners=False)
+                h = h + self.cond_projs[level](c)
                 skips.append(h)
 
-        if self.use_checkpoint:
-            h = grad_checkpoint(self.mid_block1, h, t_emb, use_reentrant=False)
-        else:
-            h = self.mid_block1(h, t_emb)
+        h = self._run(self.mid1, h, t_emb, num_frames)
         h = self.mid_attn(h)
-        if self.use_checkpoint:
-            h = grad_checkpoint(self.mid_block2, h, t_emb, use_reentrant=False)
-        else:
-            h = self.mid_block2(h, t_emb)
+        h = self._run(self.mid2, h, t_emb, num_frames)
 
         for blocks, sampler in zip(self.up_blocks, self.up_samplers):
             for block in blocks:
-                if isinstance(block, TimeConditionedResBlock):
-                    h = torch.cat([h, skips.pop()], dim=1)
-                    if self.use_checkpoint:
-                        h = grad_checkpoint(block, h, t_emb, use_reentrant=False)
-                    else:
-                        h = block(h, t_emb)
-                else:
-                    h = block(h)
+                h = self._run(block, torch.cat([h, skips.pop()], dim=1), t_emb, num_frames)
             if sampler is not None:
                 h = sampler(h)
 
-        h = F.silu(self.out_norm(h))
-        out = self.conv_out(h)
-        if pad_h or pad_w:
-            out = out[..., :h0, :w0]
-        return out
+        out = self.conv_out(F.silu(self.out_norm(h)))
+        return out[..., :h0, :w0]

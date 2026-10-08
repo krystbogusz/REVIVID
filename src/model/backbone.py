@@ -1,4 +1,4 @@
-"""Hole-aware bidirectional recurrent conditioning backbone (REVIVID v4).
+"""Hole-aware bidirectional recurrent conditioning backbone.
 
 Handles restoration + 2x SR of old film and prepares the inpainting of
 persistent holes (burned-in regions that stay in place for the whole clip).
@@ -34,6 +34,9 @@ Outputs (HR = h * sr_scale unless noted):
     * ``hole_logits`` — (N, T, 1, h, w) hole detector logits at LR.
     * ``validity``    — (N, T, 1, H, W) how much of each pixel's state comes
                         from real (non-hole) observations, in [0, 1].
+    * ``flow_fwd``    — (N, T-1, 2, h, w) completed flow at LR, ``[:, k]`` maps
+                        frame k+1 onto frame k (used to move the refiner's noise
+                        with the scene).
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ from torchvision.ops import deform_conv2d
 
 from .blocks import ResidualBlockNoBN, make_layer
 from .flow import build_flow_estimator, flow_warp
-from .mamba_blocks import build_feature_blocks
+from .mamba_blocks import MambaFeatureBlocks
 
 
 def build_upsampler(in_ch: int, scale: int) -> nn.Module:
@@ -106,8 +109,7 @@ class HoleDetector(nn.Module):
     A burned-in hole is constant in time and sits at the bottom of the range,
     while dark content moves or at least carries grain. The clip's temporal
     min / max / std of luma expose exactly that, so they are fed next to the
-    frame. Trained against the true mask (BCE); the old ``lq < -0.95`` rule it
-    replaces fired on every shadow.
+    frame. Trained against the true hole mask (BCE).
     """
 
     def __init__(self, ch: int = 32):
@@ -277,12 +279,9 @@ class ConditioningBackbone(nn.Module):
         sr_scale: int = 2,
         deg_dim: int = 64,
         dcn_groups: int = 8,
-        hole_threshold: float = 0.5,
+        hole_threshold: float = 0.9,
     ):
         super().__init__()
-        self.num_feat = num_feat
-        self.cond_dim = cond_dim
-        self.sr_scale = sr_scale
         self.hole_threshold = hole_threshold
         c = num_feat
 
@@ -291,17 +290,12 @@ class ConditioningBackbone(nn.Module):
         self.flow_completion = FlowCompletion()
         self.degradation_encoder = DegradationEncoder(deg_dim)
 
-        blk_kwargs = dict(
-            embed_dim=embed_dim,
-            depth=num_block,
-            d_state=d_state,
-            expand=ssm_expand,
-            cond_dim=deg_dim,
-        )
         self.proj = nn.ModuleDict({d: nn.Conv2d(3, c, 3, 1, 1) for d in _DIRS})
         self.align = nn.ModuleDict({d: SecondOrderAlignment(c, dcn_groups) for d in _DIRS})
         self.agg = nn.ModuleDict({d: ValidityAggregation(c) for d in _DIRS})
-        self.blocks = nn.ModuleDict({d: build_feature_blocks(c, **blk_kwargs) for d in _DIRS})
+        self.blocks = nn.ModuleDict(
+            {d: MambaFeatureBlocks(c, embed_dim, num_block, d_state, ssm_expand, deg_dim) for d in _DIRS}
+        )
 
         # backward + forward state, plus their validity maps
         self.fuse = nn.Conv2d(2 * c + 2, 2 * c, 3, 1, 1)
@@ -382,8 +376,8 @@ class ConditioningBackbone(nn.Module):
         Args:
             lrs: (N, T, 3, H_lr, W_lr) LQ input.
 
-        Returns dict with ``coarse``, ``cond``, ``validity`` at the SR output
-        resolution and ``hole_logits`` at the input (LR) resolution.
+        Returns ``coarse``, ``cond``, ``validity`` at the SR output resolution
+        and ``hole_logits``, ``flow_fwd`` at the input (LR) resolution.
         """
         n, t, c, h, w = lrs.size()
 
@@ -432,27 +426,19 @@ class ConditioningBackbone(nn.Module):
             fused_hr = ckpt.checkpoint(self.hr_blocks, fused_hr, use_reentrant=False)
             hr_size = fused_hr.shape[-2:]
 
-            if self.sr_scale > 1:
-                base = F.interpolate(
-                    filled[:, i], size=hr_size, mode="bilinear", align_corners=False
-                )
-                validity = F.interpolate(
-                    torch.maximum(back_vals[i], val),
-                    size=hr_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            else:
-                base = filled[:, i]
-                validity = torch.maximum(back_vals[i], val)
-
+            base = F.interpolate(filled[:, i], size=hr_size, mode="bilinear", align_corners=False)
             coarse_out.append(torch.tanh(self.coarse_head(fused_hr) + base))
             cond_out.append(self.cond_head(fused_hr))
-            val_out.append(validity)
+            val_out.append(
+                F.interpolate(
+                    torch.maximum(back_vals[i], val), size=hr_size, mode="bilinear", align_corners=False
+                )
+            )
 
         return {
             "coarse": torch.stack(coarse_out, dim=1),
             "cond": torch.stack(cond_out, dim=1),
             "hole_logits": hole_logits,
             "validity": torch.stack(val_out, dim=1),
+            "flow_fwd": fwd_flow,
         }

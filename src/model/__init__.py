@@ -1,15 +1,6 @@
-"""REVIVID — diffusion restoration model (restoration + SR + hole inpainting)."""
+"""REVIVID — restoration + 2x SR + inpainting of persistent holes."""
 
 from .config import ModelConfig
-from .video_diffusion_model import Video_Backbone, build_model
-from .diffusion import GaussianDiffusion
-from .losses import CharbonnierLoss, VGGPerceptualLoss
+from .video_diffusion_model import Video_Backbone
 
-__all__ = [
-    "ModelConfig",
-    "Video_Backbone",
-    "build_model",
-    "GaussianDiffusion",
-    "CharbonnierLoss",
-    "VGGPerceptualLoss",
-]
+__all__ = ["ModelConfig", "Video_Backbone"]

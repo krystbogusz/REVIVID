@@ -1,195 +1,108 @@
-# REVIVID configuration — v4: restoration + 2x SR + hole inpainting.
+# REVIVID — restoration + 2x SR + inpainting of persistent holes, aimed at
+# REALISM: a viewer should not be able to tell what was repaired.
 #
-#   1. Restoration — remove degradations (scratches, noise, blur, compression)
-#   2. SR          — 2× super-resolution via PixelShuffle in the backbone
-#   3. Inpainting  — fill large persistent holes (burned in for a whole window)
+# The model's only input is the degraded clip. It detects the holes itself;
+# the true hole mask of a training sample is a target only (detector BCE,
+# loss weighting, where the refiner is trained). Outside holes the output is
+# the backbone's coarse restoration (trained with pix + perceptual + GAN +
+# flicker); inside them a diffusion refiner invents what the propagation could
+# not bring in from other frames.
 #
-# Holes: the model DETECTS them itself (learned detector on the frames and
-# their temporal statistics). The true hole mask of a training sample is only a
-# target (detector BCE, loss weighting, where the refiner is trained) — never
-# an input. Validation runs on the stored .mp4 pairs, without any mask.
-# Inside holes the backbone first tries to bring the real content in from
-# other frames (flow completed inside holes, second-order propagation that
-# carries its state through holes); the diffusion refiner acts ONLY inside the
-# detected holes, everywhere else the output is the coarse restoration.
-#
-# SINGLE-PHASE TRAINING: all tasks are on from the first iteration. The only
-# internal schedule is the RAFT flow warmup (training.raft_unfreeze_iter).
-#
-# Start training (no arguments needed):  python src/trainer/trainer.py
-#
-# Data locations are fixed by the pipeline and NOT configured here:
-#   sources.yaml → downloader → data/raw/
-#   dataset.create_dataset → data/training/train/*.mp4, data/training/valid/{gt,degraded}
+# Train (no arguments needed):  python src/trainer/trainer.py
+# Data (dataset.create_dataset): data/training/train/*.mp4, data/training/valid/{gt,degraded}/*.mp4
 
 seed: 2026
 
-# --------------------------------------------------------------------------- #
-# Model architecture
-# --------------------------------------------------------------------------- #
 model:
-  # Recurrent conditioning backbone (MambaOFR-inspired). The coarse branch is
-  # the metric-critical part of the model — keep it larger than the refiner.
+  # Backbone
   num_feat: 32            # propagation feature channels
-  num_block: 6            # SSM blocks per propagation branch
-  embed_dim: 64           # internal width of SSM blocks
-  cond_dim: 64            # conditioning features fed to the diffusion head
+  num_block: 6            # SS2D blocks per propagation direction
+  embed_dim: 64           # internal width of the SS2D blocks
   d_state: 16             # SSM state dimension
   ssm_expand: 2           # SSM inner expansion factor
-  deg_dim: 64             # self-learned degradation code (FiLM on every SSM block)
+  cond_dim: 64            # backbone features handed to the refiner
+  deg_dim: 64             # self-learned degradation code (FiLM on every SS2D block)
   dcn_groups: 8           # groups of the second-order flow-guided DCN (divides 2*num_feat)
-  # RAFT warmup/fine-tune is configured in training.raft_unfreeze_iter
-
-  # Super-resolution upscale factor in the backbone (PixelShuffle)
-  # and LR downscale factor for dataset generation. The model is designed for 2.
-  # NOTE: changing this changes the backbone (build_upsampler adds/removes a
-  # PixelShuffle stage), so old checkpoints will not load. It also invalidates
-  # the baked valid/degraded clips - regenerate that split after changing it.
+  # SR factor of the model and GT / degraded size of the generated datasets.
   sr_scale: 2
 
-  # Diffusion UNet refiner (no down/up attn — Mamba backbone provides global
-  # context; conditioning is re-injected at every encoder level).
+  # Refiner (diffusion UNet, acts only inside detected holes)
   refiner_base: 48
   channel_mult: [1, 2, 3]
   num_res_blocks: 2
-
-  # Diffusion process
+  refiner_temporal_levels: [1, 2]   # UNet levels with attention across the frames
   num_timesteps: 1000
-  schedule: cosine
   refine_steps: 8         # DDIM steps at inference
+  min_snr_gamma: 5.0      # Min-SNR weighting of the diffusion loss (0 = off)
+  # The diffusion target is (gt - coarse) / running std of it inside the holes.
+  residual_std_init: 0.15
+  residual_std_momentum: 0.99
+  residual_std_warmup: 200
+  residual_std_min: 0.001
 
-  # The diffusion works on (gt - coarse) divided by a RUNNING estimate of that
-  # residual's std, so the target always lands in the schedule's native
-  # ~N(0, 1) range. A fixed scale does not survive training: as the coarse
-  # branch improves the residual shrinks, the target collapses towards zero,
-  # v becomes a closed form of x_t and the refiner stops learning (this is
-  # exactly what happened in revivid_v3 - loss_v stuck at 0.0027 and the
-  # refiner cost -0.9 dB on every one of 307 validations).
-  residual_std_init: 0.15     # seed, only used before the first train step
-  residual_std_momentum: 0.99 # EMA momentum of the running std
-  residual_std_warmup: 200    # iters using the raw batch std (fast lock-on)
-  residual_std_min: 0.001     # floor, guards against dividing by ~0
-
-  min_snr_gamma: 5.0      # Min-SNR loss weighting (0 = off); speeds up convergence
-
-  # Hole detector probability above which a pixel counts as a hole. The BCE's
-  # pos_weight (training.hole_pos_weight = 10) inflates the probabilities:
-  # 0.9 here ~ a true 50 % hole probability. Measured on synthetic samples
-  # after 2000 detector steps: 0.5 -> precision 0.92 / recall 0.998,
-  # 0.9 -> 0.97 / 0.977 (the old "lq < -0.95" rule: 0.78 / 1.00). A false hole
-  # lets the refiner hallucinate where it should not, a missed edge pixel is
-  # covered by refine_mask_dilate - hence the high threshold.
+  # Holes
+  # Detector probability above which a pixel is a hole. hole_pos_weight = 10
+  # inflates the probabilities: 0.9 ~ a true 50 %. Measured (2000 detector
+  # steps): precision 0.97 / recall 0.977; a missed edge pixel is covered by
+  # refine_mask_dilate.
   hole_threshold: 0.9
-  # The refiner acts only inside detected holes, dilated by this many HR px
-  # (and feathered); outside them the output is the coarse restoration.
-  refine_mask_dilate: 8
+  refine_mask_dilate: 8   # refiner region = detected holes dilated by this (HR px)
+  hole_prob: 0.25         # prob. a window gets holes burned in (training + dataset creation)
 
-  # Persistent spatial holes (baked per window by DatasetCreator / DataLoader)
-  hole_prob: 0.25         # prob a training window has holes burned in
-
-# --------------------------------------------------------------------------- #
-# Training
-# --------------------------------------------------------------------------- #
 training:
   epochs: 4000
   batch_size: 1
   num_frame: 7
+  gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
+  augment: true           # random flips / 90° rotation
+  num_workers: 10
 
-  # Fixed-size random GT crop, [width, height], taken at the clips' native
-  # resolution — MambaOFR's paired_random_crop (their train `gt_size`). Only
-  # the crop position is random; the size the model sees is always this.
-  # The LQ crop is always gt_size / sr_scale, so with sr_scale 4:
-  #   [400, 400] -> GT 400×400, LQ 100×100
-  #   [512, 288] -> GT 512×288, LQ 128×72
-  # Snapped to a multiple of sr_scale*4 (see validation.gt_size).
-  # Set gt_size: ~ to train on whole frames at native resolution.
-  gt_size: [256, 256]
-
-  lr: 0.0002              # linear decay from lr to lr_min over all epochs
+  lr: 0.0002              # linear decay to lr_min over all epochs
   lr_min: 0.000001
   beta1: 0.9
   beta2: 0.99
+  grad_accum: 8           # effective batch = batch_size * grad_accum
+  grad_clip: 1.0
+  ema_decay: 0.999        # EMA weights are used for validation and inference
 
-  # Optimizer steps every `grad_accum` batches (effective batch = batch_size * grad_accum).
-  grad_accum: 8
-
-  # EMA of the weights, used for validation and checkpointed inference.
-  ema_decay: 0.999
-
-  # RAFT flow warmup: frozen for the first N iterations, then fine-tuned at
-  # lr * flow_lr_mul (MambaOFR recipe). Set raft_unfreeze_iter: -1 to keep frozen.
+  # RAFT is frozen for the first N iterations, then fine-tuned at lr * flow_lr_mul
+  # (-1 = always frozen).
   raft_unfreeze_iter: 20000
   flow_lr_mul: 0.125
 
-  # Loss re-weighting inside the true holes: those pixels get weight
-  # (1 + hole_loss_boost) in the coarse pixel loss.
-  hole_loss_boost: 3.0
+  hole_loss_boost: 3.0    # true-hole pixels weigh 1 + this in `pix`
+  hole_pos_weight: 10.0   # BCE weight of the hole class (holes are a pixel minority)
 
-  # BCE pos_weight for the hole detector — holes are a tiny pixel minority,
-  # so the positive class is up-weighted to keep the detector sensitive.
-  hole_pos_weight: 10.0
-
-  use_perceptual: true
-
+  # Generator loss = sum of weight * term:
   loss_weights:
-    pix: 1.0              # Charbonnier on coarse restoration (backbone)
-    perceptual: 0.1       # VGG perceptual on coarse
-    detect: 0.05          # BCE of the hole detector vs the true hole mask
-    v: 1.0                # v-prediction diffusion loss (inside the true holes only)
-    # Anti-blur losses on the COARSE branch. Charbonnier tolerates blur (a soft
-    # edge is only slightly wrong per pixel), so with `pix` as the only real
-    # supervision the coarse branch settles on the safe, blurry posterior mean.
-    # Measured at epoch 350 without them: coarse had gained +2.5 dB PSNR but had
-    # closed only 14% of the sharpness gap to GT, and was on track to stall at
-    # ~16%. The raw values differ by ~10x (grad ~0.43, fft ~0.045), hence the
-    # different weights - both contribute roughly half of `pix` at these values.
-    # Set both to 0 to disable (they are still logged as diagnostics).
-    coarse_fft: 0.5
-    coarse_grad: 0.15
-    # Losses on the FINAL refined output (coarse + predicted residual inside
-    # the holes), on the frames that have a hole:
-    refine_pix: 1.0        # Charbonnier on refined - anchors it to GT in pixel
-                           # space, which is what val_psnr measures
-    refine_perceptual: 0.1 # VGG perceptual on refined
-    refine_fft: 0.5        # frequency-domain loss on refined (recover fine texture)
-    refine_grad: 0.5       # Sobel gradient loss on refined (crisp edges)
-  refine_snr_weight: true  # scale refined losses by alphas_cumprod[t] (down-weight noisy x0_pred)
+    pix: 1.0              # Charbonnier(coarse, gt) - content fidelity
+    perceptual: 0.1       # VGG19 feature distance (raw ~8, i.e. ~0.8 effective)
+    gan: 0.05             # adversarial, projected patch discriminator (see gan:)
+    temporal: 0.5         # flicker vs the GT's own motion
+    detect: 0.05          # hole detector BCE vs the true mask
+    v: 1.0                # refiner diffusion loss inside the true holes
 
-  num_workers: 10
+  # Projected patch discriminator: small trainable heads on frozen VGG19
+  # features (4 scales, patch logits, hinge loss). Starts after start_iter
+  # iterations, once the generator has learned the structure.
+  gan:
+    start_iter: 5000
+    d_lr: 0.0001          # decays together with lr
+    beta1: 0.0
+    beta2: 0.99
 
-  # On-the-fly degradation (textures cached once per DataLoader worker).
-  # Default directory: data/raw/noise_data
-  use_flip: true
-  use_rot: true
-
-# --------------------------------------------------------------------------- #
-# Validation / logging
-# --------------------------------------------------------------------------- #
 validation:
-  # MambaOFR validation protocol: never a crop. Whole frames, whole clips, and
-  # the model's own `model.refine_steps` — the trainer chunks each clip by
-  # num_frame and concatenates before computing metrics, exactly like
-  # MambaOFR's val_frame_num loop. Validation therefore always measures the
-  # same path as real inference; the only knob is the resolution below.
-  #
-  # gt_size is [width, height] in GT pixels — pick whatever you can afford.
-  # The LQ fed to the network is always gt_size / sr_scale, so with sr_scale 4:
-  #   [640, 368]  -> GT 640×368,  LQ 160×92   (matches MambaOFR's REDS4 val)
-  #   [960, 544]  -> GT 960×544,  LQ 240×136
-  #   [1280, 720] -> native REDS resolution — LQ 320×180 matches the baked
-  #                  degraded clips exactly, so the LQ is not resampled at all
-  #                  (slowest; watch host RAM at num_workers > 2).
-  # Both sides are snapped to a multiple of sr_scale*4 so the LQ stays integral
-  # and the refiner UNet needs no padding. Set gt_size: ~ for native size.
+  # Full inference path on the stored valid pairs (the model detects the holes
+  # itself). Reports LPIPS, flicker, PSNR, SSIM of the final output;
+  # best.pth = lowest LPIPS. gt_size [w, h] is the size dataset.create_dataset
+  # writes the valid clips at (LQ = gt_size / sr_scale).
   gt_size: [640, 360]
-
-  val_every: 10          # run validation every N epochs (1 = every epoch)
-  max_clips: 0           # cap number of validation clips (0 = all)
-  max_frames: 0          # cap frames evaluated per clip (0 = all)
-  num_workers: 5         # DataLoader workers for validation (0 = main process)
+  val_every: 10           # epochs
+  max_clips: 0            # 0 = all
+  max_frames: 0           # per clip, 0 = all
+  num_workers: 5
 
 logging:
-  log_every: 120
-  # New architecture: old checkpoints (experiments/revivid) do not load into it.
-  exp_dir: ./experiments/revivid_v4
-  save_checkpoint_every: 10   # numbered + latest checkpoints (not every epoch)
+  exp_dir: ./experiments/revivid_v5
+  log_every: 120          # iterations
+  save_checkpoint_every: 10   # epochs (numbered + latest.pth)
