@@ -1,9 +1,7 @@
-"""Training of REVIVID (restoration + 2x SR + hole inpainting), aimed at REALISM:
-a viewer should not be able to tell what was repaired.
+"""``Trainer`` — training of REVIVID (restoration + 2x SR + hole inpainting),
+aimed at REALISM: a viewer should not be able to tell what was repaired.
 
-Run it and it trains (continues from <exp_dir>/checkpoints/latest.pth if present):
-
-    python src/trainer/trainer.py [--config my.yaml] [--resume path.pth]
+Started from ``trainer/train.py`` (``python src/trainer/train.py``).
 
 Data (fixed layout, built by ``dataset.create_dataset``):
     data/training/train/*.mp4                  clean clips, degraded on the fly
@@ -27,20 +25,11 @@ lowest LPIPS.
 
 from __future__ import annotations
 
-import argparse
 import csv
-import os
-import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
-
-if __package__ in (None, ""):
-    # Run as a script / from an IDE: make the packages under src/ importable.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-if os.name != "nt":
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import lpips
 import torch
@@ -456,6 +445,11 @@ class Trainer:
               f"best lpips {self.best_lpips:.4f} @ epoch {self.best_epoch})")
         return s["epoch"] + 1
 
+    def save_config(self) -> None:
+        """Store the active config next to the run (<exp_dir>/config.yaml)."""
+        with open(self.exp_dir / "config.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(self.cfg, f, sort_keys=False, allow_unicode=True)
+
     def _write_history(self) -> None:
         keys = list(dict.fromkeys(k for e in self.history for k in e))
         with open(self.exp_dir / "loss_history.csv", "w", encoding="utf-8", newline="") as f:
@@ -485,24 +479,3 @@ class Trainer:
             print(f"[trainer] no validation pairs in {DATA_DIR / 'valid'} - training without validation")
             val = None
         return train, val
-
-
-def run(config=None, resume: Optional[str] = None) -> None:
-    trainer = Trainer(config)
-    start_epoch = trainer.resume(resume)
-    with open(trainer.exp_dir / "config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(trainer.cfg, f, sort_keys=False, allow_unicode=True)
-    train_loader, val_loader = trainer.build_loaders()
-    trainer.fit(train_loader, val_loader, start_epoch)
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Train REVIVID (no arguments needed).")
-    p.add_argument("--config", default=None, help="YAML config (default: config/REVIVID.yaml)")
-    p.add_argument("--resume", default=None, help="checkpoint (default: <exp_dir>/checkpoints/latest.pth)")
-    args = p.parse_args()
-    run(args.config, args.resume)
-
-
-if __name__ == "__main__":
-    main()

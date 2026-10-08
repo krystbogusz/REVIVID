@@ -8,7 +8,7 @@
 # flicker); inside them a diffusion refiner invents what the propagation could
 # not bring in from other frames.
 #
-# Train (no arguments needed):  python src/trainer/trainer.py
+# Train (no arguments needed):  python src/trainer/train.py
 # Data (dataset.create_dataset): data/training/train/*.mp4, data/training/valid/{gt,degraded}/*.mp4
 
 seed: 2026
