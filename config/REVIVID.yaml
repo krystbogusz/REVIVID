@@ -25,6 +25,10 @@ model:
   dcn_groups: 8           # groups of the second-order flow-guided DCN (divides 2*num_feat)
   # SR factor of the model and GT / degraded size of the generated datasets.
   sr_scale: 2
+  # Optical flow of the backbone (torchvision RAFT, pretrained, fine-tuned after
+  # training.raft_unfreeze_iter): large (~35% lower flow error on our degraded
+  # LR frames than small, +4.3 M params, ~+0.9 GiB once fine-tuned) | small.
+  raft: large
 
   # Refiner (diffusion UNet, acts only inside detected holes)
   refiner_base: 48
@@ -103,6 +107,6 @@ validation:
   num_workers: 5
 
 logging:
-  exp_dir: ./experiments/revivid_v6   # wider SS2D core (embed_dim 128): v5 checkpoints do not fit
+  exp_dir: ./experiments/revivid_v7   # RAFT large: v6 checkpoints do not fit
   log_every: 120          # iterations
   save_checkpoint_every: 10   # epochs (numbered + latest.pth)

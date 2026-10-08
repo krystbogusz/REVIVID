@@ -130,7 +130,7 @@ class Trainer:
         self.gan_loss = HingeGANLoss()
         self.detect_loss = HoleDetectionLoss(float(self.tc.get("hole_pos_weight", 10.0))).to(dev)
         self.hole_loss_boost = float(self.tc.get("hole_loss_boost", 3.0))
-        self.gt_flow = build_flow_estimator().to(dev)  # frozen RAFT: motion of the GT
+        self.gt_flow = build_flow_estimator("large").to(dev)  # frozen RAFT large: motion of the GT
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(dev).eval()
 
         # ---- optimisation

@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from .augment import augment_frames
 from .degradation.cache import get_texture_cache
-from .degradation.pipeline import process_video_frames, sample_degree
+from .degradation.pipeline import process_video_frames
 
 
 def list_mp4(folder: str | Path) -> List[Path]:
@@ -118,7 +118,6 @@ class TrainDataset(Dataset):
         lq, masks = process_video_frames(
             gt,
             get_texture_cache(cache_dir=self.texture_cache_dir),
-            degree=sample_degree(),
             device=torch.device("cpu"),
             out_size=(ph // sr, pw // sr),
             hole_prob=self.hole_prob,

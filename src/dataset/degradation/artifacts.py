@@ -5,7 +5,9 @@ depending on convention — see each function's docstring). They are called by
 ``pipeline.process_video_frames`` which handles batching and normalisation.
 
 Conventions that match MambaOFR (degradation_v3 / degradation_video_list_4):
-  - ``random_scaling`` supports bilinear / bicubic / lanczos (OpenCV for lanczos).
+  - ``random_scaling`` supports bilinear / bicubic / lanczos, antialiased like
+    MambaOFR's PIL resize (torch ``antialias=True``, PIL itself for lanczos).
+  - ``apply_blur`` mirrors the borders, like ``ndimage.convolve(mode="mirror")``.
   - ``apply_jpeg_artifact`` receives and returns a **greyscale uint8 ndarray** (H, W),
     matching MambaOFR's PIL.convert("L") → BytesIO JPEG path.
 """
@@ -20,32 +22,35 @@ import scipy.stats as ss
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+from PIL import Image
 
 
 def random_scaling(img_tensor, target_w, target_h):
-    """Resize a (1, C, H, W) tensor to (target_h, target_w).
+    """Resize a (1, C, H, W) tensor in [0, 1] to (target_h, target_w).
 
     Randomly selects bilinear, bicubic, or lanczos — matching MambaOFR's
-    random_scaling which draws from the same three methods.
-    Lanczos is not natively supported by torch.nn.functional.interpolate, so
-    we drop to OpenCV for that mode and convert back to tensor.
+    random_scaling which draws from the same three methods with PIL. PIL
+    low-pass filters when shrinking, so bilinear / bicubic use torch's
+    PIL-compatible ``antialias=True``; lanczos, which torch lacks, goes
+    through PIL itself (OpenCV's lanczos does not antialias).
     """
     mode_choice = random.randint(0, 2)
     if mode_choice == 2:
-        import numpy as np
-
-        arr = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-        resized = cv2.resize(
-            arr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
+        arr = (img_tensor[0].clamp(0.0, 1.0) * 255.0).round().byte().cpu().numpy()
+        resized = np.stack(
+            [
+                np.asarray(Image.fromarray(c).resize((target_w, target_h), Image.LANCZOS))
+                for c in arr
+            ]
         )
-        if resized.ndim == 2:
-            resized = resized[:, :, None]
-        resized_tensor = torch.from_numpy(resized).float().to(img_tensor.device) / 255.0
-        return resized_tensor.permute(2, 0, 1).unsqueeze(0)
+        return torch.from_numpy(resized).float().to(img_tensor.device).unsqueeze(0) / 255.0
     torch_mode = "bilinear" if mode_choice == 0 else "bicubic"
     return F.interpolate(
-        img_tensor, size=(target_h, target_w), mode=torch_mode, align_corners=False
+        img_tensor,
+        size=(target_h, target_w),
+        mode=torch_mode,
+        align_corners=False,
+        antialias=True,
     )
 
 
@@ -162,20 +167,19 @@ def apply_blur(img_tensor, params):
     )
     kernel_tensor = kernel_tensor.repeat(img_tensor.shape[1], 1, 1, 1)
 
+    # Mirrored borders, as MambaOFR's ndimage.convolve(mode="mirror"): zero
+    # padding would darken a band as wide as the kernel radius.
     padding = kernel_tensor.shape[-1] // 2
-    blurred = F.conv2d(
-        img_tensor, kernel_tensor, padding=padding, groups=img_tensor.shape[1]
-    )
-    return blurred
+    padded = F.pad(img_tensor, (padding, padding, padding, padding), mode="reflect")
+    return F.conv2d(padded, kernel_tensor, groups=img_tensor.shape[1])
 
 
 def apply_color_jitter(img_tensor):
+    # Every frame: MambaOFR's A.ColorJitter(always_apply=True, p=0.5) always applies.
     jitter = T.ColorJitter(
         brightness=[0.8, 1.2], contrast=[0.9, 1.0], saturation=[1.0, 1.0], hue=0.0
     )
-    if random.random() < 0.5:
-        return jitter(img_tensor)
-    return img_tensor
+    return jitter(img_tensor)
 
 
 def apply_noise(img_tensor, std, noise_type="gaussian"):

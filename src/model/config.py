@@ -21,6 +21,7 @@ class ModelConfig:
     deg_dim: int = 64           # self-learned degradation code (FiLM on SS2D blocks)
     dcn_groups: int = 8         # groups of the second-order DCN (divides 2 * num_feat)
     sr_scale: int = 2
+    raft: str = "large"         # optical flow of the backbone: large | small
 
     # Refiner (diffusion UNet, inside holes only)
     refiner_base: int = 48

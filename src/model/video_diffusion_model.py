@@ -52,6 +52,7 @@ class Video_Backbone(nn.Module):
             deg_dim=cfg.deg_dim,
             dcn_groups=cfg.dcn_groups,
             hole_threshold=cfg.hole_threshold,
+            raft=cfg.raft,
         )
         self.diffusion = GaussianDiffusion(cfg.num_timesteps, cfg.min_snr_gamma)
         self.refine_unet = ConditionalUNet(

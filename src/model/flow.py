@@ -1,13 +1,13 @@
-"""Optical-flow estimation and warping.
+"""Optical-flow estimation (torchvision RAFT) and warping.
 
-REVIVID uses a single, real optical-flow estimator: torchvision's RAFT
-(``raft_small``) with pretrained weights. The estimator starts frozen and is
-unfrozen by the trainer after a warmup (MambaOFR recipe: fine-tune the flow on
-degraded frames at a reduced learning rate once the rest of the network has
-stabilised).
+The backbone's RAFT starts frozen and is fine-tuned on degraded frames after a
+warmup (``training.raft_unfreeze_iter``) at a reduced learning rate; the
+trainer's GT-flow RAFT (flicker loss / metric) stays frozen.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -32,10 +32,9 @@ def flow_warp(
     vgrid = grid + flow
     vgrid_x = 2.0 * vgrid[..., 0] / max(w - 1, 1) - 1.0
     vgrid_y = 2.0 * vgrid[..., 1] / max(h - 1, 1) - 1.0
-    vgrid_scaled = torch.stack((vgrid_x, vgrid_y), dim=3)
     return F.grid_sample(
         x,
-        vgrid_scaled,
+        torch.stack((vgrid_x, vgrid_y), dim=3),
         mode=interp_mode,
         padding_mode=padding_mode,
         align_corners=align_corners,
@@ -43,64 +42,58 @@ def flow_warp(
 
 
 class RAFTFlow(nn.Module):
-    """torchvision RAFT wrapper returning flow_{a->b} as (n, 2, h, w).
+    """torchvision RAFT (``large`` or ``small``, pretrained) returning
+    flow_{a->b} as (n, 2, h, w) in pixels; inputs in [-1, 1].
 
-    Frozen by default; the trainer calls :meth:`set_trainable` after the
-    warmup phase to fine-tune the flow at a reduced learning rate.
+    Frozen by default; :meth:`set_trainable` enables fine-tuning. Batch-norm
+    statistics (RAFT large's context encoder) always stay frozen — the small
+    training batches would corrupt the pretrained ones (as in RAFT's own
+    fine-tuning, ``freeze_bn``).
     """
 
-    def __init__(self):
+    MIN_SIZE = 128  # RAFT works at >= 128 px; smaller inputs are upsampled
+
+    def __init__(self, variant: str = "large"):
         super().__init__()
-        from torchvision.models.optical_flow import raft_small
+        from torchvision.models import optical_flow as of
 
-        try:
-            from torchvision.models.optical_flow import Raft_Small_Weights
-
-            self.raft = raft_small(weights=Raft_Small_Weights.DEFAULT)
-        except Exception:
-            self.raft = raft_small(weights=None)
-
-        self._trainable = False
-        for p in self.raft.parameters():
-            p.requires_grad_(False)
+        if variant == "large":
+            self.raft = of.raft_large(weights=of.Raft_Large_Weights.DEFAULT)
+        elif variant == "small":
+            self.raft = of.raft_small(weights=of.Raft_Small_Weights.DEFAULT)
+        else:
+            raise ValueError(f"unknown RAFT variant {variant!r} (large | small)")
+        self.set_trainable(False)
         self.eval()
 
     def set_trainable(self, flag: bool = True) -> None:
-        """Enable/disable fine-tuning of the RAFT weights."""
         self._trainable = bool(flag)
-        for p in self.raft.parameters():
-            p.requires_grad_(self._trainable)
+        self.raft.requires_grad_(self._trainable)
 
-    _MIN_SIZE = 128
-
-    def _work_size(self, h: int, w: int):
-        import math
-
-        H = max(self._MIN_SIZE, math.ceil(h / 8) * 8)
-        W = max(self._MIN_SIZE, math.ceil(w / 8) * 8)
-        return H, W
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for m in self.raft.modules():
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.eval()
+        return self
 
     def forward(self, frame_a: torch.Tensor, frame_b: torch.Tensor) -> torch.Tensor:
         h, w = frame_a.shape[-2:]
-        H, W = self._work_size(h, w)
+        H = max(self.MIN_SIZE, math.ceil(h / 8) * 8)
+        W = max(self.MIN_SIZE, math.ceil(w / 8) * 8)
         a, b = frame_a, frame_b
         if (H, W) != (h, w):
             a = F.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
-        grad_ok = self._trainable and torch.is_grad_enabled()
-        with torch.set_grad_enabled(grad_ok):
+        with torch.set_grad_enabled(self._trainable and torch.is_grad_enabled()):
             flow = self.raft(a.contiguous(), b.contiguous())[-1]
 
         if (H, W) != (h, w):
-            flow = F.interpolate(
-                flow, size=(h, w), mode="bilinear", align_corners=False
-            )
-            flow = flow.clone()
-            flow[:, 0] *= w / W
-            flow[:, 1] *= h / H
+            flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)
+            flow = torch.stack([flow[:, 0] * (w / W), flow[:, 1] * (h / H)], dim=1)
         return flow
 
 
-def build_flow_estimator() -> nn.Module:
-    return RAFTFlow()
+def build_flow_estimator(variant: str = "large") -> RAFTFlow:
+    return RAFTFlow(variant)

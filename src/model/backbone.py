@@ -11,7 +11,7 @@ Per clip ``lrs`` of shape (N, T, 3, h, w) in [-1, 1]:
                            training target.
 2. ``push_pull_fill``    — holes are pre-filled from their surroundings, so the
                            flat black patch does not pin the optical flow to 0.
-3. RAFT + ``FlowCompletion`` — flow on the pre-filled frames, then re-estimated
+3. RAFT (large) + ``FlowCompletion`` — flow on the pre-filled frames, then re-estimated
                            inside holes from the motion around them. With the
                            right motion, the content hidden under a static hole
                            at frame t is fetched from frames where it was visible.
@@ -280,13 +280,14 @@ class ConditioningBackbone(nn.Module):
         deg_dim: int = 64,
         dcn_groups: int = 8,
         hole_threshold: float = 0.9,
+        raft: str = "large",
     ):
         super().__init__()
         self.hole_threshold = hole_threshold
         c = num_feat
 
         self.hole_detector = HoleDetector()
-        self.flow_net = build_flow_estimator()
+        self.flow_net = build_flow_estimator(raft)
         self.flow_completion = FlowCompletion()
         self.degradation_encoder = DegradationEncoder(deg_dim)
 

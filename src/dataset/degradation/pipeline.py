@@ -13,16 +13,19 @@ Order of operations per frame — the one MambaOFR actually trains with
     5. Gaussian / speckle noise  (at the resampled size)
     6. JPEG on greyscale uint8   (at the resampled size)
     7. Resize back to native resolution
-    8. Color jitter (50 % probability)
+    8. Color jitter (every frame — MambaOFR's ``always_apply=True`` overrides ``p=0.5``)
     9. Final resize to LR resolution (LR = GT / sr_scale), replicate to 3 channels
    10. Persistent holes: the frames are split into windows of ``hole_window``
        and each window gets, with probability ``hole_prob``, one hole mask
        shared by all its frames.
 
+The core parameters (blur kernel, noise std, JPEG quality, resampling scale)
+are drawn once per call from ``degradation_video_list_4``'s full continuous
+ranges, then jittered per frame.
+
 Do not follow ``degradation_video_list_5`` (MambaOFR's ``degradation.py``):
 it passes ``distortion_probability = [1, 1, 1, 1]`` and ``degradation_v3``
-tests ``p < 1.0``, so blur, noise and JPEG never run there. Its per-degree
-parameter ranges are still the ones used in ``_DEG_PARAMS`` below.
+tests ``p < 1.0``, so blur, noise and JPEG never run there.
 """
 
 from __future__ import annotations
@@ -60,39 +63,6 @@ def _add_alpha_channel(tensor_rgb: torch.Tensor) -> torch.Tensor:
         * 255.0
     )
     return torch.cat((tensor_rgb, alpha), dim=2)
-
-
-_DEG_PARAMS = [
-    {
-        "shape_value": lambda: random.randint(2, 5),
-        "noise_std": lambda: random.uniform(5.0 / 255.0, 6.0 / 255.0),
-        "jpeg_quality": lambda: random.randint(80, 100),
-        "up_scale": lambda: random.uniform(1, 1.5),
-        "down_scale": lambda: random.uniform(0.5, 1),
-    },
-    {
-        "shape_value": lambda: random.randint(5, 8),
-        "noise_std": lambda: random.uniform(6.0 / 255.0, 8.0 / 255.0),
-        "jpeg_quality": lambda: random.randint(60, 80),
-        "up_scale": lambda: random.uniform(1, 2),
-        "down_scale": lambda: random.uniform(0.25, 1),
-    },
-    {
-        "shape_value": lambda: random.randint(8, 11),
-        "noise_std": lambda: random.uniform(8.0 / 255.0, 10.0 / 255.0),
-        "jpeg_quality": lambda: random.randint(40, 60),
-        "up_scale": lambda: random.uniform(1, 2),
-        "down_scale": lambda: random.uniform(0.125, 1),
-    },
-]
-
-
-_DEGREE_WEIGHTS = [0.30, 0.30, 0.40]
-
-
-def sample_degree() -> int:
-    """Sample a degradation degree (0, 1, 2) with weights 30 / 30 / 40 %."""
-    return random.choices([0, 1, 2], weights=_DEGREE_WEIGHTS, k=1)[0]
 
 
 def apply_holes_to_window(
@@ -134,7 +104,6 @@ def apply_holes_to_window(
 def process_video_frames(
     frame_list_cv2: list,
     texture_cache,
-    degree: int = 1,
     downscale_factor: int = 4,
     device: torch.device | None = None,
     out_size: tuple | None = None,
@@ -162,18 +131,18 @@ def process_video_frames(
     first_frame = frame_list_cv2[0]
     original_h, original_w = first_frame.shape[:2]
 
-    _p = _DEG_PARAMS[degree]
+    # As MambaOFR's degradation_video_list_4: fixed for the call, jittered per frame.
     deg_params = {
         "type_value": random.random(),
         "l1_value": random.random(),
         "l2_value": random.random(),
         "angle_value": random.random(),
-        "shape_value": _p["shape_value"](),
-        "noise_std": _p["noise_std"](),
-        "jpeg_quality": _p["jpeg_quality"](),
+        "shape_value": random.randint(2, 11),
+        "noise_std": random.uniform(5.0 / 255.0, 10.0 / 255.0),
+        "jpeg_quality": random.randint(40, 100),
         "rnum": np.random.rand(),
-        "up_scale": _p["up_scale"](),
-        "down_scale": _p["down_scale"](),
+        "up_scale": random.uniform(1, 2),
+        "down_scale": random.uniform(0.5 / 4, 1),
     }
 
     use_moving_line = random.random() < 0.2
@@ -275,6 +244,7 @@ def process_video_frames(
                 size=(target_h, target_w),
                 mode="bilinear",
                 align_corners=False,
+                antialias=True,
             ).squeeze(0)
 
         current_frame = (

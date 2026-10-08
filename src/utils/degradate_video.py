@@ -14,7 +14,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", type=str, required=True)
     parser.add_argument("-o", "--output", type=str, required=True)
-    parser.add_argument("-d", "--degree", type=int, default=1, choices=[0, 1, 2])
     parser.add_argument("-t", "--textures", type=str, default="./data/raw/noise_data")
     parser.add_argument("-b", "--batch_size", type=int, default=30)
     parser.add_argument("--downscale_factor", type=int, default=1)
@@ -65,7 +64,6 @@ def main():
                 degraded_batch = process_video_frames(
                     frame_batch,
                     texture_cache,
-                    degree=args.degree,
                     downscale_factor=args.downscale_factor,
                     device=device,
                     hole_prob=args.hole_prob,
@@ -80,7 +78,6 @@ def main():
             degraded_batch = process_video_frames(
                 frame_batch,
                 texture_cache,
-                degree=args.degree,
                 downscale_factor=args.downscale_factor,
                 device=device,
                 hole_prob=args.hole_prob,

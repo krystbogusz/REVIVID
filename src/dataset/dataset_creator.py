@@ -27,7 +27,7 @@ import torch
 from tqdm import tqdm
 
 from .degradation.cache import build_texture_mmap, get_texture_cache
-from .degradation.pipeline import process_video_frames, sample_degree
+from .degradation.pipeline import process_video_frames
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -163,7 +163,6 @@ class DatasetCreator:
             degraded = process_video_frames(
                 gt,
                 textures,
-                degree=sample_degree(),
                 device=device,
                 out_size=(size[0] // self.sr_scale, size[1] // self.sr_scale),
                 hole_prob=self.hole_prob,
