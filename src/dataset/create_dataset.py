@@ -6,7 +6,7 @@
 Sources are video files, frame folders, or directories containing them.
 Evaluation reuses the texture cache built by the train mode.
 Defaults for scale, window, hole probability, textures and validation size
-come from config/REVIVID.yaml.
+come from config/REVIVID.yaml (hole probability: 0 while training.stage is restore).
 """
 
 import argparse
@@ -33,7 +33,11 @@ def parse_args(model_cfg, train_cfg, val_cfg):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--num-frame", type=int, default=train_cfg.get("num_frame", 7),
                         help="window length for holes")
-    common.add_argument("--hole-prob", type=float, default=model_cfg.get("hole_prob", 0.15))
+    # The restore stage trains without holes, so its validation pairs have none either.
+    restore = train_cfg.get("stage", "inpaint") == "restore"
+    common.add_argument("--hole-prob", type=float,
+                        default=0.0 if restore else model_cfg.get("hole_prob", 0.15),
+                        help="0 in the restore stage, else model.hole_prob")
     common.add_argument("--fps", type=float, default=24.0, help="fps for frame folders")
 
     train = sub.add_parser("train", parents=[common], help="build data/training")

@@ -7,14 +7,20 @@ Data (fixed layout, built by ``dataset.create_dataset``):
     data/training/train/*.mp4                  clean clips, degraded on the fly
     data/training/valid/{gt,degraded}/*.mp4    validation pairs
 
+Two stages (``training.stage``):
+    restore  restoration + SR of the backbone only: no holes in the training
+             data, no detector / refiner losses, validation on the coarse output
+    inpaint  holes burned in with ``model.hole_prob``; detector + refiner train
+             too, validation on the full inference path
+
 Generator loss (weights: ``training.loss_weights``):
     pix        Charbonnier(coarse, gt), true-hole pixels weighted 1 + hole_loss_boost
-    perceptual VGG19 feature distance(coarse, gt)
-    gan        hinge, projected patch discriminator on the same VGG features
+    perceptual MambaOFR's VGG19 loss(coarse, gt): relu1_1..relu5_1 weighted 1/32..1
+    gan        hinge, projected patch discriminator on VGG features of the same pass
                (from ``training.gan.start_iter``)
     temporal   flicker of coarse vs the GT's own motion
-    detect     BCE of the hole detector vs the true hole mask
-    v          diffusion v-loss of the refiner inside the true holes
+    detect     BCE of the hole detector vs the true hole mask        (inpaint)
+    v          diffusion v-loss of the refiner inside the true holes (inpaint)
 Discriminator: hinge on VGG features of GT vs coarse, own AdamW.
 
 The true hole mask of a training sample is a TARGET only — the model never
@@ -55,7 +61,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
 DATA_DIR = PROJECT_ROOT / "data" / "training"
 
-DEFAULT_WEIGHTS = {"pix": 1.0, "perceptual": 0.1, "gan": 0.05, "temporal": 0.5, "detect": 0.05, "v": 1.0}
+DEFAULT_WEIGHTS = {"pix": 1.0, "perceptual": 1.0, "gan": 0.05, "temporal": 0.5, "detect": 0.05, "v": 1.0}
+STAGES = ("restore", "inpaint")
 
 
 def load_config(path=None) -> dict:
@@ -119,6 +126,10 @@ class Trainer:
             raise RuntimeError("CUDA GPU is required.")
         self.device = dev = torch.device("cuda")
         torch.manual_seed(int(cfg.get("seed", 2026)))
+        self.stage = str(self.tc.get("stage", "inpaint"))
+        if self.stage not in STAGES:
+            raise ValueError(f"training.stage must be one of {STAGES}, got {self.stage!r}")
+        self.inpaint = self.stage == "inpaint"
 
         self.exp_dir = Path(self.lc.get("exp_dir", "experiments/revivid"))
         if not self.exp_dir.is_absolute():
@@ -146,6 +157,7 @@ class Trainer:
         # ---- optimisation
         self.lr = float(self.tc.get("lr", 2e-4))
         self.lr_min = float(self.tc.get("lr_min", 1e-6))
+        self.lr_steady = float(self.tc.get("lr_steady", 0.0))
         betas = (float(self.tc.get("beta1", 0.9)), float(self.tc.get("beta2", 0.99)))
         params = [p for p in self.net.parameters() if p.requires_grad]
         self.opt_g = torch.optim.AdamW([{"params": params, "lr_mult": 1.0}], lr=self.lr, betas=betas)
@@ -174,8 +186,10 @@ class Trainer:
     # ------------------------------------------------------------ schedule
 
     def _set_lr(self, epoch: int, epochs: int) -> float:
-        """Linear decay from ``lr`` (first epoch) to ``lr_min`` (last epoch)."""
-        frac = min(max((epoch - 1) / max(epochs - 1, 1), 0.0), 1.0)
+        """Constant ``lr`` over the first ``lr_steady`` fraction of the epochs, then
+        a linear decay to ``lr_min`` at the last epoch (MambaOFR: half and half)."""
+        steady = int(round(self.lr_steady * epochs))
+        frac = min(max((epoch - 1 - steady) / max(epochs - 1 - steady, 1), 0.0), 1.0)
         lr = self.lr + (self.lr_min - self.lr) * frac
         for g in self.opt_g.param_groups:
             g["lr"] = lr * g["lr_mult"]
@@ -217,14 +231,14 @@ class Trainer:
         fake_feats = self.vgg(coarse_f)
         with torch.no_grad():
             real_feats = self.vgg(gt_f)
-        losses["perceptual"] = VGGFeatures.perceptual(fake_feats, real_feats)
+        losses["perceptual"] = VGGFeatures.perceptual(fake_feats["perc"], real_feats["perc"])
 
         gan_on = self.iteration >= self.gan_start_iter
         if gan_on:
             # D's parameters are frozen while this graph is built, so the
             # generator loss sends them no gradient.
             self.net_d.requires_grad_(False)
-            losses["gan"] = self.gan_loss.generator(self.net_d(fake_feats))
+            losses["gan"] = self.gan_loss.generator(self.net_d(fake_feats["disc"]))
             self.net_d.requires_grad_(True)
 
         if t > 1:
@@ -234,11 +248,12 @@ class Trainer:
                 ).view(n, t - 1, 2, H, W)
             losses["temporal"] = self.temporal_loss(coarse, gt, flow)
 
-        losses["detect"] = self.detect_loss(out["hole_logits_f"], hole_lr)
+        if self.inpaint:
+            losses["detect"] = self.detect_loss(out["hole_logits_f"], hole_lr)
 
         # Refiner: diffusion inside the TRUE holes; batches without holes skip it.
         gen = self.net.generation_mask(hole_hr)
-        if bool((gen > 0).any()):
+        if self.inpaint and bool((gen > 0).any()):
             residual = gt_f - coarse_f.detach()
             std = self.net.update_residual_std(residual, gen)
             # One timestep per clip: the temporal attention mixes its frames.
@@ -264,8 +279,8 @@ class Trainer:
         log["total"] = float(total.detach())
 
         if gan_on:
-            d_real = self.net_d(real_feats)
-            d_fake = self.net_d([f.detach() for f in fake_feats])
+            d_real = self.net_d(real_feats["disc"])
+            d_fake = self.net_d([f.detach() for f in fake_feats["disc"]])
             loss_d = self.gan_loss.discriminator(d_real, d_fake)
             (loss_d / self.grad_accum).backward()
             log["d"] = float(loss_d.detach())
@@ -317,9 +332,18 @@ class Trainer:
         return total / max(pairs, 1)
 
     @torch.no_grad()
+    def _restore_window(self, lq: torch.Tensor):
+        """The stage's output for one window and where the refiner acted (None
+        in the restore stage, whose output is the coarse restoration)."""
+        if not self.inpaint:
+            return self.net(lq)["coarse"][0].clamp(-1.0, 1.0), None
+        r = self.net.restore_full(lq)
+        return r["refined"][0], r["generation_mask"][0]
+
+    @torch.no_grad()
     def validate(self, loader, epoch: int) -> dict:
-        """Full inference path on the stored .mp4 pairs (the model finds the holes
-        itself, in windows of num_frame); metrics of the final output."""
+        """The stage's inference path on the stored .mp4 pairs (inpaint: the model
+        finds the holes itself), in windows of num_frame; metrics of the output."""
         self.net.eval()
         win = int(self.tc.get("num_frame", 7))
         max_clips = int(self.vc.get("max_clips", 0))
@@ -332,15 +356,17 @@ class Trainer:
                 lq, gt = self._val_clip(item, max_frames)
                 outs, masks = [], []
                 for i in range(0, lq.shape[1], win):
-                    r = self.net.restore_full(lq[:, i : i + win].to(self.device))
-                    outs.append(r["refined"][0].cpu())
-                    masks.append((r["generation_mask"][0] > 0).float().cpu())
+                    o, gen = self._restore_window(lq[:, i : i + win].to(self.device))
+                    outs.append(o.cpu())
+                    if gen is not None:
+                        masks.append((gen > 0).float().cpu())
                 out = torch.cat(outs)
                 m = evaluate_clip(out, gt)
                 m["psnr"] = min(m["psnr"], 100.0)
                 m["lpips"] = self._lpips(out, gt)
                 m["flicker"] = self._flicker(out, gt)
-                m["hole_frac"] = float(torch.cat(masks).mean())  # where the refiner acted
+                if masks:
+                    m["hole_frac"] = float(torch.cat(masks).mean())  # where the refiner acted
                 for k, v in m.items():
                     sums[k] = sums.get(k, 0.0) + v
                 count += 1
@@ -348,19 +374,24 @@ class Trainer:
 
     @torch.no_grad()
     def save_sample(self, loader, epoch: int, tag: str) -> None:
-        """First validation window: rows LQ / coarse / refined / GT / refiner mask."""
+        """First validation window: rows LQ / coarse / refined / GT / refiner mask
+        (restore stage: LQ / coarse / GT)."""
         self.net.eval()
         lq, gt = self._val_clip(next(iter(loader)), int(self.tc.get("num_frame", 7)))
-        with self.ema.applied(self.net):
-            r = self.net.restore_full(lq.to(self.device))
         size = gt.shape[-2:]
-        rows = [
-            F.interpolate(lq[0], size=size, mode="bilinear", align_corners=False),
-            r["coarse"][0].cpu(),
-            r["refined"][0].cpu(),
-            gt,
-            r["generation_mask"][0].cpu().expand(-1, 3, -1, -1) * 2 - 1,
-        ]
+        lq_up = F.interpolate(lq[0], size=size, mode="bilinear", align_corners=False)
+        with self.ema.applied(self.net):
+            if self.inpaint:
+                r = self.net.restore_full(lq.to(self.device))
+                rows = [
+                    lq_up,
+                    r["coarse"][0].cpu(),
+                    r["refined"][0].cpu(),
+                    gt,
+                    r["generation_mask"][0].cpu().expand(-1, 3, -1, -1) * 2 - 1,
+                ]
+            else:
+                rows = [lq_up, self.net(lq.to(self.device))["coarse"][0].cpu(), gt]
         grid = torch.cat([x.float().clamp(-1, 1).add(1).div(2) for x in rows])
         save_image(grid, self.exp_dir / "samples" / f"epoch{epoch:04d}_{tag}.png", nrow=lq.shape[1], padding=2)
 
@@ -395,7 +426,8 @@ class Trainer:
                 entry.update({f"val_{k}": v for k, v in m.items()})
                 print(
                     f"[epoch {epoch}] VAL lpips {m['lpips']:.4f} | flicker {m['flicker']:.4f} | "
-                    f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f} | refiner on {100 * m['hole_frac']:.2f}% px"
+                    f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f}"
+                    + (f" | refiner on {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
                 )
             self.history.append(entry)
             self._write_history()
@@ -470,15 +502,16 @@ class Trainer:
     # ----------------------------------------------------------------- data
 
     def build_loaders(self):
-        """Train clips (degraded on the fly, with their true hole masks) and the
-        stored validation pairs (no masks; ``None`` when there are none)."""
+        """Train clips (degraded on the fly, with their true hole masks; no holes
+        in the restore stage) and the stored validation pairs (no masks; ``None``
+        when there are none)."""
         tc = self.tc
         train = data.train_loader(
             DATA_DIR / "train",
             num_frame=int(tc.get("num_frame", 7)),
             sr_scale=self.model_cfg.sr_scale,
             crop_size=tc.get("gt_size"),
-            hole_prob=self.model_cfg.hole_prob,
+            hole_prob=self.model_cfg.hole_prob if self.inpaint else 0.0,
             batch_size=int(tc.get("batch_size", 1)),
             num_workers=int(tc.get("num_workers", 0)),
             augment=bool(tc.get("augment", True)),

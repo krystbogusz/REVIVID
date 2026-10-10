@@ -51,18 +51,25 @@ model:
   # refine_mask_dilate.
   hole_threshold: 0.9
   refine_mask_dilate: 8   # refiner region = detected holes dilated by this (HR px)
-  hole_prob: 0.25         # prob. a window gets holes burned in (training + dataset creation)
+  hole_prob: 0.25         # prob. a window gets holes burned in (inpaint stage: training + dataset creation)
 
 training:
-  epochs: 4000
+  # restore: restoration + SR of the backbone only - no holes in the training data
+  #          (valid pairs: create them with this stage set), no detector / refiner
+  #          losses, validation on the coarse output.
+  # inpaint: holes with model.hole_prob; detector + refiner train, full inference
+  #          path in validation (fine-tuning after restore).
+  stage: restore
+  epochs: 2000            # x 120 batches (240 clips / batch 2) = 240k iterations, as MambaOFR
   batch_size: 2
   num_frame: 7
   gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
   augment: true           # random flips / 90° rotation
   num_workers: 10
 
-  lr: 0.0002              # linear decay to lr_min over all epochs
+  lr: 0.0002
   lr_min: 0.000001
+  lr_steady: 0.5          # constant lr for this fraction of the epochs, then linear decay to lr_min (MambaOFR)
   beta1: 0.9
   beta2: 0.99
   # Optimizer steps every grad_accum batches (effective batch = batch_size * grad_accum).
@@ -83,11 +90,11 @@ training:
   # Generator loss = sum of weight * term:
   loss_weights:
     pix: 1.0              # Charbonnier(coarse, gt) - content fidelity
-    perceptual: 0.1       # VGG19 feature distance (raw ~8, i.e. ~0.8 effective)
+    perceptual: 1.0       # MambaOFR's VGG19 loss: relu1_1..relu5_1 weighted 1/32..1
     gan: 0.05             # adversarial, projected patch discriminator (see gan:)
     temporal: 0.5         # flicker vs the GT's own motion
-    detect: 0.05          # hole detector BCE vs the true mask
-    v: 1.0                # refiner diffusion loss inside the true holes
+    detect: 0.05          # hole detector BCE vs the true mask (inpaint stage)
+    v: 1.0                # refiner diffusion loss inside the true holes (inpaint stage)
 
   # Projected patch discriminator: small trainable heads on frozen VGG19
   # features (4 scales, patch logits, hinge loss). Starts after start_iter
@@ -99,8 +106,9 @@ training:
     beta2: 0.99
 
 validation:
-  # Full inference path on the stored valid pairs (the model detects the holes
-  # itself). Reports LPIPS, flicker, PSNR, SSIM of the final output;
+  # The stage's inference path on the stored valid pairs (restore: the coarse
+  # output; inpaint: the model detects the holes itself). Reports LPIPS,
+  # flicker, PSNR, SSIM of the output;
   # best.pth = lowest LPIPS. gt_size [w, h] is the size dataset.create_dataset
   # writes the valid clips at (LQ = gt_size / sr_scale).
   gt_size: [640, 360]
@@ -110,6 +118,6 @@ validation:
   num_workers: 5
 
 logging:
-  exp_dir: ./experiments/revivid_v7   # RAFT large: v6 checkpoints do not fit
+  exp_dir: ./experiments/revivid_v8   # restore stage from scratch (v7: holes from the start)
   log_every: 120          # iterations
   save_checkpoint_every: 10   # epochs (numbered + latest.pth)

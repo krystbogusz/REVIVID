@@ -2,7 +2,7 @@
 
 This is NOT MambaOFR's discriminator (a 3-D conv net on raw pixels, judging the
 whole clip). It judges FROZEN pretrained VGG19 features — the very maps
-``VGGFeatures`` computes for the perceptual loss, so VGG runs once per step —
+``VGGFeatures`` computes in the same pass as the perceptual loss —
 at four scales, each with a small trainable patch head (the "projected GAN"
 idea):
 
@@ -11,8 +11,8 @@ idea):
 * Every head outputs a map of logits, one per image patch, so the critic is
   local: a smeared scratch, a seam around a filled hole or a plastic-looking
   texture patch is judged where it is, not averaged into one score per clip.
-* The four scales cover grain and fine texture (conv1_2) up to object-level
-  structure (conv4_4).
+* The four scales cover grain and fine texture (relu1_2) up to object-level
+  structure (relu4_4).
 
 Flicker is not this module's job — ``TemporalConsistencyLoss`` handles it.
 """

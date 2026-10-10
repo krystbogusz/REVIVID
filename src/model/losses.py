@@ -2,7 +2,7 @@
 
 Generator (coarse output = the final image everywhere outside holes):
     * ``CharbonnierLoss``         — fidelity to GT (robust L1); keeps content right.
-    * ``VGGFeatures.perceptual``  — VGG19 feature distance; keeps texture/structure right.
+    * ``VGGFeatures.perceptual``  — MambaOFR's VGG19 feature distance; keeps texture/structure right.
     * ``HingeGANLoss.generator``  — realism: the projected patch discriminator must
                                     not tell the output from real footage.
     * ``TemporalConsistencyLoss`` — no flicker: frame-to-frame change must follow
@@ -14,7 +14,7 @@ Refiner: its v-prediction loss lives in ``GaussianDiffusion.training_loss``.
 
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -37,39 +37,44 @@ class CharbonnierLoss(nn.Module):
 
 
 class VGGFeatures(nn.Module):
-    """Frozen VGG19 feature maps (conv1_2, conv2_2, conv3_4, conv4_4) of images
-    in [-1, 1]. One forward per step feeds both the perceptual loss and the
-    projected discriminator."""
+    """Frozen VGG19 of images in [-1, 1]; one forward per step feeds both users:
 
-    LAYERS = (2, 7, 16, 25)
-    CHANNELS = (64, 128, 256, 512)
+    * ``"perc"`` relu1_1 … relu5_1 — MambaOFR's perceptual loss (``VGGLoss_torch``:
+      same layers, weights ``PERC_WEIGHTS``, the [-1, 1] input fed as is);
+    * ``"disc"`` relu1_2, relu2_2, relu3_4, relu4_4 — the projected discriminator.
+    """
+
+    PERC_LAYERS = (1, 6, 11, 20, 29)
+    PERC_WEIGHTS = (1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0)
+    DISC_LAYERS = (3, 8, 17, 26)
+    CHANNELS = (64, 128, 256, 512)  # of the "disc" maps
 
     def __init__(self):
         super().__init__()
         from torchvision import models
 
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.slices = nn.ModuleList()
-        start = 0
-        for end in self.LAYERS:
-            self.slices.append(nn.Sequential(*list(vgg.children())[start : end + 1]))
-            start = end + 1
+        self.layers = vgg[: max(self.PERC_LAYERS + self.DISC_LAYERS) + 1]
+        for m in self.layers:
+            if isinstance(m, nn.ReLU):
+                m.inplace = False  # a tapped map must not be overwritten by the next ReLU
         self.requires_grad_(False)
         self.eval()
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x = ((x.float() + 1.0) / 2.0 - self.mean) / self.std
-        feats = []
-        for slc in self.slices:
-            x = slc(x)
-            feats.append(x)
+    def forward(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
+        x = x.float()
+        feats = {"perc": [], "disc": []}
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i in self.PERC_LAYERS:
+                feats["perc"].append(x)
+            if i in self.DISC_LAYERS:
+                feats["disc"].append(x)
         return feats
 
-    @staticmethod
-    def perceptual(fake: List[torch.Tensor], real: List[torch.Tensor]) -> torch.Tensor:
-        return sum(F.l1_loss(a, b.detach()) for a, b in zip(fake, real))
+    @classmethod
+    def perceptual(cls, fake: List[torch.Tensor], real: List[torch.Tensor]) -> torch.Tensor:
+        return sum(w * F.l1_loss(a, b.detach()) for w, a, b in zip(cls.PERC_WEIGHTS, fake, real))
 
 
 class HingeGANLoss:
