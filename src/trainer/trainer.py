@@ -19,14 +19,16 @@ Generator loss (weights: ``training.loss_weights``):
     gan        hinge, projected patch discriminator on VGG features of the same pass
                (from ``training.gan.start_iter``)
     temporal   flicker of coarse vs the GT's own motion
+    fft        L1 of FFT amplitude(coarse, gt) — missing high frequencies
+    grad       L1 of Sobel gradients(coarse, gt) — soft edges
     detect     BCE of the hole detector vs the true hole mask        (inpaint)
     v          diffusion v-loss of the refiner inside the true holes (inpaint)
 Discriminator: hinge on VGG features of GT vs coarse, own AdamW.
 
 The true hole mask of a training sample is a TARGET only — the model never
 receives it. Validation runs the full inference path on the stored .mp4 pairs
-and reports LPIPS / flicker / PSNR / SSIM of the final output; best.pth is the
-lowest LPIPS.
+and reports LPIPS / flicker / sharpness / PSNR / SSIM of the output; best.pth
+is the lowest LPIPS.
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ from model.discriminator import ProjectedPatchDiscriminator
 from model.flow import build_flow_estimator
 from model.losses import (
     CharbonnierLoss,
+    FrequencyLoss,
+    GradientLoss,
     HingeGANLoss,
     HoleDetectionLoss,
     TemporalConsistencyLoss,
@@ -61,7 +65,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
 DATA_DIR = PROJECT_ROOT / "data" / "training"
 
-DEFAULT_WEIGHTS = {"pix": 1.0, "perceptual": 1.0, "gan": 0.05, "temporal": 0.5, "detect": 0.05, "v": 1.0}
+DEFAULT_WEIGHTS = {
+    "pix": 1.0, "perceptual": 1.0, "gan": 0.05, "temporal": 0.5,
+    "fft": 0.5, "grad": 0.15, "detect": 0.05, "v": 1.0,
+}
 STAGES = ("restore", "inpaint")
 
 
@@ -148,6 +155,8 @@ class Trainer:
         self.vgg = VGGFeatures().to(dev)
         self.pix_loss = CharbonnierLoss()
         self.temporal_loss = TemporalConsistencyLoss()
+        self.fft_loss = FrequencyLoss()
+        self.grad_loss = GradientLoss().to(dev)
         self.gan_loss = HingeGANLoss()
         self.detect_loss = HoleDetectionLoss(float(self.tc.get("hole_pos_weight", 10.0))).to(dev)
         self.hole_loss_boost = float(self.tc.get("hole_loss_boost", 3.0))
@@ -227,6 +236,8 @@ class Trainer:
         losses = {}
 
         losses["pix"] = self.pix_loss(coarse_f, gt_f, 1.0 + self.hole_loss_boost * hole_hr)
+        losses["fft"] = self.fft_loss(coarse_f, gt_f)
+        losses["grad"] = self.grad_loss(coarse_f, gt_f)
 
         fake_feats = self.vgg(coarse_f)
         with torch.no_grad():
@@ -332,6 +343,27 @@ class Trainer:
         return total / max(pairs, 1)
 
     @torch.no_grad()
+    def _sharpness(self, out: torch.Tensor, gt: torch.Tensor, chunk: int = 8) -> float:
+        """High-frequency energy of the output relative to the GT: the mean FFT
+        amplitude between 0.45 and 0.9 of the Nyquist frequency, over the clip.
+        1.0 = as sharp as the GT; below = softer; above = over-sharpened / noise."""
+        h, w = gt.shape[-2:]
+        fy = torch.fft.fftfreq(h, device=self.device)[:, None] * 2  # in units of Nyquist
+        fx = torch.fft.rfftfreq(w, device=self.device)[None, :] * 2
+        r = torch.sqrt(fy**2 + fx**2)
+        band = ((r >= 0.45) & (r < 0.9)).float()
+
+        def energy(x: torch.Tensor) -> float:
+            total = 0.0
+            for i in range(0, x.shape[0], chunk):
+                y = x[i : i + chunk].to(self.device).float().mean(1)  # grey frames
+                y = y - y.mean((-2, -1), keepdim=True)
+                total += float((torch.fft.rfft2(y, norm="ortho").abs() * band).sum())
+            return total
+
+        return energy(out) / max(energy(gt), 1e-8)
+
+    @torch.no_grad()
     def _restore_window(self, lq: torch.Tensor):
         """The stage's output for one window and where the refiner acted (None
         in the restore stage, whose output is the coarse restoration)."""
@@ -365,6 +397,7 @@ class Trainer:
                 m["psnr"] = min(m["psnr"], 100.0)
                 m["lpips"] = self._lpips(out, gt)
                 m["flicker"] = self._flicker(out, gt)
+                m["sharpness"] = self._sharpness(out, gt)
                 if masks:
                     m["hole_frac"] = float(torch.cat(masks).mean())  # where the refiner acted
                 for k, v in m.items():
@@ -426,6 +459,7 @@ class Trainer:
                 entry.update({f"val_{k}": v for k, v in m.items()})
                 print(
                     f"[epoch {epoch}] VAL lpips {m['lpips']:.4f} | flicker {m['flicker']:.4f} | "
+                    f"sharpness {100 * m['sharpness']:.0f}% of GT | "
                     f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f}"
                     + (f" | refiner on {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
                 )

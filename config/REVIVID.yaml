@@ -92,6 +92,10 @@ training:
     pix: 1.0              # Charbonnier(coarse, gt) - content fidelity
     perceptual: 1.0       # MambaOFR's VGG19 loss: relu1_1..relu5_1 weighted 1/32..1
     gan: 0.05             # adversarial, projected patch discriminator (see gan:)
+    # Sharpness. Without them the output stayed soft (run v8: 33% of the GT's
+    # sharpness at epoch ~486, v3 with them: 58% at the same epoch).
+    fft: 0.5              # L1 of FFT amplitude - missing high frequencies
+    grad: 0.15            # L1 of Sobel gradients - soft edges
     temporal: 0.5         # flicker vs the GT's own motion
     detect: 0.05          # hole detector BCE vs the true mask (inpaint stage)
     v: 1.0                # refiner diffusion loss inside the true holes (inpaint stage)

@@ -7,6 +7,10 @@ Generator (coarse output = the final image everywhere outside holes):
                                     not tell the output from real footage.
     * ``TemporalConsistencyLoss`` — no flicker: frame-to-frame change must follow
                                     the GT's own change along the GT motion.
+    * ``FrequencyLoss``, ``GradientLoss`` — sharpness: pixel / VGG losses settle on
+                                    the blurry average of what the degraded input
+                                    allows; these penalise the missing high
+                                    frequencies and soft edges directly.
 Hole detector:
     * ``HoleDetectionLoss``       — BCE against the true hole mask.
 Refiner: its v-prediction loss lives in ``GaussianDiffusion.training_loss``.
@@ -75,6 +79,34 @@ class VGGFeatures(nn.Module):
     @classmethod
     def perceptual(cls, fake: List[torch.Tensor], real: List[torch.Tensor]) -> torch.Tensor:
         return sum(w * F.l1_loss(a, b.detach()) for w, a, b in zip(cls.PERC_WEIGHTS, fake, real))
+
+
+class FrequencyLoss(nn.Module):
+    """L1 between the FFT amplitude spectra of prediction and target — a blurry
+    output lacks high-frequency amplitude, which this penalises directly."""
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p = torch.fft.rfft2(pred.float(), norm="ortho").abs()
+        t = torch.fft.rfft2(target.float(), norm="ortho").abs()
+        return F.l1_loss(p, t)
+
+
+class GradientLoss(nn.Module):
+    """L1 between Sobel gradients of prediction and target — a soft edge is
+    only slightly wrong per pixel, but has a much weaker gradient than a sharp one."""
+
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
+        self.register_buffer("kernel", torch.stack([kx, kx.t()])[:, None])  # (2, 1, 3, 3)
+
+    def _grad(self, x: torch.Tensor) -> torch.Tensor:
+        c = x.shape[1]
+        return F.conv2d(x, self.kernel.repeat(c, 1, 1, 1), padding=1, groups=c)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # = L1(dx) + L1(dy): x and y maps are equally many, so twice their joint mean
+        return 2.0 * F.l1_loss(self._grad(pred), self._grad(target))
 
 
 class HingeGANLoss:
