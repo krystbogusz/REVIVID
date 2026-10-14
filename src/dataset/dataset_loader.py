@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from .augment import augment_frames
 from .degradation.cache import get_texture_cache
-from .degradation.pipeline import process_video_frames
+from .degradation.pipeline import process_video_frames, sample_frame_ids
 
 
 def list_mp4(folder: str | Path) -> List[Path]:
@@ -106,14 +106,16 @@ class TrainDataset(Dataset):
     def __getitem__(self, index: int):
         path = self.clips[index]
         start = random.randint(0, max(0, frame_count(path) - self.num_frame))
-        frames = read_mp4(path, start, self.num_frame)
+        # Repeated frames as in real transfers: GT and input repeat together.
+        ids = sample_frame_ids(self.num_frame)
+        frames = read_mp4(path, start, ids[-1] + 1)
 
         sr = self.sr
         h, w = frames[0].shape[0] // sr * sr, frames[0].shape[1] // sr * sr
         ph, pw = (min(self.crop[0], h), min(self.crop[1], w)) if self.crop else (h, w)
         y = random.randint(0, h - ph) // sr * sr
         x = random.randint(0, w - pw) // sr * sr
-        gt = [f[y : y + ph, x : x + pw] for f in frames]
+        gt = [frames[i][y : y + ph, x : x + pw] for i in ids]
 
         lq, masks = process_video_frames(
             gt,
@@ -122,6 +124,7 @@ class TrainDataset(Dataset):
             out_size=(ph // sr, pw // sr),
             hole_prob=self.hole_prob,
             return_masks=True,
+            frame_ids=ids,
         )
 
         if self.augment:

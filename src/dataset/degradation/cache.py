@@ -198,6 +198,14 @@ class TextureCache:
     def get_moving_line_keys(self) -> list[str]:
         return self.moving_line_textures
 
+    def get_keys_in(self, folders) -> list[str]:
+        """Keys of the textures whose folder is one of ``folders``."""
+        folders = tuple(folders)
+        cache = self.__dict__.setdefault("_keys_in", {})
+        if folders not in cache:
+            cache[folders] = [k for k, e in self._entries.items() if e["folder"] in folders]
+        return cache[folders]
+
     def get_texture(self, key: str) -> tuple[np.ndarray, str]:
         entry = self._entries[key]
         h, w = int(entry["h"]), int(entry["w"])

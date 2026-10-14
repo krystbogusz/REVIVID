@@ -1,41 +1,56 @@
 """Degradation pipeline for REVIVID dataset creation.
 
-Applies a randomised sequence of classical film-degradation operations
-(blur, noise, JPEG compression, resampling, texture overlay, holes) to a list
-of BGR frames and returns the degraded frames at the requested output size.
+Turns clean BGR frames into what REVIVID meets in practice: old films as they
+reach it, 360p uploads of scanned prints. Order of operations, following how
+that footage came to be:
 
-Order of operations per frame — the one MambaOFR actually trains with
-(``degradation_video_list_4`` → ``degradation_v3``), on a single grey channel:
-    1. BGR → greyscale
-    2. Textures (static or moving-line, random blend mode), at native resolution
-    3. Blur
-    4. Resampling (down / up / none) — the frame STAYS at the resampled size
-    5. Gaussian / speckle noise  (at the resampled size)
-    6. JPEG on greyscale uint8   (at the resampled size)
-    7. Resize back to native resolution
-    8. Color jitter (every frame — MambaOFR's ``always_apply=True`` overrides ``p=0.5``)
-    9. Final resize to LR resolution (LR = GT / sr_scale), replicate to 3 channels
-   10. Persistent holes: the frames are split into windows of ``hole_window``
-       and each window gets, with probability ``hole_prob``, one hole mask
-       shared by all its frames.
+    Film (per film frame, at the GT resolution, on one grey channel):
+        1. Tone of a faded print: lifted blacks, dimmed whites, gamma
+        2. Textures: either scratches that stay over the clip and drift slowly
+           (vertical, as on a film strip) or dust / dirt / grain that change
+           every frame
+        3. Exposure flicker: a per-frame gain
+        4. Blur (MambaOFR's anisotropic / isotropic Gaussian kernels)
+        5. Gaussian / speckle grain
+    Transfer:
+        6. Resampling (down / up / none) - the scan's resolution
+        7. Resize to the output (LR) resolution, antialiased, often a slight
+           Gaussian softness there (the transfer)
+        8. Telecine: a film frame shown on several video frames
+           (``frame_ids``) is the very same degraded picture
+    Damage (``hole_prob``): persistent holes per window of ``hole_window``
+    Upload:
+        9. H.264 of the whole clip at the output resolution (``apply_video_codec``)
 
-The core parameters (blur kernel, noise std, JPEG quality, resampling scale)
-are drawn once per call from ``degradation_video_list_4``'s full continuous
-ranges, then jittered per frame.
+Calibration (``P``) is against data/raw/old_films: 216 five-second segments
+of 53 films (mostly 480x360 H.264), measured as 7-frame 128 px windows at
+native size - the unit the model trains on - against the same windows of REDS
+train through this pipeline. Medians, real / this pipeline / MambaOFR's:
+    frame-to-frame log brightness std (flicker)   0.007 / 0.010 / 0.150
+    single-frame dust blobs per 10k px, p90       1.2 / 5.7 / 50  (REDS motion alone: 3.6)
+    windows with repeated frames                   66 % / 66 % / 0 %
+    block-edge / in-block gradient (8 px grid)     1.07 / 1.07 / 1.00
+    noise in flat areas (Immerkaer, 0-255)         0.28 / 0.31 / 0.66
+    high / low frequency power, log10              -2.96 / -2.97 / -3.01
+    1st / 99th percentile grey level               23, 201 / 23, 197 / 17, 215
+Not matched by degradation: REDS has much more motion than the films.
 
-Do not follow ``degradation_video_list_5`` (MambaOFR's ``degradation.py``):
-it passes ``distortion_probability = [1, 1, 1, 1]`` and ``degradation_v3``
-tests ``p < 1.0``, so blur, noise and JPEG never run there.
+That is the realistic mode. ``HEAVY_PROB`` (20 %) of the clips use ``P_HEAVY``
+instead, degradations past the sample's p90, so that films more damaged than
+these uploads (or less compressed, grain visible) are not out of distribution.
+
+MambaOFR's ops are kept (blur kernels, resampling, noise, textures, blend
+modes); its order and ColorJitter are not.
 """
 
 from __future__ import annotations
 
+import math
 import random
 
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from .blend_modes import addition, subtract, multiply
 from .textures import (
@@ -44,13 +59,73 @@ from .textures import (
     generate_persistent_hole_mask,
 )
 from .artifacts import (
-    apply_color_jitter,
     apply_blur,
-    apply_jpeg_artifact,
     apply_downsampling,
-    random_scaling,
     apply_noise,
+    apply_tone,
+    apply_video_codec,
+    random_scaling,
 )
+
+# Per-clip ranges; (a, b) is uniform unless noted.
+P = {
+    "tone_prob": 0.6,
+    "black": (0.0, 0.08),          # added black level (0..1)
+    "white": (0.85, 1.0),          # white level
+    "gamma": (0.8, 1.25),          # log-uniform
+    "flicker": (0.0003, 0.008),    # std of the per-frame log gain, log-uniform
+    "tex_prob": (0.0, 0.2),        # chance a film frame carries dust / dirt / grain
+    "tex_opacity": (0.25, 0.8),    # dust, dirt
+    "line_opacity": (0.5, 1.0),    # scratches
+    "moving_line_prob": 0.4,       # scratches persisting over the clip
+    "blur_prob": 0.6,
+    "blur_strength": 0.8,          # scales MambaOFR's kernel spread (l1, l2)
+    "lr_soft_prob": 0.6,           # transfer softness at the output resolution
+    "lr_soft_sigma": (0.3, 0.7),   # Gaussian, output px
+    "noise_std": (0.5 / 255.0, 2.5 / 255.0),
+    "grain_size": (0.0, 0.0),      # px at the GT resolution; 0 = per-pixel noise
+    "crf": (22, 36),               # x264 constant rate factor (higher = worse)
+    "deblock": (0, 2),             # x264 loop-filter offset
+    # Film frames per video frame: distinct / slow (animation on twos and
+    # threes) / telecine-like, else. Never a still: no picture is held longer
+    # than 3 video frames.
+    "hold_none": 0.17,
+    "hold_slow": 0.10,
+    "hold_slow_rate": (0.34, 0.5),
+    "hold_rate": (0.5, 0.97),
+    "dust_with_scratches": False,  # dust on clips with persistent scratches too
+}
+
+# Heavy mode: a share of the clips is degraded past the calibrated sample's
+# p90 (old_films are web uploads, many already cleaned): strong flicker, dense
+# dust together with scratches, visible grain - also lightly compressed, as on
+# a raw scan - harder blur and fading. Overrides of ``P``; the frame repeats
+# stay as calibrated.
+HEAVY_PROB = 0.2
+P_HEAVY = {
+    "tone_prob": 1.0,
+    "black": (0.05, 0.2),
+    "white": (0.65, 0.9),
+    "gamma": (0.6, 1.6),
+    "flicker": (0.01, 0.05),
+    "tex_prob": (0.4, 0.9),
+    "tex_opacity": (0.5, 1.0),
+    "line_opacity": (0.7, 1.0),
+    "moving_line_prob": 0.7,
+    "dust_with_scratches": True,
+    "blur_prob": 0.8,
+    "blur_strength": 1.0,
+    "noise_std": (4.0 / 255.0, 12.0 / 255.0),
+    "grain_size": (0.5, 1.2),      # clumped grain that survives the resize
+    "lr_soft_prob": 0.3,
+    "crf": (14, 30),               # grain visible needs a light encode (raw scan)
+}
+
+
+# Texture folders of data/raw/noise_data (see their contents): vertical scratches
+# (001 with the gate vignette), and dust, dirt, blotches and grain.
+SCRATCH_FOLDERS = ("001", "002", "007", "009", "011", "012")
+DUST_FOLDERS = ("003", "004", "005", "006", "008", "010")
 
 
 def _add_alpha_channel(tensor_rgb: torch.Tensor) -> torch.Tensor:
@@ -65,6 +140,46 @@ def _add_alpha_channel(tensor_rgb: torch.Tensor) -> torch.Tensor:
     return torch.cat((tensor_rgb, alpha), dim=2)
 
 
+def _blend(x: torch.Tensor, texture: np.ndarray, mode: int, opacity: float) -> torch.Tensor:
+    """Blend a uint8 (H, W) texture onto a (1, 1, H, W) frame in [0, 1];
+    ``mode`` 0 / 1 / 2 = addition / subtract / multiply."""
+    frame_rgba = _add_alpha_channel((x[0, 0] * 255.0)[..., None].expand(-1, -1, 3))
+    tex = torch.from_numpy(texture).float().to(x.device)[..., None].expand(-1, -1, 3)
+    blended = (addition, subtract, multiply)[mode](frame_rgba, _add_alpha_channel(tex), opacity)
+    return blended[:, :, :1].permute(2, 0, 1).unsqueeze(0) / 255.0
+
+
+def _log_uniform(a: float, b: float) -> float:
+    return math.exp(random.uniform(math.log(a), math.log(b)))
+
+
+def _flatten(texture: np.ndarray) -> np.ndarray:
+    """Lift a texture's background to white, keeping only its local marks.
+
+    Several textures carry a vignette or a grey base (001, 008, 011). Drawn on
+    single frames, that base changes the whole frame's brightness from frame to
+    frame - with it the synthetic clips flickered 2x more than old_films.
+    """
+    t = texture.astype(np.float32)
+    bg = cv2.GaussianBlur(t, (0, 0), max(t.shape) / 30.0)
+    return np.clip(t + (255.0 - bg), 0, 255).astype(np.uint8)
+
+
+def sample_frame_ids(n: int) -> list:
+    """Which film frame each of ``n`` video frames shows (telecine / a low
+    shooting rate): ``[0, 1, 1, 2, ...]``. In old_films each film frame is
+    shown once (82 %) or twice (16 %)."""
+    u = random.random()
+    if u < P["hold_none"]:
+        return list(range(n))
+    if u < P["hold_none"] + P["hold_slow"]:
+        rate = random.uniform(*P["hold_slow_rate"])
+    else:
+        rate = random.uniform(*P["hold_rate"])
+    phase = random.random()
+    return [int(k * rate + phase) - int(phase) for k in range(n)]
+
+
 def apply_holes_to_window(
     frames_bgr: list,
     hole_prob: float,
@@ -72,14 +187,14 @@ def apply_holes_to_window(
     """Optionally overlay a persistent spatial hole mask on every frame of a window.
 
     With probability ``hole_prob`` a single hole mask is generated for the
-    window's native resolution and applied to every frame (consistent damage
-    across the whole window, as if the film strip was torn).  Hole pixels are
-    set to 0 in uint8 space, which becomes -1.0 after [-1, 1] normalisation.
-    The model is NOT told where they are — it has to detect them; the returned
-    mask is only a training target.
+    window's resolution and applied to every frame (consistent damage across
+    the whole window, as if the film strip was torn). Hole pixels are set to 0
+    in uint8 space, which becomes -1.0 after [-1, 1] normalisation. The model
+    is NOT told where they are — it has to detect them; the returned mask is
+    only a training target.
 
     Args:
-        frames_bgr: list of BGR uint8 ndarrays, all same spatial size.
+        frames_bgr: list of uint8 ndarrays (greyscale or BGR), all same spatial size.
         hole_prob:  probability in [0, 1] that holes are applied to this window.
 
     Returns:
@@ -110,154 +225,136 @@ def process_video_frames(
     hole_prob: float = 0.0,
     hole_window: int | None = None,
     return_masks: bool = False,
+    frame_ids: list | None = None,
 ) -> list | tuple[list, list]:
-    """Degrade frames at their native resolution and resize them at the very end.
+    """Degrade a clip; see the module docstring for the order of operations.
 
-    All degradations run on the original resolution. The final size is either an
-    explicit ``out_size=(height, width)`` (takes precedence) or the native size
-    divided by ``downscale_factor``. Holes are burned in last, at the output
-    size, per window of ``hole_window`` frames (default: all frames are one window).
+    The output size is ``out_size=(height, width)`` (takes precedence) or the
+    native size divided by ``downscale_factor``. ``frame_ids`` (one per frame,
+    e.g. from ``sample_frame_ids``) marks frames showing the same film frame:
+    they get the identical film / transfer degradation, as on a real telecine,
+    and only the codec treats them as separate pictures. Default: all distinct.
 
     With ``return_masks=True`` it returns ``(frames, masks)``, where ``masks``
     holds one (h, w) uint8 {0, 1} hole mask per output frame — the training
-    target for the hole detector. Without it, only the frames (as before).
+    target for the hole detector. Without it, only the frames.
     """
     if not frame_list_cv2:
-        return []
+        return ([], []) if return_masks else []
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if frame_ids is None:
+        frame_ids = list(range(len(frame_list_cv2)))
+    if len(frame_ids) != len(frame_list_cv2):
+        raise ValueError("frame_ids needs one id per frame")
 
-    first_frame = frame_list_cv2[0]
-    original_h, original_w = first_frame.shape[:2]
+    original_h, original_w = frame_list_cv2[0].shape[:2]
+    if out_size is not None:
+        target_h, target_w = int(out_size[0]), int(out_size[1])
+    elif downscale_factor > 1:
+        target_h, target_w = original_h // downscale_factor, original_w // downscale_factor
+    else:
+        target_h, target_w = original_h, original_w
 
-    # As MambaOFR's degradation_video_list_4: fixed for the call, jittered per frame.
-    deg_params = {
+    # ---- per clip: realistic or heavy mode
+    p = {**P, **P_HEAVY} if random.random() < HEAVY_PROB else P
+    deg_params = {  # MambaOFR's degradation_video_list_4 ranges
         "type_value": random.random(),
         "l1_value": random.random(),
         "l2_value": random.random(),
         "angle_value": random.random(),
         "shape_value": random.randint(2, 11),
-        "noise_std": random.uniform(5.0 / 255.0, 10.0 / 255.0),
-        "jpeg_quality": random.randint(40, 100),
         "rnum": np.random.rand(),
         "up_scale": random.uniform(1, 2),
         "down_scale": random.uniform(0.5 / 4, 1),
     }
+    deg_params["l1_value"] *= p["blur_strength"]
+    deg_params["l2_value"] *= p["blur_strength"]
+    lr_soft = random.uniform(*p["lr_soft_sigma"]) if random.random() < p["lr_soft_prob"] else 0.0
+    if random.random() < p["tone_prob"]:
+        tone = (random.uniform(*p["black"]), random.uniform(*p["white"]), _log_uniform(*p["gamma"]))
+    else:
+        tone = None
+    flicker = _log_uniform(*p["flicker"])
+    tex_prob = random.uniform(*p["tex_prob"])
+    use_blur = random.random() < p["blur_prob"]
+    noise_std = random.uniform(*p["noise_std"])
+    grain_size = random.uniform(*p["grain_size"])
+    crf = random.randint(*p["crf"])
+    deblock = random.randint(*p["deblock"])
 
-    use_moving_line = random.random() < 0.2
+    # Scratches stay on the film for many frames, dust and grain change every
+    # frame (a fresh set of scratches per frame flickered like exposure did).
+    use_moving_line = random.random() < p["moving_line_prob"]
+    use_dust = not use_moving_line or p["dust_with_scratches"]
     moving_line_mode = random.randint(0, 2)
     last_moving_texture = None
+    all_keys = texture_cache.get_all_keys()  # another texture set: no folder split
+    dust_keys = texture_cache.get_keys_in(DUST_FOLDERS) or all_keys
+    line_key = random.choice(texture_cache.get_keys_in(SCRATCH_FOLDERS) or all_keys)
 
-    all_texture_keys = texture_cache.get_all_keys()
-    moving_line_keys = texture_cache.get_moving_line_keys()
-    available_keys = moving_line_keys if use_moving_line else all_texture_keys
+    # ---- film + transfer, once per film frame
+    film_frames = {}
+    for frame_cv2, fid in zip(frame_list_cv2, frame_ids):
+        if fid in film_frames:
+            continue
+        gray = cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2GRAY)
+        x = torch.from_numpy(gray).float().to(device)[None, None] / 255.0
 
-    degraded_frames = []
+        # 1. tone of the print
+        if tone is not None:
+            x = apply_tone(x, *tone)
 
-    for frame_cv2 in frame_list_cv2:
-
-        gray_frame = cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2GRAY)
-        frame_tensor = (
-            torch.from_numpy(cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB))
-            .float()
-            .to(device)
-        )
-
-        # 1. Textures, on the clean frame at native resolution — so the
-        #    scratches go through blur / resampling / noise / JPEG like the content.
-        selected_key = random.choice(available_keys)
-        texture_img, folder_name = texture_cache.get_texture(selected_key)
-        blend_mode = 0 if folder_name == "011" else random.randint(0, 2)
-
-        if not use_moving_line:
-            processed_texture = generate_texture(
-                texture_img, folder_name, original_h, original_w
-            )
-        else:
+        # 2. textures on the film: persistent scratches, per-frame dust / dirt / grain
+        if use_moving_line:
+            texture_img, folder_name = texture_cache.get_texture(line_key)
+            first = last_moving_texture is None
             processed_texture, last_moving_texture = generate_moving_line_texture(
                 texture_img, last_moving_texture, original_h, original_w
             )
+            if first and folder_name != "001":  # 001's gate vignette stays
+                processed_texture = last_moving_texture = _flatten(processed_texture)
+            x = _blend(x, processed_texture, moving_line_mode, random.uniform(*p["line_opacity"]))
+        if use_dust and random.random() < tex_prob:
+            texture_img, folder_name = texture_cache.get_texture(random.choice(dust_keys))
+            processed_texture = _flatten(generate_texture(texture_img, folder_name, original_h, original_w))
+            blend = 0 if folder_name == "011" else random.randint(0, 2)
+            x = _blend(x, processed_texture, blend, random.uniform(*p["tex_opacity"]))
 
-        texture_rgb = cv2.cvtColor(processed_texture, cv2.COLOR_GRAY2RGB)
-        texture_tensor = torch.from_numpy(texture_rgb).float().to(device)
+        # 3. exposure flicker
+        x = x * math.exp(random.gauss(0.0, flicker))
 
-        frame_rgba = _add_alpha_channel(frame_tensor)
-        texture_rgba = _add_alpha_channel(texture_tensor)
-        opacity = random.uniform(0.6, 1.0)
+        # 4. blur, 5. grain
+        if use_blur:
+            x = apply_blur(x, deg_params)
+        noise_type = "gaussian" if random.random() < 0.5 else "speckle"
+        x = apply_noise(x.clamp(0.0, 1.0), max(noise_std + random.uniform(-0.5, 0.5) / 255.0, 0.0), noise_type,
+                        grain_size)
 
-        effective_blend = blend_mode if not use_moving_line else moving_line_mode
-        if effective_blend == 0:
-            blended = addition(frame_rgba, texture_rgba, opacity)
-        elif effective_blend == 1:
-            blended = subtract(frame_rgba, texture_rgba, opacity)
-        else:
-            blended = multiply(frame_rgba, texture_rgba, opacity)
+        # 6. scan resolution, 7. output resolution
+        x = apply_downsampling(x, deg_params)
+        if x.shape[-2:] != (target_h, target_w):
+            x = random_scaling(x, target_w, target_h)
+        lr = x[0, 0].clamp(0.0, 1.0).cpu().numpy()
+        if lr_soft > 0:
+            lr = cv2.GaussianBlur(lr, (0, 0), lr_soft)
+        film_frames[fid] = np.clip(lr * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-        # Frame and texture are both grey replicated to RGB, so the blend has
-        # three identical channels. Continue on one (1, 1, H, W) channel: the
-        # noise must be drawn once per pixel, as on MambaOFR's PIL "L" image —
-        # per-channel noise would be averaged down ~33% by the final luma.
-        frame_tensor = blended[:, :, :1].permute(2, 0, 1).unsqueeze(0) / 255.0
+    # 8. telecine: repeated film frames are the same picture
+    frames = [film_frames[fid] for fid in frame_ids]
 
-        # 2. Blur, 3. resample. The frame stays at the resampled size, so
-        #    noise and JPEG below act at that scale and get resized with it.
-        frame_tensor = apply_blur(frame_tensor, deg_params)
-        frame_tensor = apply_downsampling(frame_tensor, deg_params)
-
-        # 4. Noise
-        noise_type = "gaussian" if random.choice([1, 2]) == 1 else "speckle"
-        std_variance = random.uniform(-0.5, 0.5)
-        new_std = float(
-            np.clip(
-                deg_params["noise_std"] + std_variance / 255.0,
-                5.0 / 255.0,
-                10.0 / 255.0,
-            )
-        )
-        frame_tensor = apply_noise(frame_tensor, new_std, noise_type)
-
-        # 5. JPEG (greyscale uint8)
-        small = (frame_tensor[0, 0] * 255.0).round().byte().cpu().numpy()
-        small = apply_jpeg_artifact(small, deg_params["jpeg_quality"])
-        frame_tensor = torch.from_numpy(small).float().to(device)[None, None] / 255.0
-
-        # 6. Back to native resolution
-        if frame_tensor.shape[2:] != (original_h, original_w):
-            frame_tensor = random_scaling(frame_tensor, original_w, original_h)
-
-        # 7. Color jitter, then back to 3 identical channels
-        frame_tensor = apply_color_jitter(frame_tensor.squeeze(0).clamp(0.0, 1.0))
-        frame_tensor = frame_tensor.repeat(3, 1, 1) * 255.0
-
-        if out_size is not None:
-            target_h, target_w = int(out_size[0]), int(out_size[1])
-        elif downscale_factor > 1:
-            target_h = original_h // downscale_factor
-            target_w = original_w // downscale_factor
-        else:
-            target_h, target_w = None, None
-
-        if target_h is not None and (target_h, target_w) != (original_h, original_w):
-            frame_tensor = F.interpolate(
-                frame_tensor.unsqueeze(0),
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            ).squeeze(0)
-
-        current_frame = (
-            frame_tensor.clamp(0.0, 255.0).round().permute(1, 2, 0).byte().cpu().numpy()
-        )
-        degraded_frames.append(cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR))
-
-    window = hole_window or len(degraded_frames)
+    # holes on the film, per window, before the upload
+    window = hole_window or len(frames)
     with_holes, masks = [], []
-    for start in range(0, len(degraded_frames), window):
-        chunk, mask = apply_holes_to_window(degraded_frames[start : start + window], hole_prob)
+    for start in range(0, len(frames), window):
+        chunk, mask = apply_holes_to_window(frames[start : start + window], hole_prob)
         with_holes.extend(chunk)
         if mask is None:
             mask = np.zeros(chunk[0].shape[:2], np.uint8)
         masks.extend([mask] * len(chunk))
-    return (with_holes, masks) if return_masks else with_holes
+
+    # 9. upload: H.264 of the clip at the output resolution
+    coded = apply_video_codec(np.stack(with_holes), crf, deblock)
+    out = [cv2.cvtColor(f, cv2.COLOR_GRAY2BGR) for f in coded]
+    return (out, masks) if return_masks else out

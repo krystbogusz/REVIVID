@@ -13,6 +13,8 @@ import random
 import cv2
 import numpy as np
 
+MAX_TILT = 3.0  # degrees a texture may lean off vertical
+
 
 def rotated_rect_with_max_area(w, h, angle):
     if w <= 0 or h <= 0:
@@ -100,7 +102,10 @@ def generate_texture(texture_input, folder_name, target_h=256, target_w=256):
         crop_y1 : crop_y1 + bounding_box_size, crop_x1 : crop_x1 + bounding_box_size
     ]
 
-    rotation_angle = random.randint(0, 360)
+    # Scratches run along the film, i.e. vertically: only a slight tilt (or the
+    # strip upside down). MambaOFR rotates by any angle, which makes diagonal
+    # scratches the real footage does not have.
+    rotation_angle = random.uniform(-MAX_TILT, MAX_TILT) + random.choice((0.0, 180.0))
     center = (bounding_box_size // 2, bounding_box_size // 2)
     rot_mat = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
 
@@ -196,7 +201,9 @@ def generate_moving_line_texture(
             final_texture = cropped_texture
     else:
         random_direction = random.uniform(0, 1) > 0.5
-        random_distance = random.randint(5, 15)
+        # A scratch drifts slowly along the gate; MambaOFR's 5-15 px per frame
+        # makes it jump, which the real footage does not show.
+        random_distance = random.randint(0, 3)
         texture_np = last_texture.copy()
 
         if random_direction:

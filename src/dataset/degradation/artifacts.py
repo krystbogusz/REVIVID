@@ -14,7 +14,12 @@ Conventions that match MambaOFR (degradation_v3 / degradation_video_list_4):
 
 from __future__ import annotations
 
+import math
+import os
 import random
+import shutil
+import subprocess
+import warnings
 
 import cv2
 import numpy as np
@@ -22,6 +27,7 @@ import scipy.stats as ss
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from PIL import Image
 
 
@@ -182,8 +188,53 @@ def apply_color_jitter(img_tensor):
     return jitter(img_tensor)
 
 
-def apply_noise(img_tensor, std, noise_type="gaussian"):
-    noise = torch.randn_like(img_tensor) * std
+def apply_tone(img_tensor, black: float, white: float, gamma: float):
+    """Faded print / transfer tone curve on [0, 1]: ``black + (white - black) * x ** gamma``."""
+    return black + (white - black) * img_tensor.clamp(0.0, 1.0) ** gamma
+
+
+_FFMPEG = shutil.which(os.environ.get("REVIVID_FFMPEG", "ffmpeg"))
+if _FFMPEG is None:
+    warnings.warn("ffmpeg not found: the H.264 upload stage of the degradation falls back to per-frame JPEG")
+
+
+def apply_video_codec(frames: np.ndarray, crf: int, deblock: int = 0, fallback_quality: int = 50) -> np.ndarray:
+    """H.264 round trip of a greyscale clip (T, H, W) uint8, as the 360p uploads
+    the real films come from: block artefacts on the frame's own pixel grid,
+    flattened grain, smeared fine texture; ``deblock`` is x264's loop-filter
+    offset (higher = smoother block edges). Uses the ``ffmpeg`` binary
+    (``REVIVID_FFMPEG`` overrides the name); without it, per-frame JPEG."""
+    t, h, w = frames.shape
+    if _FFMPEG is None:
+        return np.stack([apply_jpeg_artifact(f, fallback_quality) for f in frames])
+    # yuv420p needs even sizes: replicate the last row / column, crop it off again
+    ph, pw = h + h % 2, w + w % 2
+    x = np.pad(frames, ((0, 0), (0, ph - h), (0, pw - w)), mode="edge") if (ph, pw) != (h, w) else frames
+    enc = subprocess.run(
+        [_FFMPEG, "-v", "error", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{pw}x{ph}", "-r", "25",
+         "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(int(crf)), "-deblock", f"{int(deblock)}:{int(deblock)}",
+         "-pix_fmt", "yuv420p", "-f", "h264", "-"],
+        input=np.ascontiguousarray(x).tobytes(), capture_output=True, check=True,
+    ).stdout
+    dec = subprocess.run(
+        [_FFMPEG, "-v", "error", "-f", "h264", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        input=enc, capture_output=True, check=True,
+    ).stdout
+    out = np.frombuffer(dec, np.uint8).reshape(-1, ph, pw)[:t, :h, :w]
+    if len(out) < t:  # the decoder never drops frames, but stay total
+        out = np.concatenate([out, np.repeat(out[-1:], t - len(out), 0)])
+    return out.copy()
+
+
+def apply_noise(img_tensor, std, noise_type="gaussian", grain_size=0.0):
+    """Additive (gaussian) or signal-proportional (speckle) noise of ``std``;
+    ``grain_size`` > 0 (px) clumps it like film grain, at the same std."""
+    noise = torch.randn_like(img_tensor)
+    if grain_size > 0:
+        k = 2 * int(math.ceil(3 * grain_size)) + 1
+        noise = TF.gaussian_blur(noise, [k, k], [grain_size, grain_size])
+        noise = noise / noise.std().clamp(min=1e-6)
+    noise = noise * std
 
     if noise_type == "gaussian":
         noisy_img = img_tensor + noise

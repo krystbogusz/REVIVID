@@ -27,7 +27,7 @@ import torch
 from tqdm import tqdm
 
 from .degradation.cache import build_texture_mmap, get_texture_cache
-from .degradation.pipeline import process_video_frames
+from .degradation.pipeline import process_video_frames, sample_frame_ids
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -158,7 +158,9 @@ class DatasetCreator:
                 continue
 
             size = self.gt_size or self._round_size(frames[0].shape[:2])
-            gt = [to_gray(resize(f, size)) for f in frames]
+            # Repeated frames as in real transfers: GT and degraded repeat together.
+            ids = sample_frame_ids(len(frames))
+            gt = [to_gray(resize(frames[i], size)) for i in ids]
 
             degraded = process_video_frames(
                 gt,
@@ -167,6 +169,7 @@ class DatasetCreator:
                 out_size=(size[0] // self.sr_scale, size[1] // self.sr_scale),
                 hole_prob=self.hole_prob,
                 hole_window=self.num_frame,
+                frame_ids=ids,
             )
 
             write_video(dest / "gt" / f"{name}.mp4", gt, fps)
