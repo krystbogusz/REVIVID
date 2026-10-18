@@ -9,10 +9,9 @@ Data (fixed layout, built by ``dataset.create_dataset``):
 
 Two phases (``training.stage`` in config/REVIVID.yaml), each its own experiment;
 a config value written as ``{restore: a, inpaint: b}`` takes the phase's one:
-    restore  phase 1: restoration of all degradations + SR,
-             MambaOFR's recipe; no holes in the data, the model has no hole
-             machinery switched on (``model.use_holes`` off), validation on the
-             restored output
+    restore  phase 1: restoration of all degradations + SR; MambaOFR's
+             backbone and recipe, trained from scratch. No holes in the data,
+             the model has no hole machinery switched on (``model.use_holes`` off)
     inpaint  phase 2: fine-tuning from the phase-1
              weights (``training.init_from``): holes burned in with
              ``model.hole_prob``; detector + flow completion + refiner train, the
@@ -41,6 +40,7 @@ is the lowest LPIPS.
 from __future__ import annotations
 
 import csv
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -78,8 +78,10 @@ DEFAULT_WEIGHTS = {
     "fft": 0.0, "grad": 0.0, "detect": 0.05, "v": 1.0,
 }
 STAGES = ("restore", "inpaint")
-# Modules that only phase 2 trains; the rest of the network is the phase-1 backbone.
-INPAINT_MODULES = ("backbone.hole_detector.", "backbone.flow_completion.", "refine_unet.")
+# Modules that only phase 2 trains (full lr there); the rest is the phase-1
+# backbone (backbone_lr_mult). cond_head only feeds the refiner, so phase 1
+# leaves it untrained.
+INPAINT_MODULES = ("backbone.hole_detector.", "backbone.flow_completion.", "backbone.cond_head.", "refine_unet.")
 
 
 def load_config(path=None) -> dict:
@@ -477,6 +479,21 @@ class Trainer:
 
     # ------------------------------------------------------------------ fit
 
+    def _validate_epoch(self, val_loader, epoch: int, entry: dict) -> None:
+        """Validate, add the metrics to ``entry``, keep best.pth (lowest LPIPS)."""
+        m = self.validate(val_loader, epoch)
+        entry.update({f"val_{k}": v for k, v in m.items()})
+        print(
+            f"[epoch {epoch}] VAL lpips {m['lpips']:.4f} | flicker {m['flicker']:.4f} | "
+            f"sharpness {100 * m['sharpness']:.0f}% of GT | "
+            f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f}"
+            + (f" | refiner on {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
+        )
+        if m["lpips"] < self.best_lpips:
+            self.best_lpips, self.best_epoch = m["lpips"], epoch
+            self._save("best.pth", epoch)
+            self.save_sample(val_loader, epoch, "best")
+
     def fit(self, train_loader, val_loader=None, start_epoch: int = 1) -> None:
         epochs = int(self.tc.get("epochs", 4000))
         val_every = max(1, int(self.vc.get("val_every", 10)))
@@ -500,23 +517,11 @@ class Trainer:
                     bar.write(f"[iter {self.iteration}] " + " ".join(f"{k}:{v:.4f}" for k, v in log.items()))
             entry = {"epoch": epoch, "lr": lr, **{k: sums[k] / counts[k] for k in sums}}
 
-            m = None
             if val_loader is not None and (epoch % val_every == 0 or epoch == epochs):
-                m = self.validate(val_loader, epoch)
-                entry.update({f"val_{k}": v for k, v in m.items()})
-                print(
-                    f"[epoch {epoch}] VAL lpips {m['lpips']:.4f} | flicker {m['flicker']:.4f} | "
-                    f"sharpness {100 * m['sharpness']:.0f}% of GT | "
-                    f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f}"
-                    + (f" | refiner on {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
-                )
+                self._validate_epoch(val_loader, epoch, entry)
             self.history.append(entry)
             self._write_history()
 
-            if m is not None and m["lpips"] < self.best_lpips:
-                self.best_lpips, self.best_epoch = m["lpips"], epoch
-                self._save("best.pth", epoch)
-                self.save_sample(val_loader, epoch, "best")
             if epoch % save_every == 0 or epoch == epochs:
                 self._save(f"epoch{epoch:04d}.pth", epoch)
                 self._save("latest.pth", epoch)
@@ -527,6 +532,10 @@ class Trainer:
     # ---------------------------------------------------------- checkpoints
 
     def _save(self, name: str, epoch: int) -> None:
+        """Atomic: written next to the target, then renamed over it, so an
+        interrupted save never leaves a broken checkpoint behind."""
+        path = self.exp_dir / "checkpoints" / name
+        tmp = path.with_name(path.name + ".tmp")
         torch.save(
             {
                 "epoch": epoch,
@@ -543,8 +552,9 @@ class Trainer:
                 "model_config": self.model_cfg.to_dict(),
                 "config": self.cfg,
             },
-            self.exp_dir / "checkpoints" / name,
+            tmp,
         )
+        os.replace(tmp, path)
 
     def init_from(self, path: str | Path) -> None:
         """Start from the weights of another run (phase 2 from phase 1): its EMA
@@ -590,7 +600,7 @@ class Trainer:
         self.iteration = s["iteration"]
         self.best_lpips, self.best_epoch = s["best_lpips"], s["best_epoch"]
         self.history = s["history"]
-        print(f"[trainer] resumed from {path} (next epoch {s['epoch'] + 1}, "
+        print(f"[trainer] resumed from {path} (next epoch {s['epoch'] + 1}, iter {self.iteration}, "
               f"best lpips {self.best_lpips:.4f} @ epoch {self.best_epoch})")
         return s["epoch"] + 1
 

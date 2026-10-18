@@ -42,8 +42,10 @@ def flow_warp(
 
 
 class RAFTFlow(nn.Module):
-    """torchvision RAFT (``large`` or ``small``, pretrained) returning
-    flow_{a->b} as (n, 2, h, w) in pixels; inputs in [-1, 1].
+    """torchvision RAFT returning flow_{a->b} as (n, 2, h, w) in pixels; inputs
+    in [-1, 1]. Variants: ``large`` (C_T_SKHT_V2), ``sintel`` (large with
+    C_T_SKHT_V1 = the original ``raft-sintel.pth`` MambaOFR uses), ``small``.
+    ``iters`` = refinement iterations (MambaOFR: 24, torchvision default 12).
 
     Frozen by default; :meth:`set_trainable` enables fine-tuning. Batch-norm
     statistics (RAFT large's context encoder) always stay frozen — the small
@@ -53,16 +55,19 @@ class RAFTFlow(nn.Module):
 
     MIN_SIZE = 128  # RAFT works at >= 128 px; smaller inputs are upsampled
 
-    def __init__(self, variant: str = "large"):
+    def __init__(self, variant: str = "large", iters: int = 12):
         super().__init__()
         from torchvision.models import optical_flow as of
 
         if variant == "large":
             self.raft = of.raft_large(weights=of.Raft_Large_Weights.DEFAULT)
+        elif variant == "sintel":
+            self.raft = of.raft_large(weights=of.Raft_Large_Weights.C_T_SKHT_V1)
         elif variant == "small":
             self.raft = of.raft_small(weights=of.Raft_Small_Weights.DEFAULT)
         else:
-            raise ValueError(f"unknown RAFT variant {variant!r} (large | small)")
+            raise ValueError(f"unknown RAFT variant {variant!r} (large | sintel | small)")
+        self.iters = int(iters)
         self.set_trainable(False)
         self.eval()
 
@@ -87,7 +92,7 @@ class RAFTFlow(nn.Module):
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
         with torch.set_grad_enabled(self._trainable and torch.is_grad_enabled()):
-            flow = self.raft(a.contiguous(), b.contiguous())[-1]
+            flow = self.raft(a.contiguous(), b.contiguous(), num_flow_updates=self.iters)[-1]
 
         if (H, W) != (h, w):
             flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)
@@ -95,5 +100,5 @@ class RAFTFlow(nn.Module):
         return flow
 
 
-def build_flow_estimator(variant: str = "large") -> RAFTFlow:
-    return RAFTFlow(variant)
+def build_flow_estimator(variant: str = "large", iters: int = 12) -> RAFTFlow:
+    return RAFTFlow(variant, iters)

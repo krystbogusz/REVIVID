@@ -11,20 +11,18 @@ from typing import Sequence
 
 @dataclass
 class ModelConfig:
-    # Backbone (MambaOFR: 16 / 64 / [2, 2, 2] / 16 / 1.2 / 8 / 0.1)
-    num_feat: int = 32          # propagated state channels
+    # Backbone = MambaOFR's
+    num_feat: int = 16          # propagated state channels
     embed_dim: int = 64         # width of the Mamba restorer (MambaIR embed_dim)
     depths: Sequence[int] = (2, 2, 2)  # VSS blocks per residual group
     d_state: int = 16           # SSM state dimension
     ssm_expand: float = 1.2     # SS2D inner expansion (MambaOFR's mlp_ratio)
     dyn_kernels: int = 8        # kernels of the degradation-aware prompt convs
     drop_path: float = 0.1      # stochastic depth of the VSS blocks
-    recon_feat: int = 64        # reconstruction width
-    recon_blocks: int = 2       # residual blocks before the upsampler
     cond_dim: int = 64          # backbone features handed to the refiner
-    dcn_groups: int = 4         # deformable groups of the alignment (divides num_feat)
-    sr_scale: int = 2
-    raft: str = "large"         # optical flow of the backbone: large | small
+    sr_scale: int = 2           # SR factor of the tail (PixelShuffle)
+    raft: str = "sintel"        # optical flow: sintel (MambaOFR's) | large | small
+    raft_iters: int = 24        # RAFT refinement iterations (MambaOFR: 24)
     # Phase 2: hole detection / filling / flow completion. Set by the trainer
     # from training.stage and stored with the checkpoint's model_config.
     use_holes: bool = False

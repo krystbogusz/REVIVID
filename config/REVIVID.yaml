@@ -20,25 +20,20 @@
 seed: 2026
 
 model:
-  # Backbone = MambaOFR (RNN_Swin_4 + MambaIR with the degradation-aware prompt
-  # blocks, flow-guided mask DCN, mask-gated propagation) + a 2x SR head.
-  # MambaOFR: num_feat 16, embed_dim 64, depths [2, 2, 2], d_state 16, expand 1.2,
-  # 8 kernels, drop_path 0.1 -> 3.48 M params without RAFT; this: 4.1 M (wider
-  # state + SR head).
-  num_feat: 32            # propagated state channels (MambaOFR 16; the SR head needs a bit more)
+  # Backbone = MambaOFR's RNN_Swin_4 one to one (3.48 M params without RAFT) on
+  # the LR input, + 2x SR in its tail (PixelShuffle up1 and bilinear global
+  # residual, which MambaOFR has at scale 1). Trained from scratch.
+  num_feat: 16            # propagated state channels
   embed_dim: 64           # Mamba restorer width, one restorer per propagation direction
   depths: [2, 2, 2]       # VSS blocks per residual group
   d_state: 16             # SSM state dimension
   ssm_expand: 1.2         # SS2D inner expansion (MambaOFR's mlp_ratio)
   dyn_kernels: 8          # degradation-aware prompt: kernels mixed per frame
   drop_path: 0.1          # stochastic depth (MambaIR default, inherited by MambaOFR)
-  dcn_groups: 4           # deformable groups of the alignment (divides num_feat)
-  recon_feat: 64          # reconstruction width
-  recon_blocks: 2         # residual blocks before the PixelShuffle
-  sr_scale: 2             # SR factor; GT / degraded size of the generated datasets
-  # Optical flow (torchvision RAFT, pretrained; fine-tuned after
-  # training.raft_unfreeze_iter): large | small.
-  raft: large
+  sr_scale: 2             # SR factor of the tail; GT / degraded size of the datasets
+  # Optical flow, torchvision RAFT: sintel = MambaOFR's raft-sintel.pth | large | small
+  raft: sintel
+  raft_iters: 24          # MambaOFR: 24
 
   # ---- phase 2 (inpainting); built in phase 1 too, so every checkpoint holds
   # the whole model. model.use_holes is set by the trainer from training.stage.
@@ -66,9 +61,9 @@ training:
   # x 120 batches (240 clips / batch 2): 240k iterations as MambaOFR | 60k fine-tuning
   epochs: {restore: 2000, inpaint: 500}
   # Phase 2 starts from these weights (EMA) when its exp_dir has no latest.pth.
-  init_from: experiments/revivid_p1/checkpoints/best.pth
+  init_from: experiments/revivid_p1_mambaofr/checkpoints/best.pth
   backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 backbone; detector, flow completion, refiner train at lr
-  batch_size: 2           # MambaOFR: 2 GPUs x 1
+  batch_size: 2           # as your MambaOFR run (1 GPU x 2)
   num_frame: 7
   gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
   augment: true           # random flips / 90° rotation
@@ -84,7 +79,7 @@ training:
   degradation_modes: {realistic: 0.4, heavy: 0.2, dirty: 0.4}
 
   # MambaOFR: Adam(0.9, 0.999), lr 2e-4 constant for half of the run, then a
-  # linear decay.
+  # linear decay; phase 2 fine-tunes at half of it.
   lr: {restore: 0.0002, inpaint: 0.0001}
   lr_min: 0.000001
   lr_steady: 0.5
@@ -96,20 +91,20 @@ training:
   ema_decay: 0.999        # EMA weights are used for validation and inference
 
   # RAFT is frozen for the first N iterations, then fine-tuned at lr * flow_lr_mul
-  # (-1 = always frozen). MambaOFR paper: from 50k iterations; phase 2 keeps
-  # the RAFT phase 1 left.
-  raft_unfreeze_iter: {restore: 50000, inpaint: -1}
+  # (-1 = always frozen). MambaOFR's code keeps it frozen (its flow runs under no_grad).
+  raft_unfreeze_iter: -1
   flow_lr_mul: 0.125
 
   hole_loss_boost: 3.0    # true-hole pixels weigh 1 + this in `pix` (phase 2)
   hole_pos_weight: 10.0   # BCE weight of the hole class (phase 2)
 
   # Generator loss = sum of weight * term; a 0 weight skips the term.
+  # Phase 1 = MambaOFR's loss exactly: L1 1.0 + perceptual 1.0 + GAN 0.01.
   loss_weights:
     pix: 1.0              # Charbonnier(out, gt)            MambaOFR: L1, 1.0
     perceptual: 1.0       # VGG19 relu1_1..relu5_1          MambaOFR: 1.0
     gan: 0.01             # hinge, see gan:                 MambaOFR: 0.01
-    temporal: 0.5         # flicker vs the GT's own motion (not in MambaOFR)
+    temporal: 0.0         # flicker vs the GT's own motion (not in MambaOFR)
     # Off in phase 1: L1 on Sobel gradients favours flat patches with sharp
     # edges where the input leaves detail uncertain, and the phase-free FFT
     # amplitude loss rewards any high-frequency energy - together the
@@ -138,7 +133,8 @@ validation:
   num_workers: 5
 
 logging:
-  # MambaOFR backbone: the v8 checkpoints do not fit it.
-  exp_dir: {restore: ./experiments/revivid_p1, inpaint: ./experiments/revivid_p2}
+  # revivid_p1 (the earlier 32-channel backbone) does not fit this model.
+  exp_dir: {restore: ./experiments/revivid_p1_mambaofr, inpaint: ./experiments/revivid_p2}
   log_every: 120          # iterations
+  # `python src/trainer/train.py` continues from <exp_dir>/checkpoints/latest.pth automatically.
   save_checkpoint_every: 10   # epochs (numbered + latest.pth)

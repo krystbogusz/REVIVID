@@ -50,13 +50,11 @@ class Video_Backbone(nn.Module):
             ssm_expand=cfg.ssm_expand,
             dyn_kernels=cfg.dyn_kernels,
             drop_path=cfg.drop_path,
-            recon_feat=cfg.recon_feat,
-            recon_blocks=cfg.recon_blocks,
             cond_dim=cfg.cond_dim,
             sr_scale=cfg.sr_scale,
-            dcn_groups=cfg.dcn_groups,
             hole_threshold=cfg.hole_threshold,
             raft=cfg.raft,
+            raft_iters=cfg.raft_iters,
             use_holes=cfg.use_holes,
         )
         self.diffusion = GaussianDiffusion(cfg.num_timesteps, cfg.min_snr_gamma)

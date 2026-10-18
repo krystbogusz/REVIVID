@@ -45,9 +45,9 @@ class TemporalPatchDiscriminator(nn.Module):
             nn.init.normal_(m.weight, 0.0, 0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-            return spectral_norm(m) if sn else m
+            return nn.utils.spectral_norm(m) if sn else m
 
-        self.net = nn.Sequential(
+        self.conv = nn.Sequential(
             conv(in_channels, nf, 1), nn.LeakyReLU(0.2, inplace=True),
             conv(nf, 2 * nf, (1, 2, 2)), nn.LeakyReLU(0.2, inplace=True),
             conv(2 * nf, 2 * nf, (1, 2, 2)), nn.LeakyReLU(0.2, inplace=True),
@@ -57,7 +57,7 @@ class TemporalPatchDiscriminator(nn.Module):
 
     def forward(self, clip: torch.Tensor) -> List[torch.Tensor]:
         """One logit map in a list, like the projected discriminator's scales."""
-        return [self.net(clip.transpose(1, 2)).transpose(1, 2)]
+        return [self.conv(clip.transpose(1, 2)).transpose(1, 2)]
 
 
 class ProjectedPatchDiscriminator(nn.Module):
