@@ -2,9 +2,9 @@
 
 No arguments needed — run it from anywhere (or from an IDE):
 
-    python src/trainer/train.py                       # phase 1: restoration + SR (config/REVIVID.yaml)
-    python src/trainer/train.py --config config/REVIVID_inpaint.yaml   # phase 2: inpainting
+    python src/trainer/train.py                       # phase of training.stage in config/REVIVID.yaml
     python src/trainer/train.py --resume path.pth     # continue from a given checkpoint
+    python src/trainer/train.py --config my.yaml      # another config
 
 Training continues automatically from <logging.exp_dir>/checkpoints/latest.pth
 when it exists; a phase-2 run without one starts from ``training.init_from``

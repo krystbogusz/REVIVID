@@ -7,12 +7,13 @@ Data (fixed layout, built by ``dataset.create_dataset``):
     data/training/train/*.mp4                  clean clips, degraded on the fly
     data/training/valid/{gt,degraded}/*.mp4    validation pairs
 
-Two phases (``training.stage``), each its own experiment / config:
-    restore  phase 1 (config/REVIVID.yaml): restoration of all degradations + SR,
+Two phases (``training.stage`` in config/REVIVID.yaml), each its own experiment;
+a config value written as ``{restore: a, inpaint: b}`` takes the phase's one:
+    restore  phase 1: restoration of all degradations + SR,
              MambaOFR's recipe; no holes in the data, the model has no hole
              machinery switched on (``model.use_holes`` off), validation on the
              restored output
-    inpaint  phase 2 (config/REVIVID_inpaint.yaml): fine-tuning from the phase-1
+    inpaint  phase 2: fine-tuning from the phase-1
              weights (``training.init_from``): holes burned in with
              ``model.hole_prob``; detector + flow completion + refiner train, the
              phase-1 backbone at ``backbone_lr_mult``; validation on the full
@@ -67,8 +68,8 @@ from model.losses import (
     VGGFeatures,
 )
 
-from utils.config import PROJECT_ROOT, load_config
-
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
 DATA_DIR = PROJECT_ROOT / "data" / "training"
 
 # MambaOFR: L1 1.0, perceptual 1.0, adversarial 0.01.
@@ -79,6 +80,20 @@ DEFAULT_WEIGHTS = {
 STAGES = ("restore", "inpaint")
 # Modules that only phase 2 trains; the rest of the network is the phase-1 backbone.
 INPAINT_MODULES = ("backbone.hole_detector.", "backbone.flow_completion.", "refine_unet.")
+
+
+def load_config(path=None) -> dict:
+    with open(path or DEFAULT_CONFIG, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_stage(cfg, stage: str):
+    """A value written as ``{restore: a, inpaint: b}`` becomes the one of ``stage``."""
+    if isinstance(cfg, dict):
+        if cfg and set(cfg) == set(STAGES):
+            return cfg[stage]
+        return {k: resolve_stage(v, stage) for k, v in cfg.items()}
+    return cfg
 
 
 class ModelEMA:
@@ -129,6 +144,11 @@ class ModelEMA:
 class Trainer:
     def __init__(self, config=None):
         cfg = config if isinstance(config, dict) else load_config(config)
+        self.stage = str((cfg.get("training") or {}).get("stage", "inpaint"))
+        if self.stage not in STAGES:
+            raise ValueError(f"training.stage must be one of {STAGES}, got {self.stage!r}")
+        self.inpaint = self.stage == "inpaint"
+        cfg = resolve_stage(cfg, self.stage)
         self.cfg = cfg
         self.tc = cfg.get("training") or {}
         self.vc = cfg.get("validation") or {}
@@ -137,10 +157,6 @@ class Trainer:
             raise RuntimeError("CUDA GPU is required.")
         self.device = dev = torch.device("cuda")
         torch.manual_seed(int(cfg.get("seed", 2026)))
-        self.stage = str(self.tc.get("stage", "inpaint"))
-        if self.stage not in STAGES:
-            raise ValueError(f"training.stage must be one of {STAGES}, got {self.stage!r}")
-        self.inpaint = self.stage == "inpaint"
 
         self.exp_dir = Path(self.lc.get("exp_dir", "experiments/revivid"))
         if not self.exp_dir.is_absolute():
@@ -554,11 +570,11 @@ class Trainer:
 
     def resume(self, path: Optional[str] = None) -> int:
         """Continue from ``path`` or <exp_dir>/checkpoints/latest.pth (a checkpoint
-        of this same model); returns the next epoch, 1 when starting fresh (from
-        ``training.init_from`` when it is set)."""
+        of this same model); returns the next epoch, 1 when starting fresh (phase
+        2: from ``training.init_from``)."""
         path = Path(path) if path else self.exp_dir / "checkpoints" / "latest.pth"
         if not path.exists():
-            if self.tc.get("init_from"):
+            if self.inpaint and self.tc.get("init_from"):
                 self.init_from(self.tc["init_from"])
             else:
                 print("[trainer] no checkpoint - starting fresh")
@@ -609,9 +625,7 @@ class Trainer:
             gt_usm=float(tc.get("gt_usm", 0.0)),
             degradation_modes=tc.get("degradation_modes"),
         )
-        val_dir = Path(self.vc.get("dir") or DATA_DIR / "valid")
-        if not val_dir.is_absolute():
-            val_dir = PROJECT_ROOT / val_dir
+        val_dir = DATA_DIR / "valid"
         try:
             val = data.eval_loader(val_dir, num_workers=int(self.vc.get("num_workers", 0)))
         except FileNotFoundError:

@@ -1,15 +1,19 @@
 # REVIVID — old film restoration + 2x SR + inpainting of holes burned through
 # the whole window, aimed at REALISM: a viewer should not tell what was repaired.
 #
-# Training in two phases, each its own run (python src/trainer/train.py):
-#   PHASE 1 — this file:                  python src/trainer/train.py
+# Training in two phases, picked by training.stage; each phase is its own run
+# (python src/trainer/train.py). A value written as {restore: a, inpaint: b}
+# takes the one of the current phase.
+#   PHASE 1 — stage: restore
 #       removal of all degradations (dirt, scratches, blur, noise, flicker,
 #       compression) + 2x SR. MambaOFR's backbone and training recipe; the
 #       target is at least MambaOFR's quality. No holes, the model has no hole
 #       machinery switched on.
-#   PHASE 2 — config/REVIVID_inpaint.yaml: python src/trainer/train.py --config config/REVIVID_inpaint.yaml
-#       fine-tuning of the phase-1 model: it finds the burned-in holes itself
-#       and fills them (diffusion refiner) so that the repair cannot be seen.
+#   PHASE 2 — stage: inpaint
+#       fine-tuning of the phase-1 model (training.init_from): it finds the
+#       burned-in holes itself and fills them (diffusion refiner) so that the
+#       repair cannot be seen. Before it, recreate the validation pairs with
+#       holes:  PYTHONPATH=src python -m dataset.create_dataset valid --valid <sources>
 #
 # Data (dataset.create_dataset): data/training/train/*.mp4, data/training/valid/{gt,degraded}/*.mp4
 
@@ -58,8 +62,12 @@ model:
   hole_prob: 0.25         # prob. a window gets holes burned in (phase 2 training + its valid pairs)
 
 training:
-  stage: restore          # phase 1
-  epochs: 2000            # x 120 batches (240 clips / batch 2) = 240k iterations, as MambaOFR
+  stage: restore          # restore = phase 1 | inpaint = phase 2
+  # x 120 batches (240 clips / batch 2): 240k iterations as MambaOFR | 60k fine-tuning
+  epochs: {restore: 2000, inpaint: 500}
+  # Phase 2 starts from these weights (EMA) when its exp_dir has no latest.pth.
+  init_from: experiments/revivid_p1/checkpoints/best.pth
+  backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 backbone; detector, flow completion, refiner train at lr
   batch_size: 2           # MambaOFR: 2 GPUs x 1
   num_frame: 7
   gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
@@ -77,7 +85,7 @@ training:
 
   # MambaOFR: Adam(0.9, 0.999), lr 2e-4 constant for half of the run, then a
   # linear decay.
-  lr: 0.0002
+  lr: {restore: 0.0002, inpaint: 0.0001}
   lr_min: 0.000001
   lr_steady: 0.5
   beta1: 0.9
@@ -88,8 +96,9 @@ training:
   ema_decay: 0.999        # EMA weights are used for validation and inference
 
   # RAFT is frozen for the first N iterations, then fine-tuned at lr * flow_lr_mul
-  # (-1 = always frozen). MambaOFR paper: from 50k iterations.
-  raft_unfreeze_iter: 50000
+  # (-1 = always frozen). MambaOFR paper: from 50k iterations; phase 2 keeps
+  # the RAFT phase 1 left.
+  raft_unfreeze_iter: {restore: 50000, inpaint: -1}
   flow_lr_mul: 0.125
 
   hole_loss_boost: 3.0    # true-hole pixels weigh 1 + this in `pix` (phase 2)
@@ -107,6 +116,8 @@ training:
     # "watercolour" look of run v8. Sharpness comes from gt_usm + GAN instead.
     fft: 0.0
     grad: 0.0
+    detect: 0.05          # phase 2: hole detector BCE vs the true mask
+    v: 1.0                # phase 2: refiner diffusion loss inside the true holes
 
   gan:
     type: temporal        # temporal = MambaOFR's 3-D clip discriminator | projected = VGG patch heads
@@ -116,10 +127,10 @@ training:
     beta2: 0.999
 
 validation:
-  # Phase 1: the restored output on the stored valid pairs; LPIPS, flicker,
-  # sharpness, PSNR, SSIM; best.pth = lowest LPIPS. gt_size [w, h] is the size
+  # The phase's inference path on the stored valid pairs (data/training/valid;
+  # phase 2: the model finds the holes itself); LPIPS, flicker, sharpness,
+  # PSNR, SSIM; best.pth = lowest LPIPS. gt_size [w, h] is the size
   # dataset.create_dataset writes the valid clips at (LQ = gt_size / sr_scale).
-  dir: data/training/valid
   gt_size: [640, 360]
   val_every: 10           # epochs
   max_clips: 0            # 0 = all
@@ -127,6 +138,7 @@ validation:
   num_workers: 5
 
 logging:
-  exp_dir: ./experiments/revivid_p1   # phase 1, MambaOFR backbone (v8 checkpoints do not fit it)
+  # MambaOFR backbone: the v8 checkpoints do not fit it.
+  exp_dir: {restore: ./experiments/revivid_p1, inpaint: ./experiments/revivid_p2}
   log_every: 120          # iterations
   save_checkpoint_every: 10   # epochs (numbered + latest.pth)

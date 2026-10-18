@@ -5,11 +5,11 @@ from pathlib import Path
 import cv2
 import torch
 import numpy as np
+import yaml
 from tqdm import tqdm
 
 from model import Video_Backbone
 from model.config import ModelConfig
-from utils.config import load_config
 
 _MEAN = 0.5
 _STD = 0.5
@@ -39,7 +39,8 @@ def _load_model(
     if "model_config" in state:
         model_cfg = ModelConfig.from_dict(state["model_config"])
     else:
-        cfg = load_config(config_path)
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
         model_cfg = ModelConfig.from_dict(cfg.get("model", {}))
 
     net = Video_Backbone(model_cfg).to(device)
