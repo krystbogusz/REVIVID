@@ -9,7 +9,8 @@ Per clip ``lq`` (N, T, 3, h, w) in [-1, 1] — the ONLY input:
     refined = coarse + G * residual
 
 Outside holes the output IS the coarse restoration. A clip in which the
-detector finds no hole skips DDIM altogether.
+detector finds no hole skips DDIM altogether, and so does phase 1
+(``cfg.use_holes`` off: no detector, the output is the backbone's restoration).
 
 Temporal consistency of the invented content (flicker gives a repair away
 first): the UNet attends across the frames of the window, and the DDIM
@@ -43,16 +44,20 @@ class Video_Backbone(nn.Module):
 
         self.backbone = ConditioningBackbone(
             num_feat=cfg.num_feat,
-            num_block=cfg.num_block,
-            cond_dim=cfg.cond_dim,
             embed_dim=cfg.embed_dim,
+            depths=cfg.depths,
             d_state=cfg.d_state,
             ssm_expand=cfg.ssm_expand,
+            dyn_kernels=cfg.dyn_kernels,
+            drop_path=cfg.drop_path,
+            recon_feat=cfg.recon_feat,
+            recon_blocks=cfg.recon_blocks,
+            cond_dim=cfg.cond_dim,
             sr_scale=cfg.sr_scale,
-            deg_dim=cfg.deg_dim,
             dcn_groups=cfg.dcn_groups,
             hole_threshold=cfg.hole_threshold,
             raft=cfg.raft,
+            use_holes=cfg.use_holes,
         )
         self.diffusion = GaussianDiffusion(cfg.num_timesteps, cfg.min_snr_gamma)
         self.refine_unet = ConditionalUNet(
@@ -171,7 +176,7 @@ class Video_Backbone(nn.Module):
         gen = self.generation_mask(out["hole_f"])
 
         refined = coarse_f
-        if bool((gen > 0).any()):
+        if self.backbone.use_holes and bool((gen > 0).any()):
             noise = self.warped_noise(out["flow_fwd"], n, t, coarse_f.shape[1:], coarse_f.device)
             residual = self.diffusion.ddim_sample(
                 self.refine_unet, noise, refine_steps or self.cfg.refine_steps,

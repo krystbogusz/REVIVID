@@ -7,6 +7,8 @@ Training:   ``<dir>/*.mp4`` clean clips. Each sample is a random window of
             "hole_mask": (B, T, 1, h, w)}``; lq/gt in [-1, 1] with H = h * sr_scale,
             GT greyscale replicated to 3 channels. ``hole_mask`` (1 = burned-in
             hole) is a training target only — the model never receives it.
+            With ``gt_usm`` > 0 the GT target is USM-sharpened as in MambaOFR
+            (the input is degraded from the unsharpened frames).
 Evaluation: ``<dir>/degraded/<name>.mp4`` + ``<dir>/gt/<name>.mp4``. Each item is
             one whole clip as frames, not a batch: ``{"name", "lq", "gt"}`` with
             lists of BGR uint8 frames exactly as stored in the files.
@@ -73,6 +75,20 @@ def to_tensor(frames_bgr: List[np.ndarray], gray: bool = False) -> torch.Tensor:
     return torch.stack(out).float().div(127.5).sub(1.0)
 
 
+def usm_sharpen(frame_bgr: np.ndarray, weight: float = 0.5, radius: int = 50, threshold: int = 10) -> np.ndarray:
+    """MambaOFR's GT sharpening (``add_sharpening``, from Real-ESRGAN) of the grey
+    frame: ``K = I + weight * (I - blur(I))``, blended in where the residual
+    exceeds ``threshold`` (0-255) through a blurred mask. BGR uint8 in and out."""
+    radius += 1 - radius % 2
+    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    residual = img - cv2.GaussianBlur(img, (radius, radius), 0)
+    mask = (np.abs(residual) * 255.0 > threshold).astype(np.float32)
+    soft = cv2.GaussianBlur(mask, (radius, radius), 0)
+    sharp = np.clip(img + weight * residual, 0.0, 1.0)
+    out = soft * sharp + (1.0 - soft) * img
+    return cv2.cvtColor(np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
 class TrainDataset(Dataset):
     def __init__(
         self,
@@ -83,6 +99,8 @@ class TrainDataset(Dataset):
         hole_prob: float,
         augment: bool = True,
         texture_cache_dir: str | Path | None = None,
+        gt_usm: float = 0.0,
+        degradation_modes: Optional[dict] = None,
     ):
         self.clips = list_mp4(clips_dir)
         if not self.clips:
@@ -92,6 +110,8 @@ class TrainDataset(Dataset):
         self.hole_prob = hole_prob
         self.augment = augment
         self.texture_cache_dir = texture_cache_dir
+        self.gt_usm = float(gt_usm)
+        self.degradation_modes = degradation_modes
         self.crop = None  # (h, w) in GT pixels
         if crop_size:
             w, h = int(crop_size[0]), int(crop_size[1])
@@ -125,7 +145,10 @@ class TrainDataset(Dataset):
             hole_prob=self.hole_prob,
             return_masks=True,
             frame_ids=ids,
+            mode_probs=self.degradation_modes,
         )
+        if self.gt_usm > 0:
+            gt = [usm_sharpen(f, self.gt_usm) for f in gt]
 
         if self.augment:
             n = len(gt)
@@ -179,9 +202,12 @@ def train_loader(
     num_workers: int = 0,
     augment: bool = True,
     texture_cache_dir: str | Path | None = None,
+    gt_usm: float = 0.0,
+    degradation_modes: Optional[dict] = None,
 ) -> DataLoader:
     dataset = TrainDataset(
-        clips_dir, num_frame, sr_scale, crop_size, hole_prob, augment, texture_cache_dir
+        clips_dir, num_frame, sr_scale, crop_size, hole_prob, augment, texture_cache_dir,
+        gt_usm, degradation_modes,
     )
     return DataLoader(
         dataset,

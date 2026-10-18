@@ -1,58 +1,57 @@
-"""Hole-aware bidirectional recurrent conditioning backbone.
+"""Restoration + 2x SR backbone built on MambaOFR (CVPR 2025), prepared for the
+inpainting of persistent holes (burned-in regions that stay for the whole clip).
 
-Handles restoration + 2x SR of old film and prepares the inpainting of
-persistent holes (burned-in regions that stay in place for the whole clip).
+Per clip ``lrs`` (N, T, 3, h, w) in [-1, 1], as MambaOFR's ``RNN_Swin_4.Video_Backbone``:
 
-Per clip ``lrs`` of shape (N, T, 3, h, w) in [-1, 1]:
+1. RAFT (large) optical flow between neighbouring LR frames.
+2. Bidirectional first-order recurrent propagation; per frame and direction:
+     ``proj``                    conv3x3 of the current frame (latent feature)
+     ``FlowGuidedMaskAlignment`` the previous state, aligned by a deformable
+                                 conv whose offsets = flow + a residual predicted
+                                 from the warped state, the latent feature, the
+                                 flow and the warped previous mask (paper eq. 9-10)
+     ``MaskGatedAggregation``    soft mask M = MG(aligned, latent, residual
+                                 indicator, warped previous mask); state =
+                                 M * aligned + (1 - M) * latent (eq. 11-12) - the
+                                 mask keeps scratches / dirt of single frames
+                                 from being propagated
+     ``MambaRestorer``           MambaIR with the degradation-aware prompt blocks
+                                 (``mamba_blocks``), one per direction
+3. Reconstruction: fuse both directions, residual blocks at LR, PixelShuffle x
+   ``sr_scale``, conv, + bilinear upsampled input, tanh (MambaOFR's global
+   residual; MambaOFR has no SR, its "upsamplers" are x1).
 
-1. ``HoleDetector``      — per-pixel hole logits at LR, learned from the frame
-                           and the clip's temporal statistics. Nothing tells the
-                           model where the holes are; the true mask is only its
-                           training target.
-2. ``push_pull_fill``    — holes are pre-filled from their surroundings, so the
-                           flat black patch does not pin the optical flow to 0.
-3. RAFT (large) + ``FlowCompletion`` — flow on the pre-filled frames, then re-estimated
-                           inside holes from the motion around them. With the
-                           right motion, the content hidden under a static hole
-                           at frame t is fetched from frames where it was visible.
-4. ``DegradationEncoder``— self-learned degradation code per frame (from a
-                           3-frame window, no labels); it modulates every SS2D
-                           block (FiLM).
-5. Bidirectional SECOND-ORDER propagation (states of t±1 and t±2):
-     ``SecondOrderAlignment`` — flow-guided DCNv2 with a modulation mask driven
-                                by validity and holes;
-     ``ValidityAggregation``  — gate between the aligned state and the current
-                                frame; inside holes the state is carried over,
-                                and a validity map tracks how much of it comes
-                                from real observations;
-     SS2D blocks (Mamba), FiLM-modulated by the degradation code.
-6. Fusion, PixelShuffle x sr_scale, HR blocks, heads.
+Inpainting (phase 2, ``use_holes``; off in phase 1, where the model is exactly
+the above): ``HoleDetector`` finds the holes (nobody tells the model where they
+are), ``push_pull_fill`` pre-fills them so the flow is not pinned to 0,
+``FlowCompletion`` re-estimates the flow inside them, the mask gate is floored
+at the hole probability (the state is carried over the hole, content seen in
+other frames survives until it is used) and a validity map tracks how much of
+the state comes from real observations - conditioning of the refiner.
 
 Outputs (HR = h * sr_scale unless noted):
-    * ``coarse``      — (N, T, 3, H, W) first-pass restored frames.
-    * ``cond``        — (N, T, cond_dim, H, W) conditioning for the refiner.
-    * ``hole_logits`` — (N, T, 1, h, w) hole detector logits at LR.
-    * ``validity``    — (N, T, 1, H, W) how much of each pixel's state comes
-                        from real (non-hole) observations, in [0, 1].
-    * ``flow_fwd``    — (N, T-1, 2, h, w) completed flow at LR, ``[:, k]`` maps
-                        frame k+1 onto frame k (used to move the refiner's noise
-                        with the scene).
+    * ``coarse``      (N, T, 3, H, W) restored frames
+    * ``cond``        (N, T, cond_dim, H, W) features for the refiner
+    * ``hole_logits`` (N, T, 1, h, w) hole detector logits at LR (-20 = no hole
+                      when ``use_holes`` is off)
+    * ``validity``    (N, T, 1, H, W) share of the state from real observations
+    * ``flow_fwd``    (N, T-1, 2, h, w) flow at LR, ``[:, k]`` maps frame k+1
+                      onto frame k
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt
 from torchvision.ops import deform_conv2d
 
 from .blocks import ResidualBlockNoBN, make_layer
 from .flow import build_flow_estimator, flow_warp
-from .mamba_blocks import MambaFeatureBlocks
+from .mamba_blocks import MambaRestorer
 
 
 def build_upsampler(in_ch: int, scale: int) -> nn.Module:
@@ -160,108 +159,73 @@ class FlowCompletion(nn.Module):
         return flow + mask * self.net(x)
 
 
-class DegradationEncoder(nn.Module):
-    """Self-learned degradation code per frame (no labels, no supervision).
+class FlowGuidedMaskAlignment(nn.Module):
+    """Flow-guided mask deformable alignment (MambaOFR, eq. 9-10).
 
-    Sees the frame with its two neighbours: scratches, dirt and flicker change
-    from frame to frame while content moves smoothly, and the encoder is free
-    to pick that up. The code modulates the SS2D blocks (FiLM).
+    Offsets = optical flow + a residual bounded by ``max_residue`` px, predicted
+    from the flow-warped state, the current latent feature, the flow, the warped
+    previous mask (where the previous frame did not trust its own propagation,
+    e.g. on a scratch) and the hole map. DCNv2 modulation lets the conv drop
+    untrusted samples. MambaOFR's code passed the flow of the first clip of the
+    batch, vertically flipped and with (dx, dy) swapped, as the offset base; here
+    every clip gets its own flow as (dy, dx), which is what torchvision expects.
     """
 
-    def __init__(self, out_dim: int = 64, ch: int = 64):
+    def __init__(self, ch: int, groups: int = 4, max_residue: float = 10.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(9, ch // 2, 3, 2, 1), _lrelu(),
-            nn.Conv2d(ch // 2, ch, 3, 2, 1), _lrelu(),
-            nn.Conv2d(ch, ch, 3, 2, 1), _lrelu(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(ch, out_dim), _lrelu(),
-            nn.Linear(out_dim, out_dim),
-        )
-
-    def forward(self, lrs: torch.Tensor) -> torch.Tensor:
-        n, t, c, h, w = lrs.shape
-        prev = torch.cat([lrs[:, :1], lrs[:, :-1]], dim=1)
-        nxt = torch.cat([lrs[:, 1:], lrs[:, -1:]], dim=1)
-        x = torch.cat([prev, lrs, nxt], dim=2).reshape(n * t, 3 * c, h, w)
-        return self.net(x).view(n, t, -1)
-
-
-class SecondOrderAlignment(nn.Module):
-    """Flow-guided modulated deformable alignment of the t±1 and t±2 states.
-
-    Sampling offsets = optical flow + a learned residual bounded by
-    ``max_residue`` px, predicted from the flow-warped states, the current
-    frame feature, both flows, the validity of both states and the hole mask.
-    The DCNv2 modulation mask lets the module drop samples that come from holes
-    or other untrusted places (MambaOFR's flow-guided DCN runs without one).
-    """
-
-    def __init__(self, ch: int, groups: int = 8, max_residue: float = 10.0):
-        super().__init__()
-        if (2 * ch) % groups:
-            raise ValueError(f"dcn_groups={groups} must divide 2*num_feat={2 * ch}")
+        if ch % groups:
+            raise ValueError(f"dcn_groups={groups} must divide num_feat={ch}")
         self.max_residue = max_residue
         self.conv_offset = nn.Sequential(
-            nn.Conv2d(3 * ch + 2 + 2 + 2 + 1, ch, 3, 1, 1), _lrelu(),
+            nn.Conv2d(2 * ch + 2 + 1 + 1, ch, 3, 1, 1), _lrelu(),
             nn.Conv2d(ch, ch, 3, 1, 1), _lrelu(),
             nn.Conv2d(ch, ch, 3, 1, 1), _lrelu(),
             nn.Conv2d(ch, 27 * groups, 3, 1, 1),
         )
-        # Zero offsets residual + modulation 0.5 at start: pure flow-guided warp.
+        # Zero residual + modulation 0.5 at start: a plain flow-guided warp.
         nn.init.zeros_(self.conv_offset[-1].weight)
         nn.init.zeros_(self.conv_offset[-1].bias)
-        self.weight = nn.Parameter(torch.empty(ch, 2 * ch, 3, 3))
+        self.weight = nn.Parameter(torch.empty(ch, ch, 3, 3))
         self.bias = nn.Parameter(torch.zeros(ch))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, h1, h2, w1, w2, curr, f1, f2, v1, v2, m):
-        """``h*`` unwarped states, ``w*`` their flow-warped versions, ``f*``
-        flows (N, 2, h, w) as (dx, dy), ``v*`` warped validity, ``m`` hole mask."""
-        out = self.conv_offset(torch.cat([w1, w2, curr, f1, f2, v1, v2, m], dim=1))
+    def forward(self, feat, warped, curr, flow, mask_w, hole):
+        """``feat`` the unwarped previous state, ``warped`` it warped by ``flow``
+        (N, 2, h, w) as (dx, dy), ``mask_w`` the warped previous mask."""
+        out = self.conv_offset(torch.cat([warped, curr, flow, mask_w, hole], dim=1))
         o1, o2, modulation = torch.chunk(out, 3, dim=1)
         offset = self.max_residue * torch.tanh(torch.cat([o1, o2], dim=1))
-        off1, off2 = torch.chunk(offset, 2, dim=1)
-        # torchvision wants (dy, dx) per sampling point; the flows are (dx, dy).
-        off1 = off1 + f1.flip(1).repeat(1, off1.size(1) // 2, 1, 1)
-        off2 = off2 + f2.flip(1).repeat(1, off2.size(1) // 2, 1, 1)
-        return deform_conv2d(
-            torch.cat([h1, h2], dim=1),
-            torch.cat([off1, off2], dim=1),
-            self.weight,
-            self.bias,
-            padding=1,
-            mask=torch.sigmoid(modulation),
-        )
+        offset = offset + flow.flip(1).repeat(1, offset.size(1) // 2, 1, 1)
+        return deform_conv2d(feat, offset, self.weight, self.bias, padding=1, mask=torch.sigmoid(modulation))
 
 
-class ValidityAggregation(nn.Module):
-    """Fuse the aligned state with the current frame's feature, tracking validity.
+class MaskGatedAggregation(nn.Module):
+    """MambaOFR's mask generator and fusion (``Gated_Aggregation``, eq. 11-12).
 
-    The gate sees the residual indicator (how inconsistent the warped neighbour
-    is with the current frame), the propagated validity and the hole mask.
-    Inside a hole the gate is floored at the hole probability, so the state is
-    carried over and content seen in earlier frames survives until it is used.
-    ``validity`` = how much of the state comes from real observations:
-    ``1 - hole`` for a fresh pixel, the propagated validity for a carried one.
+    M = MG(aligned, latent, residual indicator, warped previous mask, hole), the
+    weight of the propagated state against the current frame's latent feature.
+    The residual indicator |warp(previous frame) - current frame| flags pixels
+    the motion does not explain: a scratch or a speck of dirt of one frame.
+    Inside a hole M is floored at the hole probability (state carried over).
+    ``validity`` = how much of the state comes from real observations: ``1 -
+    hole`` for a fresh pixel, the propagated validity for a carried one.
     """
 
     def __init__(self, ch: int):
         super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv2d(2 * ch + 3, ch, 3, 1, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ch, 1, 3, 1, 1),
-            nn.Sigmoid(),
+        c_in = 2 * ch + 3
+        self.mask_gen = nn.Sequential(
+            nn.Conv2d(c_in, c_in, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(c_in, ch // 2, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ch // 2, 1, 3, 1, 1), nn.Sigmoid(),
         )
 
-    def forward(self, aligned, curr, res_ind, v_prop, m):
-        g = self.gate(torch.cat([aligned, curr, res_ind, v_prop, m], dim=1))
-        g = torch.maximum(g, m)
+    def forward(self, aligned, curr, res_ind, mask_w, hole, v_prop):
+        g = self.mask_gen(torch.cat([aligned, curr, res_ind, mask_w, hole], dim=1))
+        g = torch.maximum(g, hole)
         fused = g * aligned + (1 - g) * curr
-        validity = g * v_prop + (1 - g) * (1 - m)
-        return fused, validity
+        validity = g * v_prop + (1 - g) * (1 - hole)
+        return fused, g, validity
 
 
 _DIRS = ("bwd", "fwd")  # "forward" would clash with nn.Module.forward
@@ -271,55 +235,53 @@ class ConditioningBackbone(nn.Module):
     def __init__(
         self,
         num_feat: int = 32,
-        num_block: int = 6,
-        cond_dim: int = 64,
         embed_dim: int = 64,
+        depths: Sequence[int] = (2, 2, 2),
         d_state: int = 16,
-        ssm_expand: int = 2,
+        ssm_expand: float = 1.2,
+        dyn_kernels: int = 8,
+        drop_path: float = 0.1,
+        recon_feat: int = 64,
+        recon_blocks: int = 2,
+        cond_dim: int = 64,
         sr_scale: int = 2,
-        deg_dim: int = 64,
-        dcn_groups: int = 8,
+        dcn_groups: int = 4,
         hole_threshold: float = 0.9,
         raft: str = "large",
+        use_holes: bool = False,
     ):
         super().__init__()
         self.hole_threshold = hole_threshold
+        # Phase 2 switch (not saved in the state dict, set from ModelConfig).
+        self.use_holes = use_holes
         c = num_feat
 
         self.hole_detector = HoleDetector()
         self.flow_net = build_flow_estimator(raft)
         self.flow_completion = FlowCompletion()
-        self.degradation_encoder = DegradationEncoder(deg_dim)
 
         self.proj = nn.ModuleDict({d: nn.Conv2d(3, c, 3, 1, 1) for d in _DIRS})
-        self.align = nn.ModuleDict({d: SecondOrderAlignment(c, dcn_groups) for d in _DIRS})
-        self.agg = nn.ModuleDict({d: ValidityAggregation(c) for d in _DIRS})
-        self.blocks = nn.ModuleDict(
-            {d: MambaFeatureBlocks(c, embed_dim, num_block, d_state, ssm_expand, deg_dim) for d in _DIRS}
+        self.align = nn.ModuleDict({d: FlowGuidedMaskAlignment(c, dcn_groups) for d in _DIRS})
+        self.agg = nn.ModuleDict({d: MaskGatedAggregation(c) for d in _DIRS})
+        self.restorer = nn.ModuleDict(
+            {d: MambaRestorer(c, embed_dim, tuple(depths), d_state, ssm_expand, dyn_kernels, drop_path) for d in _DIRS}
         )
 
-        # backward + forward state, plus their validity maps
-        self.fuse = nn.Conv2d(2 * c + 2, 2 * c, 3, 1, 1)
-        self.trunk = make_layer(ResidualBlockNoBN, 4, num_feat=2 * c)
+        # Reconstruction: both states + their validity maps -> SR frame.
+        self.fuse = nn.Conv2d(2 * c + 2, recon_feat, 3, 1, 1)
+        self.recon = make_layer(ResidualBlockNoBN, recon_blocks, num_feat=recon_feat)
+        self.upsampler = build_upsampler(recon_feat, sr_scale)
+        self.conv_hr = nn.Conv2d(recon_feat, recon_feat, 3, 1, 1)
+        self.conv_last = nn.Conv2d(recon_feat, 3, 3, 1, 1)
+        self.cond_head = nn.Conv2d(recon_feat, cond_dim, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(0.1, inplace=True)
 
-        self.upsampler = build_upsampler(2 * c, sr_scale)
-        # HR-space reconstruction: refine features after PixelShuffle so the
-        # coarse head is not a single conv away from the sub-pixel output.
-        self.hr_blocks = make_layer(ResidualBlockNoBN, 2, num_feat=2 * c)
-
-        self.coarse_head = nn.Sequential(
-            nn.Conv2d(2 * c, 2 * c, 3, 1, 1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(2 * c, 3, 3, 1, 1),
-        )
-        self.cond_head = nn.Conv2d(2 * c, cond_dim, 3, 1, 1)
-
     def _comp_flow(self, frames: torch.Tensor, m: torch.Tensor):
-        """(forward_flow, backward_flow), each (N, T-1, 2, h, w), holes completed.
+        """(forward_flow, backward_flow), each (N, T-1, 2, h, w).
 
         ``forward_flow[:, k]`` maps frame k+1 onto frame k (warps the state of
         frame k into frame k+1); ``backward_flow[:, k]`` maps frame k onto k+1.
+        With ``use_holes`` the flow inside the holes is completed.
         """
         n, t, c, h, w = frames.size()
         if t < 2:
@@ -327,50 +289,32 @@ class ConditioningBackbone(nn.Module):
             return empty, empty
         a = frames[:, 1:].reshape(-1, c, h, w)
         b = frames[:, :-1].reshape(-1, c, h, w)
-        pair_m = torch.maximum(m[:, 1:], m[:, :-1]).reshape(-1, 1, h, w)
-        fwd = self.flow_completion(self.flow_net(a, b), pair_m, a, b)
-        bwd = self.flow_completion(self.flow_net(b, a), pair_m, b, a)
+        fwd, bwd = self.flow_net(a, b), self.flow_net(b, a)
+        if self.use_holes:
+            pair_m = torch.maximum(m[:, 1:], m[:, :-1]).reshape(-1, 1, h, w)
+            fwd = self.flow_completion(fwd, pair_m, a, b)
+            bwd = self.flow_completion(bwd, pair_m, b, a)
         return fwd.view(n, t - 1, 2, h, w), bwd.view(n, t - 1, 2, h, w)
 
     def _step(
-        self,
-        d: str,
-        frame: torch.Tensor,
-        m_i: torch.Tensor,
-        z_i: torch.Tensor,
-        s1: Optional[Tuple[torch.Tensor, ...]],
-        s2: Optional[Tuple[torch.Tensor, ...]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One propagation step in direction ``d``.
-
-        ``s1 = (state, validity, frame, flow)`` of the previous frame in the
-        propagation order, ``s2 = (state, validity, flow)`` of the one before
-        it (flow already composed to reach the current frame); ``None`` at the
-        start of the sequence.
-        """
+        self, d: str, frame: torch.Tensor, hole: torch.Tensor, prev: Optional[Tuple[torch.Tensor, ...]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One propagation step in direction ``d``; ``prev = (state, mask,
+        validity, frame, flow)`` of the previous frame in propagation order
+        (``None`` at the start). Returns (state, mask, validity)."""
         curr = self.proj[d](frame)
-        if s1 is None:
-            feat, validity = curr, 1.0 - m_i
+        if prev is None:
+            feat, mask, validity = curr, torch.ones_like(hole), 1.0 - hole
         else:
-            h1, val1, frame1, f1 = s1
-            g1 = f1.permute(0, 2, 3, 1)
-            w1 = flow_warp(h1, g1)
-            v1 = flow_warp(val1, g1, padding_mode="zeros")
-            if s2 is None:
-                h2 = torch.zeros_like(h1)
-                w2 = h2
-                v2 = torch.zeros_like(v1)
-                f2 = torch.zeros_like(f1)
-            else:
-                h2, val2, f2 = s2
-                g2 = f2.permute(0, 2, 3, 1)
-                w2 = flow_warp(h2, g2)
-                v2 = flow_warp(val2, g2, padding_mode="zeros")
-            aligned = self.align[d](h1, h2, w1, w2, curr, f1, f2, v1, v2, m_i)
-            res_ind = torch.abs(rgb_to_luma(flow_warp(frame1, g1)) - rgb_to_luma(frame))
-            feat, validity = self.agg[d](aligned, curr, res_ind, torch.maximum(v1, v2), m_i)
-        feat = ckpt.checkpoint(self.blocks[d], feat, z_i, use_reentrant=False)
-        return feat, validity
+            p_feat, p_mask, p_val, p_frame, flow = prev
+            grid = flow.permute(0, 2, 3, 1)
+            warped = flow_warp(p_feat, grid)
+            mask_w = flow_warp(p_mask, grid, padding_mode="zeros")
+            v_w = flow_warp(p_val, grid, padding_mode="zeros")
+            res_ind = torch.abs(rgb_to_luma(flow_warp(p_frame, grid)) - rgb_to_luma(frame))
+            aligned = self.align[d](p_feat, warped, curr, flow, mask_w, hole)
+            feat, mask, validity = self.agg[d](aligned, curr, res_ind, mask_w, hole, v_w)
+        return self.restorer[d](feat), mask, validity
 
     def forward(self, lrs: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -382,58 +326,43 @@ class ConditioningBackbone(nn.Module):
         """
         n, t, c, h, w = lrs.size()
 
-        hole_logits = self.hole_detector(lrs)
-        m = torch.sigmoid(hole_logits).detach()
-        hard = (m > self.hole_threshold).to(lrs.dtype)
-        filled = push_pull_fill(
-            lrs.reshape(n * t, c, h, w), 1.0 - hard.reshape(n * t, 1, h, w)
-        ).view(n, t, c, h, w)
+        if self.use_holes:
+            hole_logits = self.hole_detector(lrs)
+            m = torch.sigmoid(hole_logits).detach()
+            hard = (m > self.hole_threshold).to(lrs.dtype)
+            filled = push_pull_fill(
+                lrs.reshape(n * t, c, h, w), 1.0 - hard.reshape(n * t, 1, h, w)
+            ).view(n, t, c, h, w)
+        else:
+            hole_logits = lrs.new_full((n, t, 1, h, w), -20.0)
+            m = lrs.new_zeros(n, t, 1, h, w)
+            filled = lrs
 
-        z = self.degradation_encoder(lrs)
         fwd_flow, bwd_flow = self._comp_flow(filled, m)
 
         # ---- backward propagation (t-1 -> 0), states kept for the fusion
-        back_feats = [None] * t
-        back_vals = [None] * t
+        back = [None] * t
         for i in range(t - 1, -1, -1):
-            s1 = s2 = None
-            if i < t - 1:
-                f1 = bwd_flow[:, i]
-                s1 = (back_feats[i + 1], back_vals[i + 1], filled[:, i + 1], f1)
-                if i < t - 2:
-                    f2 = f1 + flow_warp(bwd_flow[:, i + 1], f1.permute(0, 2, 3, 1))
-                    s2 = (back_feats[i + 2], back_vals[i + 2], f2)
-            back_feats[i], back_vals[i] = self._step(
-                "bwd", filled[:, i], m[:, i], z[:, i], s1, s2
-            )
+            prev = (*back[i + 1], filled[:, i + 1], bwd_flow[:, i]) if i < t - 1 else None
+            back[i] = self._step("bwd", filled[:, i], m[:, i], prev)
 
         # ---- forward propagation (0 -> t-1), reconstructing each frame on the fly
         coarse_out, cond_out, val_out = [], [], []
-        p1 = p2 = None  # (state, validity) of frames i-1 and i-2
+        state = None
         for i in range(t):
-            s1 = s2 = None
-            if i > 0:
-                f1 = fwd_flow[:, i - 1]
-                s1 = (p1[0], p1[1], filled[:, i - 1], f1)
-                if i > 1:
-                    f2 = f1 + flow_warp(fwd_flow[:, i - 2], f1.permute(0, 2, 3, 1))
-                    s2 = (p2[0], p2[1], f2)
-            feat, val = self._step("fwd", filled[:, i], m[:, i], z[:, i], s1, s2)
-            p2, p1 = p1, (feat, val)
+            prev = (*state, filled[:, i - 1], fwd_flow[:, i - 1]) if i > 0 else None
+            state = self._step("fwd", filled[:, i], m[:, i], prev)
+            (b_feat, _, b_val), (f_feat, _, f_val) = back[i], state
 
-            fused = self.fuse(torch.cat([back_feats[i], feat, back_vals[i], val], dim=1))
-            fused = self.trunk(self.lrelu(fused))
-            fused_hr = self.upsampler(fused)
-            fused_hr = ckpt.checkpoint(self.hr_blocks, fused_hr, use_reentrant=False)
-            hr_size = fused_hr.shape[-2:]
-
+            x = self.lrelu(self.fuse(torch.cat([b_feat, f_feat, b_val, f_val], dim=1)))
+            x = self.upsampler(self.recon(x))
+            x = self.lrelu(self.conv_hr(x))
+            hr_size = x.shape[-2:]
             base = F.interpolate(filled[:, i], size=hr_size, mode="bilinear", align_corners=False)
-            coarse_out.append(torch.tanh(self.coarse_head(fused_hr) + base))
-            cond_out.append(self.cond_head(fused_hr))
+            coarse_out.append(torch.tanh(self.conv_last(x) + base))
+            cond_out.append(self.cond_head(x))
             val_out.append(
-                F.interpolate(
-                    torch.maximum(back_vals[i], val), size=hr_size, mode="bilinear", align_corners=False
-                )
+                F.interpolate(torch.maximum(b_val, f_val), size=hr_size, mode="bilinear", align_corners=False)
             )
 
         return {

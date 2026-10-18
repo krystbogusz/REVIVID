@@ -11,17 +11,23 @@ from typing import Sequence
 
 @dataclass
 class ModelConfig:
-    # Backbone
-    num_feat: int = 32          # propagation feature channels
-    num_block: int = 6          # SS2D blocks per propagation direction
-    embed_dim: int = 128        # internal width of the SS2D blocks
+    # Backbone (MambaOFR: 16 / 64 / [2, 2, 2] / 16 / 1.2 / 8 / 0.1)
+    num_feat: int = 32          # propagated state channels
+    embed_dim: int = 64         # width of the Mamba restorer (MambaIR embed_dim)
+    depths: Sequence[int] = (2, 2, 2)  # VSS blocks per residual group
     d_state: int = 16           # SSM state dimension
-    ssm_expand: int = 2         # SSM inner expansion factor
+    ssm_expand: float = 1.2     # SS2D inner expansion (MambaOFR's mlp_ratio)
+    dyn_kernels: int = 8        # kernels of the degradation-aware prompt convs
+    drop_path: float = 0.1      # stochastic depth of the VSS blocks
+    recon_feat: int = 64        # reconstruction width
+    recon_blocks: int = 2       # residual blocks before the upsampler
     cond_dim: int = 64          # backbone features handed to the refiner
-    deg_dim: int = 64           # self-learned degradation code (FiLM on SS2D blocks)
-    dcn_groups: int = 8         # groups of the second-order DCN (divides 2 * num_feat)
+    dcn_groups: int = 4         # deformable groups of the alignment (divides num_feat)
     sr_scale: int = 2
     raft: str = "large"         # optical flow of the backbone: large | small
+    # Phase 2: hole detection / filling / flow completion. Set by the trainer
+    # from training.stage and stored with the checkpoint's model_config.
+    use_holes: bool = False
 
     # Refiner (diffusion UNet, inside holes only)
     refiner_base: int = 48
@@ -48,7 +54,7 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, d: dict | None) -> "ModelConfig":
         kwargs = {k: v for k, v in (d or {}).items() if k in cls.__dataclass_fields__}
-        for key in ("channel_mult", "refiner_temporal_levels"):
+        for key in ("depths", "channel_mult", "refiner_temporal_levels"):
             if key in kwargs:
                 kwargs[key] = tuple(kwargs[key])
         return cls(**kwargs)

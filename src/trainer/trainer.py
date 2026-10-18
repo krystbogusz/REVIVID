@@ -7,23 +7,29 @@ Data (fixed layout, built by ``dataset.create_dataset``):
     data/training/train/*.mp4                  clean clips, degraded on the fly
     data/training/valid/{gt,degraded}/*.mp4    validation pairs
 
-Two stages (``training.stage``):
-    restore  restoration + SR of the backbone only: no holes in the training
-             data, no detector / refiner losses, validation on the coarse output
-    inpaint  holes burned in with ``model.hole_prob``; detector + refiner train
-             too, validation on the full inference path
+Two phases (``training.stage``), each its own experiment / config:
+    restore  phase 1 (config/REVIVID.yaml): restoration of all degradations + SR,
+             MambaOFR's recipe; no holes in the data, the model has no hole
+             machinery switched on (``model.use_holes`` off), validation on the
+             restored output
+    inpaint  phase 2 (config/REVIVID_inpaint.yaml): fine-tuning from the phase-1
+             weights (``training.init_from``): holes burned in with
+             ``model.hole_prob``; detector + flow completion + refiner train, the
+             phase-1 backbone at ``backbone_lr_mult``; validation on the full
+             inference path (the model finds the holes itself)
 
-Generator loss (weights: ``training.loss_weights``):
+Generator loss (weights: ``training.loss_weights``; a 0 weight skips the term):
     pix        Charbonnier(coarse, gt), true-hole pixels weighted 1 + hole_loss_boost
     perceptual MambaOFR's VGG19 loss(coarse, gt): relu1_1..relu5_1 weighted 1/32..1
-    gan        hinge, projected patch discriminator on VGG features of the same pass
+    gan        hinge; ``gan.type`` temporal = MambaOFR's 3-D clip discriminator,
+               projected = patch heads on the VGG features of the same pass
                (from ``training.gan.start_iter``)
     temporal   flicker of coarse vs the GT's own motion
     fft        L1 of FFT amplitude(coarse, gt) — missing high frequencies
     grad       L1 of Sobel gradients(coarse, gt) — soft edges
     detect     BCE of the hole detector vs the true hole mask        (inpaint)
     v          diffusion v-loss of the refiner inside the true holes (inpaint)
-Discriminator: hinge on VGG features of GT vs coarse, own AdamW.
+Discriminator: hinge, GT vs coarse, own Adam.
 
 The true hole mask of a training sample is a TARGET only — the model never
 receives it. Validation runs the full inference path on the stored .mp4 pairs
@@ -49,7 +55,7 @@ from tqdm import tqdm
 from dataset import dataset_loader as data
 from evaluator.metrics import evaluate_clip
 from model import ModelConfig, Video_Backbone
-from model.discriminator import ProjectedPatchDiscriminator
+from model.discriminator import ProjectedPatchDiscriminator, TemporalPatchDiscriminator
 from model.flow import build_flow_estimator
 from model.losses import (
     CharbonnierLoss,
@@ -61,20 +67,18 @@ from model.losses import (
     VGGFeatures,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
+from utils.config import PROJECT_ROOT, load_config
+
 DATA_DIR = PROJECT_ROOT / "data" / "training"
 
+# MambaOFR: L1 1.0, perceptual 1.0, adversarial 0.01.
 DEFAULT_WEIGHTS = {
-    "pix": 1.0, "perceptual": 1.0, "gan": 0.05, "temporal": 0.5,
-    "fft": 0.5, "grad": 0.15, "detect": 0.05, "v": 1.0,
+    "pix": 1.0, "perceptual": 1.0, "gan": 0.01, "temporal": 0.0,
+    "fft": 0.0, "grad": 0.0, "detect": 0.05, "v": 1.0,
 }
 STAGES = ("restore", "inpaint")
-
-
-def load_config(path=None) -> dict:
-    with open(path or DEFAULT_CONFIG, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+# Modules that only phase 2 trains; the rest of the network is the phase-1 backbone.
+INPAINT_MODULES = ("backbone.hole_detector.", "backbone.flow_completion.", "refine_unet.")
 
 
 class ModelEMA:
@@ -146,8 +150,16 @@ class Trainer:
 
         # ---- networks
         self.model_cfg = ModelConfig.from_dict(cfg.get("model"))
+        self.model_cfg.use_holes = self.inpaint  # stored with the checkpoints' model_config
         self.net = Video_Backbone(self.model_cfg).to(dev)
-        self.net_d = ProjectedPatchDiscriminator().to(dev)
+        gan = self.tc.get("gan") or {}
+        self.gan_type = str(gan.get("type", "temporal"))
+        if self.gan_type == "temporal":
+            self.net_d = TemporalPatchDiscriminator().to(dev)
+        elif self.gan_type == "projected":
+            self.net_d = ProjectedPatchDiscriminator().to(dev)
+        else:
+            raise ValueError(f"training.gan.type must be temporal | projected, got {self.gan_type!r}")
         self.ema = ModelEMA(self.net, float(self.tc.get("ema_decay", 0.999)))
 
         # ---- losses
@@ -167,19 +179,26 @@ class Trainer:
         self.lr = float(self.tc.get("lr", 2e-4))
         self.lr_min = float(self.tc.get("lr_min", 1e-6))
         self.lr_steady = float(self.tc.get("lr_steady", 0.0))
-        betas = (float(self.tc.get("beta1", 0.9)), float(self.tc.get("beta2", 0.99)))
-        params = [p for p in self.net.parameters() if p.requires_grad]
-        self.opt_g = torch.optim.AdamW([{"params": params, "lr_mult": 1.0}], lr=self.lr, betas=betas)
-        gan = self.tc.get("gan") or {}
-        self.gan_start_iter = int(gan.get("start_iter", 5000))
-        self.d_lr = float(gan.get("d_lr", 1e-4))
-        self.opt_d = torch.optim.AdamW(
+        # Adam without weight decay, as MambaOFR (AdamW's default decay also pulled
+        # the SSM's A_logs / Ds, which Mamba keeps out of the decay).
+        betas = (float(self.tc.get("beta1", 0.9)), float(self.tc.get("beta2", 0.999)))
+        new, old = [], []
+        for name, p in self.net.named_parameters():
+            if p.requires_grad:
+                (new if name.startswith(INPAINT_MODULES) else old).append(p)
+        backbone_mult = float(self.tc.get("backbone_lr_mult", 1.0)) if self.inpaint else 1.0
+        self.opt_g = torch.optim.Adam(
+            [{"params": old, "lr_mult": backbone_mult}, {"params": new, "lr_mult": 1.0}], lr=self.lr, betas=betas
+        )
+        self.gan_start_iter = int(gan.get("start_iter", 0))
+        self.d_lr = float(gan.get("d_lr", 2e-4))
+        self.opt_d = torch.optim.Adam(
             self.net_d.parameters(),
             lr=self.d_lr,
-            betas=(float(gan.get("beta1", 0.0)), float(gan.get("beta2", 0.99))),
+            betas=(float(gan.get("beta1", 0.9)), float(gan.get("beta2", 0.999))),
         )
         self.grad_accum = max(1, int(self.tc.get("grad_accum", 1)))
-        self.grad_clip = float(self.tc.get("grad_clip", 1.0))
+        self.grad_clip = float(self.tc.get("grad_clip", 0.0))  # 0 = off (MambaOFR)
         # RAFT starts frozen and is fine-tuned after a warmup (-1 = never).
         self.raft_unfreeze_iter = int(self.tc.get("raft_unfreeze_iter", 20000))
         self.flow_lr_mul = float(self.tc.get("flow_lr_mul", 0.125))
@@ -209,7 +228,8 @@ class Trainer:
     def _unfreeze_raft(self) -> None:
         flow = self.net.backbone.flow_net
         flow.set_trainable(True)
-        lr = self.opt_g.param_groups[0]["lr"]
+        g0 = self.opt_g.param_groups[0]
+        lr = g0["lr"] / g0["lr_mult"]
         self.opt_g.add_param_group(
             {"params": list(flow.parameters()), "lr": lr * self.flow_lr_mul, "lr_mult": self.flow_lr_mul}
         )
@@ -233,26 +253,36 @@ class Trainer:
 
         out = self.net(lq)
         coarse, coarse_f = out["coarse"], out["coarse_f"]
+        w = self.w
         losses = {}
 
         losses["pix"] = self.pix_loss(coarse_f, gt_f, 1.0 + self.hole_loss_boost * hole_hr)
-        losses["fft"] = self.fft_loss(coarse_f, gt_f)
-        losses["grad"] = self.grad_loss(coarse_f, gt_f)
+        if w["fft"] > 0:
+            losses["fft"] = self.fft_loss(coarse_f, gt_f)
+        if w["grad"] > 0:
+            losses["grad"] = self.grad_loss(coarse_f, gt_f)
 
         fake_feats = self.vgg(coarse_f)
         with torch.no_grad():
             real_feats = self.vgg(gt_f)
         losses["perceptual"] = VGGFeatures.perceptual(fake_feats["perc"], real_feats["perc"])
 
-        gan_on = self.iteration >= self.gan_start_iter
+        # What the discriminator judges: the clip (temporal) or VGG maps (projected).
+        if self.gan_type == "temporal":
+            d_fake_in, d_real_in = coarse, gt
+            d_fake_detached = coarse.detach()
+        else:
+            d_fake_in, d_real_in = fake_feats["disc"], real_feats["disc"]
+            d_fake_detached = [f.detach() for f in d_fake_in]
+        gan_on = w["gan"] > 0 and self.iteration >= self.gan_start_iter
         if gan_on:
             # D's parameters are frozen while this graph is built, so the
             # generator loss sends them no gradient.
             self.net_d.requires_grad_(False)
-            losses["gan"] = self.gan_loss.generator(self.net_d(fake_feats["disc"]))
+            losses["gan"] = self.gan_loss.generator(self.net_d(d_fake_in))
             self.net_d.requires_grad_(True)
 
-        if t > 1:
+        if t > 1 and w["temporal"] > 0:
             with torch.no_grad():
                 flow = self.gt_flow(
                     gt[:, 1:].reshape(-1, c, H, W), gt[:, :-1].reshape(-1, c, H, W)
@@ -276,7 +306,7 @@ class Trainer:
                 cond=out["refine_cond"], num_frames=t,
             )
 
-        total = sum(self.w[k] * v for k, v in losses.items())
+        total = sum(w[k] * v for k, v in losses.items())
         if not torch.isfinite(total):
             print(f"[iter {self.iteration}] non-finite loss, step skipped: "
                   + ", ".join(f"{k}={float(v):.4g}" for k, v in losses.items()))
@@ -290,8 +320,8 @@ class Trainer:
         log["total"] = float(total.detach())
 
         if gan_on:
-            d_real = self.net_d(real_feats["disc"])
-            d_fake = self.net_d([f.detach() for f in fake_feats["disc"]])
+            d_real = self.net_d(d_real_in)
+            d_fake = self.net_d(d_fake_detached)
             loss_d = self.gan_loss.discriminator(d_real, d_fake)
             (loss_d / self.grad_accum).backward()
             log["d"] = float(loss_d.detach())
@@ -301,7 +331,8 @@ class Trainer:
         self._accum += 1
         if self._accum == self.grad_accum:
             self._accum = 0
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
+            clip = self.grad_clip if self.grad_clip > 0 else float("inf")
+            log["gnorm"] = float(torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip))
             self.opt_g.step()
             self.opt_g.zero_grad(set_to_none=True)
             self.opt_d.step()
@@ -499,12 +530,38 @@ class Trainer:
             self.exp_dir / "checkpoints" / name,
         )
 
+    def init_from(self, path: str | Path) -> None:
+        """Start from the weights of another run (phase 2 from phase 1): its EMA
+        weights where it has them, for the model and the new EMA alike. Modules
+        the source lacks keep their init; optimizer and schedule start fresh."""
+        path = Path(path)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        s = torch.load(path, map_location=self.device, weights_only=False)
+        weights = {**s["model"], **((s.get("ema") or {}).get("shadow") or {})}
+        own = self.net.state_dict()
+        weights = {k: v.to(own[k].dtype) for k, v in weights.items() if k in own and own[k].shape == v.shape}
+        missing = [k for k in own if k not in weights]
+        self.net.load_state_dict(weights, strict=False)
+        self.ema = ModelEMA(self.net, self.ema.decay)
+        d_state = s.get("net_d")
+        own_d = self.net_d.state_dict()
+        if d_state and d_state.keys() == own_d.keys() and all(d_state[k].shape == own_d[k].shape for k in own_d):
+            self.net_d.load_state_dict(d_state)  # same discriminator type: keep its training
+        print(f"[trainer] initialised from {path} ({len(weights)} tensors"
+              + (f"; fresh: {sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in missing})}" if missing else "")
+              + ")")
+
     def resume(self, path: Optional[str] = None) -> int:
         """Continue from ``path`` or <exp_dir>/checkpoints/latest.pth (a checkpoint
-        of this same model); returns the next epoch, 1 when starting fresh."""
+        of this same model); returns the next epoch, 1 when starting fresh (from
+        ``training.init_from`` when it is set)."""
         path = Path(path) if path else self.exp_dir / "checkpoints" / "latest.pth"
         if not path.exists():
-            print("[trainer] no checkpoint - starting fresh")
+            if self.tc.get("init_from"):
+                self.init_from(self.tc["init_from"])
+            else:
+                print("[trainer] no checkpoint - starting fresh")
             return 1
         s = torch.load(path, map_location=self.device, weights_only=False)
         self.net.load_state_dict(s["model"])
@@ -549,10 +606,15 @@ class Trainer:
             batch_size=int(tc.get("batch_size", 1)),
             num_workers=int(tc.get("num_workers", 0)),
             augment=bool(tc.get("augment", True)),
+            gt_usm=float(tc.get("gt_usm", 0.0)),
+            degradation_modes=tc.get("degradation_modes"),
         )
+        val_dir = Path(self.vc.get("dir") or DATA_DIR / "valid")
+        if not val_dir.is_absolute():
+            val_dir = PROJECT_ROOT / val_dir
         try:
-            val = data.eval_loader(DATA_DIR / "valid", num_workers=int(self.vc.get("num_workers", 0)))
+            val = data.eval_loader(val_dir, num_workers=int(self.vc.get("num_workers", 0)))
         except FileNotFoundError:
-            print(f"[trainer] no validation pairs in {DATA_DIR / 'valid'} - training without validation")
+            print(f"[trainer] no validation pairs in {val_dir} - training without validation")
             val = None
         return train, val

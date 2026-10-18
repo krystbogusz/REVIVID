@@ -3,14 +3,17 @@
 Generator (coarse output = the final image everywhere outside holes):
     * ``CharbonnierLoss``         — fidelity to GT (robust L1); keeps content right.
     * ``VGGFeatures.perceptual``  — MambaOFR's VGG19 feature distance; keeps texture/structure right.
-    * ``HingeGANLoss.generator``  — realism: the projected patch discriminator must
-                                    not tell the output from real footage.
+    * ``HingeGANLoss.generator``  — realism: the discriminator (MambaOFR's 3-D clip
+                                    critic or the projected patch heads) must not
+                                    tell the output from real footage.
     * ``TemporalConsistencyLoss`` — no flicker: frame-to-frame change must follow
                                     the GT's own change along the GT motion.
     * ``FrequencyLoss``, ``GradientLoss`` — sharpness: pixel / VGG losses settle on
                                     the blurry average of what the degraded input
                                     allows; these penalise the missing high
-                                    frequencies and soft edges directly.
+                                    frequencies and soft edges directly. Off in
+                                    phase 1: where detail is uncertain they favour
+                                    flat patches with sharp edges ("watercolour").
 Hole detector:
     * ``HoleDetectionLoss``       — BCE against the true hole mask.
 Refiner: its v-prediction loss lives in ``GaussianDiffusion.training_loss``.

@@ -35,9 +35,18 @@ train through this pipeline. Medians, real / this pipeline / MambaOFR's:
     1st / 99th percentile grey level               23, 201 / 23, 197 / 17, 215
 Not matched by degradation: REDS has much more motion than the films.
 
-That is the realistic mode. ``HEAVY_PROB`` (20 %) of the clips use ``P_HEAVY``
-instead, degradations past the sample's p90, so that films more damaged than
-these uploads (or less compressed, grain visible) are not out of distribution.
+That is the realistic mode. Each clip draws its mode from ``MODE_PROBS``
+(``training.degradation_modes`` overrides it):
+    realistic  ``P`` as calibrated above
+    heavy      ``P_HEAVY``: degradations past the sample's p90, so that films more
+               damaged than these uploads (or less compressed, grain visible) are
+               not out of distribution
+    dirty      ``P_DIRTY``: MambaOFR's damage density - dust / dirt / blotches on
+               (nearly) every film frame at MambaOFR's opacity, single-frame
+               scratches from any texture folder, MambaOFR's grain. In the
+               calibrated modes dust sits on a few % of the frames only (the
+               uploads are mostly cleaned); trained on them alone the model
+               learned to keep dirt as if it were content.
 
 MambaOFR's ops are kept (blur kernels, resampling, noise, textures, blend
 modes); its order and ColorJitter are not.
@@ -76,6 +85,7 @@ P = {
     "flicker": (0.0003, 0.008),    # std of the per-frame log gain, log-uniform
     "tex_prob": (0.0, 0.2),        # chance a film frame carries dust / dirt / grain
     "tex_opacity": (0.25, 0.8),    # dust, dirt
+    "tex_all_folders": False,      # per-frame textures also from the scratch folders
     "line_opacity": (0.5, 1.0),    # scratches
     "moving_line_prob": 0.4,       # scratches persisting over the clip
     "blur_prob": 0.6,
@@ -101,7 +111,6 @@ P = {
 # dust together with scratches, visible grain - also lightly compressed, as on
 # a raw scan - harder blur and fading. Overrides of ``P``; the frame repeats
 # stay as calibrated.
-HEAVY_PROB = 0.2
 P_HEAVY = {
     "tone_prob": 1.0,
     "black": (0.05, 0.2),
@@ -120,6 +129,35 @@ P_HEAVY = {
     "lr_soft_prob": 0.3,
     "crf": (14, 30),               # grain visible needs a light encode (raw scan)
 }
+
+# Dirty mode: MambaOFR's degradation_video_list_4 damage (a texture on every
+# frame, opacity 0.6-1, any folder; noise 5-10 / 255) on top of the calibrated
+# transfer chain. Scratches drift slowly as in ``P``, not MambaOFR's 5-15 px jumps.
+P_DIRTY = {
+    "tex_prob": (0.8, 1.0),
+    "tex_opacity": (0.6, 1.0),
+    "tex_all_folders": True,
+    "line_opacity": (0.6, 1.0),
+    "moving_line_prob": 0.3,
+    "dust_with_scratches": True,
+    "noise_std": (2.0 / 255.0, 10.0 / 255.0),
+    "flicker": (0.002, 0.03),
+    "blur_prob": 0.7,
+}
+
+MODES = {"realistic": P, "heavy": {**P, **P_HEAVY}, "dirty": {**P, **P_DIRTY}}
+MODE_PROBS = {"realistic": 0.4, "heavy": 0.2, "dirty": 0.4}
+
+
+def sample_mode(mode_probs: dict | None = None) -> dict:
+    """Parameters of one clip's degradation mode, drawn from ``mode_probs``
+    (name -> weight, default ``MODE_PROBS``)."""
+    probs = {k: float(v) for k, v in (mode_probs or MODE_PROBS).items() if float(v) > 0}
+    unknown = set(probs) - set(MODES)
+    if unknown or not probs:
+        raise ValueError(f"degradation modes must be weights over {sorted(MODES)}, got {mode_probs}")
+    name = random.choices(list(probs), weights=list(probs.values()))[0]
+    return MODES[name]
 
 
 # Texture folders of data/raw/noise_data (see their contents): vertical scratches
@@ -226,6 +264,7 @@ def process_video_frames(
     hole_window: int | None = None,
     return_masks: bool = False,
     frame_ids: list | None = None,
+    mode_probs: dict | None = None,
 ) -> list | tuple[list, list]:
     """Degrade a clip; see the module docstring for the order of operations.
 
@@ -238,6 +277,7 @@ def process_video_frames(
     With ``return_masks=True`` it returns ``(frames, masks)``, where ``masks``
     holds one (h, w) uint8 {0, 1} hole mask per output frame — the training
     target for the hole detector. Without it, only the frames.
+    ``mode_probs`` weights the degradation modes (default ``MODE_PROBS``).
     """
     if not frame_list_cv2:
         return ([], []) if return_masks else []
@@ -257,8 +297,8 @@ def process_video_frames(
     else:
         target_h, target_w = original_h, original_w
 
-    # ---- per clip: realistic or heavy mode
-    p = {**P, **P_HEAVY} if random.random() < HEAVY_PROB else P
+    # ---- per clip: degradation mode
+    p = sample_mode(mode_probs)
     deg_params = {  # MambaOFR's degradation_video_list_4 ranges
         "type_value": random.random(),
         "l1_value": random.random(),
@@ -291,7 +331,7 @@ def process_video_frames(
     moving_line_mode = random.randint(0, 2)
     last_moving_texture = None
     all_keys = texture_cache.get_all_keys()  # another texture set: no folder split
-    dust_keys = texture_cache.get_keys_in(DUST_FOLDERS) or all_keys
+    dust_keys = all_keys if p["tex_all_folders"] else (texture_cache.get_keys_in(DUST_FOLDERS) or all_keys)
     line_key = random.choice(texture_cache.get_keys_in(SCRATCH_FOLDERS) or all_keys)
 
     # ---- film + transfer, once per film frame
