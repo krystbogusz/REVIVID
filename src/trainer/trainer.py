@@ -424,9 +424,10 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader, epoch: int) -> dict:
         """The stage's inference path on the stored .mp4 pairs (inpaint: the model
-        finds the holes itself), in windows of num_frame; metrics of the output."""
+        finds the holes itself), in windows of ``validation.window`` frames;
+        metrics of the output."""
         self.net.eval()
-        win = int(self.tc.get("num_frame", 7))
+        win = int(self.vc.get("window", self.tc.get("num_frame", 7)))
         max_clips = int(self.vc.get("max_clips", 0))
         max_frames = int(self.vc.get("max_frames", 0))
         sums, count = {}, 0

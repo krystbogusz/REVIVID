@@ -65,7 +65,11 @@ training:
   backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 backbone; detector, flow completion, refiner train at lr
   batch_size: 2           # as your MambaOFR run (1 GPU x 2)
   num_frame: 7
-  gt_size: [256, 256]     # random GT crop [w, h]; the LQ crop is gt_size / sr_scale
+  # Random GT crop [w, h]; the LQ crop is gt_size / sr_scale = what the backbone
+  # sees: 256 x 256 as in MambaOFR (a 256 GT crop gave it only 128 x 128 - a
+  # quarter of MambaOFR's context and training pixels). Needs train clips of
+  # >= 512 px both ways (REDS: 1280 x 720). Out of memory: [384, 384].
+  gt_size: [512, 512]
   augment: true           # random flips / 90° rotation
   num_workers: 10
   # MambaOFR trains against a USM-sharpened GT (weight 0.5, radius 50,
@@ -127,6 +131,10 @@ validation:
   # PSNR, SSIM; best.pth = lowest LPIPS. gt_size [w, h] is the size
   # dataset.create_dataset writes the valid clips at (LQ = gt_size / sr_scale).
   gt_size: [640, 360]
+  # Frames per window. The model is recurrent: a longer window gives every frame
+  # more neighbours to take detail from (7-frame windows left the frames at their
+  # ends with one-sided context). MambaOFR tests with 20.
+  window: 20
   val_every: 10           # epochs
   max_clips: 0            # 0 = all
   max_frames: 0           # per clip, 0 = all

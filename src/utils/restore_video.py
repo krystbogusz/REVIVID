@@ -104,8 +104,8 @@ def main():
     parser.add_argument(
         "--clip-length",
         type=int,
-        default=7,
-        help="Number of frames per clip fed to the model. Should match training num_frame.",
+        default=20,
+        help="Frames per window fed to the model. Recurrent: longer = more temporal context (MambaOFR tests with 20).",
     )
     parser.add_argument(
         "--overlap",
