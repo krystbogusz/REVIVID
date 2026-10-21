@@ -6,9 +6,9 @@ No arguments needed — run it from anywhere (or from an IDE):
     python src/trainer/train.py --resume path.pth     # continue from a given checkpoint
     python src/trainer/train.py --config my.yaml      # another config
 
-Training continues automatically from <logging.exp_dir>/checkpoints/latest.pth
-when it exists; a phase-2 run without one starts from ``training.init_from``
-(the phase-1 weights).
+Training continues automatically from the phase's
+<logging.exp_dir>/p1|p2/checkpoints/latest.pth when it exists; a phase-2 run
+without one starts from <logging.exp_dir>/p1/checkpoints/best.pth.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from trainer.trainer import Trainer  # noqa: E402
 def main() -> None:
     p = argparse.ArgumentParser(description="Train REVIVID.")
     p.add_argument("--config", default=None, help="YAML config (default: config/REVIVID.yaml)")
-    p.add_argument("--resume", default=None, help="checkpoint (default: <exp_dir>/checkpoints/latest.pth)")
+    p.add_argument("--resume", default=None, help="checkpoint (default: <exp_dir>/p1|p2/checkpoints/latest.pth)")
     args = p.parse_args()
 
     trainer = Trainer(args.config)

@@ -92,14 +92,15 @@ def main():
         "-c",
         "--checkpoint",
         type=str,
-        default="./experiments/revivid_p2/checkpoints/best.pth",
-        help="Path to the model checkpoint (.pth); phase 1 or phase 2.",
+        default=None,
+        help="Model checkpoint (.pth), phase 1 or phase 2 "
+        "(default: <logging.exp_dir>/p2/checkpoints/best.pth of --config).",
     )
     parser.add_argument(
         "--config",
         type=str,
         default="./config/REVIVID.yaml",
-        help="Path to REVIVID.yaml (used when the checkpoint has no embedded config).",
+        help="Path to REVIVID.yaml (default checkpoint; model config when the checkpoint has none).",
     )
     parser.add_argument(
         "--clip-length",
@@ -138,7 +139,14 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    checkpoint = Path(args.checkpoint)
+    if args.checkpoint:
+        checkpoint = Path(args.checkpoint)
+    else:
+        with open(args.config, "r", encoding="utf-8") as f:
+            exp_dir = Path((yaml.safe_load(f) or {})["logging"]["exp_dir"])
+        if not exp_dir.is_absolute():
+            exp_dir = Path(__file__).resolve().parents[2] / exp_dir
+        checkpoint = exp_dir / "p2" / "checkpoints" / "best.pth"
     if not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 

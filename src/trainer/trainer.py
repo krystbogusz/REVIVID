@@ -7,13 +7,14 @@ Data (fixed layout, built by ``dataset.create_dataset``):
     data/training/train/*.mp4                  clean clips, degraded on the fly
     data/training/valid/{gt,degraded}/*.mp4    validation pairs
 
-Two phases (``training.stage`` in config/REVIVID.yaml), each its own experiment;
-a config value written as ``{restore: a, inpaint: b}`` takes the phase's one:
+Two phases (``training.stage`` in config/REVIVID.yaml), each its own run, both in
+one experiment folder: <logging.exp_dir>/p1 and <logging.exp_dir>/p2. A config
+value written as ``{restore: a, inpaint: b}`` takes the phase's one:
     restore  phase 1: removal of all degradations + SR; MambaOFR's network and
              recipe, trained from scratch. No holes in the data, the phase-2
              modules are off (``model.use_holes``)
-    inpaint  phase 2: fine-tuning of the whole phase-1 model
-             (``training.init_from``): holes burned in with ``model.hole_prob``;
+    inpaint  phase 2: fine-tuning of the whole phase-1 model (from phase 1's
+             best.pth): holes burned in with ``model.hole_prob``;
              hole detector, flow completion and inpainter train at ``lr``, the
              phase-1 part at ``backbone_lr_mult``; the model finds the holes itself
 
@@ -69,6 +70,7 @@ DATA_DIR = PROJECT_ROOT / "data" / "training"
 # MambaOFR: L1 1.0, perceptual 1.0, adversarial 0.01.
 DEFAULT_WEIGHTS = {"pix": 1.0, "perceptual": 1.0, "gan": 0.01, "detect": 0.05}
 STAGES = ("restore", "inpaint")
+STAGE_DIRS = {"restore": "p1", "inpaint": "p2"}  # subfolders of logging.exp_dir
 # Modules that only phase 2 trains (full lr there); the rest is the phase-1
 # model (backbone_lr_mult).
 INPAINT_MODULES = ("hole_detector.", "flow_completion.", "inpainter.")
@@ -152,9 +154,11 @@ class Trainer:
         self.device = dev = torch.device("cuda")
         torch.manual_seed(int(cfg.get("seed", 2026)))
 
-        self.exp_dir = Path(self.lc.get("exp_dir", "experiments/revivid"))
-        if not self.exp_dir.is_absolute():
-            self.exp_dir = PROJECT_ROOT / self.exp_dir
+        # One experiment folder for both phases: <exp_dir>/p1 and <exp_dir>/p2.
+        self.exp_root = Path(self.lc.get("exp_dir", "experiments/revivid"))
+        if not self.exp_root.is_absolute():
+            self.exp_root = PROJECT_ROOT / self.exp_root
+        self.exp_dir = self.exp_root / STAGE_DIRS[self.stage]
         (self.exp_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.exp_dir / "samples").mkdir(parents=True, exist_ok=True)
 
@@ -434,8 +438,7 @@ class Trainer:
     def fit(self, train_loader, val_loader=None, start_epoch: int = 1) -> None:
         epochs = int(self.tc.get("epochs", 2000))
         val_every = max(1, int(self.vc.get("val_every", 10)))
-        save_every = max(1, int(self.lc.get("save_checkpoint_every", 1)))
-        keep_every = int(self.lc.get("keep_checkpoint_every", 0))
+        save_every = max(1, int(self.lc.get("save_checkpoint_every", 10)))
         log_every = max(1, int(self.lc.get("log_every", 100)))
 
         for epoch in range(start_epoch, epochs + 1):
@@ -464,9 +467,8 @@ class Trainer:
             if best:
                 self._save("best.pth", epoch)
             if epoch % save_every == 0 or epoch == epochs:
-                self._save("latest.pth", epoch)
-            if keep_every > 0 and (epoch % keep_every == 0 or epoch == epochs):
                 self._save(f"epoch{epoch:04d}.pth", epoch)
+                self._save("latest.pth", epoch)
             print(f"[epoch {epoch}] done in {time.time() - t0:.1f}s")
 
     # ---------------------------------------------------------- checkpoints
@@ -515,13 +517,16 @@ class Trainer:
               + (f"; fresh: {missing}" if missing else "") + ")")
 
     def resume(self, path: Optional[str] = None) -> int:
-        """Continue from ``path`` or <exp_dir>/checkpoints/latest.pth (a checkpoint
-        of this same model); returns the next epoch, 1 when starting fresh (phase
-        2: from ``training.init_from``)."""
+        """Continue from ``path`` or this phase's <exp_dir>/pN/checkpoints/latest.pth
+        (a checkpoint of this same model); returns the next epoch, 1 when
+        starting fresh - phase 2 then starts from <exp_dir>/p1/checkpoints/best.pth."""
         path = Path(path) if path else self.exp_dir / "checkpoints" / "latest.pth"
         if not path.exists():
-            if self.inpaint and self.tc.get("init_from"):
-                self.init_from(self.tc["init_from"])
+            if self.inpaint:
+                p1_best = self.exp_root / STAGE_DIRS["restore"] / "checkpoints" / "best.pth"
+                if not p1_best.exists():
+                    raise FileNotFoundError(f"phase 2 starts from phase 1's best.pth, not found: {p1_best}")
+                self.init_from(p1_best)
             else:
                 print("[trainer] no checkpoint - starting fresh")
             return 1

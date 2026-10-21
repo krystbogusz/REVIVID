@@ -2,16 +2,17 @@
 # the whole window, aimed at REALISM: a viewer should not tell what was repaired.
 #
 # One network, trained in two phases picked by training.stage; each phase is
-# its own run (python src/trainer/train.py), resumed automatically from its
-# <exp_dir>/checkpoints/latest.pth. A value written as {restore: a, inpaint: b}
-# takes the one of the current phase.
+# its own run (python src/trainer/train.py), both in one experiment folder
+# (logging.exp_dir): p1/ and p2/, each resumed automatically from its
+# checkpoints/latest.pth. A value written as {restore: a, inpaint: b} takes the
+# one of the current phase.
 #   PHASE 1 — stage: restore
 #       removal of all degradations (dirt, scratches, blur, noise, compression)
 #       + 2x SR. MambaOFR's network and training recipe, trained from scratch;
 #       the target is at least MambaOFR's quality. No holes, the phase-2
 #       modules are off.
 #   PHASE 2 — stage: inpaint
-#       fine-tuning of the whole phase-1 model (training.init_from): it finds
+#       fine-tuning of the whole phase-1 model (p1/checkpoints/best.pth): it finds
 #       the burned-in holes itself and fills them (propagation from the frames
 #       where the content is visible + the Mamba inpainter for what no frame
 #       shows), with a stronger GAN so that no repair can be seen. Before it,
@@ -55,8 +56,6 @@ training:
   stage: restore          # restore = phase 1 | inpaint = phase 2
   # x 120 batches (240 clips / batch 2): 240k iterations as MambaOFR | 60k fine-tuning
   epochs: {restore: 2000, inpaint: 500}
-  # Phase 2 starts from these weights (EMA) when its exp_dir has no latest.pth.
-  init_from: experiments/revivid_p1_mambaofr/checkpoints/best.pth
   backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 part; detector, flow completion, inpainter train at lr
   batch_size: 2           # as your MambaOFR run (1 GPU x 2)
   num_frame: 7
@@ -128,9 +127,10 @@ validation:
   num_workers: 5
 
 logging:
-  exp_dir: {restore: ./experiments/revivid_p1_mambaofr, inpaint: ./experiments/revivid_p2}
+  # The experiment: phase 1 in <exp_dir>/p1, phase 2 in <exp_dir>/p2 (each with
+  # checkpoints/, samples/, loss_history.csv, config.yaml). Phase 2 starts from
+  # <exp_dir>/p1/checkpoints/best.pth (its EMA weights and discriminator).
+  exp_dir: ./experiments/revivid
   log_every: 120          # iterations
-  # latest.pth (what training resumes from) every this many epochs; numbered
-  # snapshots epochNNNN.pth every keep_checkpoint_every epochs (0 = none).
-  save_checkpoint_every: 1
-  keep_checkpoint_every: 100
+  # Every this many epochs: epochNNNN.pth + latest.pth (what training resumes from).
+  save_checkpoint_every: 10
