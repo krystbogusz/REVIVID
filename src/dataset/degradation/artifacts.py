@@ -1,244 +1,122 @@
-"""Low-level image degradation primitives for REVIVID dataset creation.
+"""MambaOFR's per-frame degradations (``VP_code/data/Data_Degradation/util.py``,
+the ops of ``degradation_v3`` and ``color_jitter``), one to one.
 
-All functions operate on single frames (torch tensors in [0, 1] or [0, 255]
-depending on convention — see each function's docstring). They are called by
-``pipeline.process_video_frames`` which handles batching and normalisation.
-
-Conventions that match MambaOFR (degradation_v3 / degradation_video_list_4):
-  - ``random_scaling`` supports bilinear / bicubic / lanczos, antialiased like
-    MambaOFR's PIL resize (torch ``antialias=True``, PIL itself for lanczos).
-  - ``apply_blur`` mirrors the borders, like ``ndimage.convolve(mode="mirror")``.
-  - ``apply_jpeg_artifact`` receives and returns a **greyscale uint8 ndarray** (H, W),
-    matching MambaOFR's PIL.convert("L") → BytesIO JPEG path.
+Every op takes and returns a greyscale PIL image ("L"): as in MambaOFR, the
+frame is quantised to uint8 (truncated) between the steps. MambaOFR runs them
+on three identical channels; one channel gives the same values.
 """
 
 from __future__ import annotations
 
-import math
-import os
 import random
-import shutil
-import subprocess
-import warnings
+from io import BytesIO
 
-import cv2
 import numpy as np
 import scipy.stats as ss
-import torch
-import torch.nn.functional as F
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
 from PIL import Image
+from scipy import ndimage
+
+RESAMPLE = (Image.BICUBIC, Image.BILINEAR, Image.LANCZOS)
 
 
-def random_scaling(img_tensor, target_w, target_h):
-    """Resize a (1, C, H, W) tensor in [0, 1] to (target_h, target_w).
-
-    Randomly selects bilinear, bicubic, or lanczos — matching MambaOFR's
-    random_scaling which draws from the same three methods with PIL. PIL
-    low-pass filters when shrinking, so bilinear / bicubic use torch's
-    PIL-compatible ``antialias=True``; lanczos, which torch lacks, goes
-    through PIL itself (OpenCV's lanczos does not antialias).
-    """
-    mode_choice = random.randint(0, 2)
-    if mode_choice == 2:
-        arr = (img_tensor[0].clamp(0.0, 1.0) * 255.0).round().byte().cpu().numpy()
-        resized = np.stack(
-            [
-                np.asarray(Image.fromarray(c).resize((target_w, target_h), Image.LANCZOS))
-                for c in arr
-            ]
-        )
-        return torch.from_numpy(resized).float().to(img_tensor.device).unsqueeze(0) / 255.0
-    torch_mode = "bilinear" if mode_choice == 0 else "bicubic"
-    return F.interpolate(
-        img_tensor,
-        size=(target_h, target_w),
-        mode=torch_mode,
-        align_corners=False,
-        antialias=True,
-    )
+def random_scaling(img, w, h):
+    """Resize to (w, h) with a random filter (``random_scaling``)."""
+    return img.resize((w, h), random.choice(RESAMPLE))
 
 
-def apply_downsampling(img_tensor, params):
-    _, _, img_h, img_w = img_tensor.shape
-    rand_num = params["rnum"]
-
-    if rand_num > 0.8:
-        scale_factor = params["up_scale"]
-    elif rand_num < 0.7:
-        scale_factor = params["down_scale"]
+def apply_downsampling(img, params):
+    """Rescale by the clip's factor (``downsampling_artifact_v3_fixed``): up
+    with p 0.2, down with p 0.7, else unchanged."""
+    w, h = img.size
+    if params["rnum"] > 0.8:
+        sf = params["up_scale"]
+    elif params["rnum"] < 0.7:
+        sf = params["down_scale"]
     else:
-        scale_factor = 1.0
-
-    new_w = int(scale_factor * img_w)
-    new_h = int(scale_factor * img_h)
-
-    if scale_factor != 1.0:
-        return random_scaling(img_tensor, new_w, new_h)
-    return img_tensor
-
-
-def apply_jpeg_artifact(img_gray: np.ndarray, quality: int) -> np.ndarray:
-    """Apply JPEG compression artefacts to a **greyscale uint8** frame (H, W).
-
-    Matches MambaOFR's ``jpeg_artifact_v2`` which encodes a PIL grayscale image
-    via BytesIO and decodes back — both paths yield equivalent blocking/ringing
-    artefacts on a single-channel signal.
-
-    Args:
-        img_gray: uint8 ndarray of shape (H, W) — greyscale frame.
-        quality:  base JPEG quality [40, 100].
-
-    Returns:
-        uint8 ndarray (H, W) after JPEG encode/decode.
-    """
-    quality_variance = random.randint(-15, 15)
-    new_quality = int(np.clip(quality + quality_variance, 40, 100))
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), new_quality]
-    success, encoded_img = cv2.imencode(".jpg", img_gray, encode_param)
-    if success:
-        return cv2.imdecode(encoded_img, cv2.IMREAD_GRAYSCALE)
-    return img_gray
+        sf = 1.0
+    return random_scaling(img, int(sf * w), int(sf * h))
 
 
 def gm_blur_kernel(mean, cov, size=15):
     center = size / 2.0 + 0.5
-    kernel = np.zeros([size, size])
-    for y in range(size):
-        for x in range(size):
-            cy = y - center + 1
-            cx = x - center + 1
-            kernel[y, x] = ss.multivariate_normal.pdf([cx, cy], mean=mean, cov=cov)
-    return kernel / np.sum(kernel)
+    c = np.arange(size) - center + 1
+    cx, cy = np.meshgrid(c, c)
+    k = ss.multivariate_normal.pdf(np.stack([cx, cy], -1), mean=mean, cov=cov)
+    return k / np.sum(k)
 
 
-def anisotropic_gaussian_kernel(ksize=15, theta=np.pi, l1=6, l2=6):
-    v = np.dot(
-        np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]),
-        np.array([1.0, 0.0]),
-    )
-    v_matrix = np.array([[v[0], v[1]], [v[1], -v[0]]])
-    d_matrix = np.array([[l1, 0], [0, l2]])
-    sigma = np.dot(np.dot(v_matrix, d_matrix), np.linalg.inv(v_matrix))
+def anisotropic_gaussian(ksize=15, theta=np.pi, l1=6, l2=6):
+    v = np.dot(np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]), np.array([1.0, 0.0]))
+    V = np.array([[v[0], v[1]], [v[1], -v[0]]])
+    D = np.array([[l1, 0], [0, l2]])
+    sigma = np.dot(np.dot(V, D), np.linalg.inv(V))
     return gm_blur_kernel(mean=[0, 0], cov=sigma, size=ksize)
 
 
 def fspecial_gaussian(hsize, sigma):
-    siz = [(hsize - 1.0) / 2.0, (hsize - 1.0) / 2.0]
-    x, y = np.meshgrid(np.arange(-siz[1], siz[1] + 1), np.arange(-siz[0], siz[0] + 1))
-    arg = -(x * x + y * y) / (2 * sigma * sigma)
-    h = np.exp(arg)
+    siz = (hsize - 1.0) / 2.0
+    x, y = np.meshgrid(np.arange(-siz, siz + 1), np.arange(-siz, siz + 1))
+    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
     h[h < np.finfo(float).eps * h.max()] = 0
-    sum_h = h.sum()
-    if sum_h != 0:
-        h = h / sum_h
+    if h.sum() != 0:
+        h = h / h.sum()
     return h
 
 
-def apply_blur(img_tensor, params):
-    device = img_tensor.device
+def _jitter(value, spread):
+    return float(np.clip(value + (random.random() - 0.5) / spread, 1e-8, 1 - 1e-8))
+
+
+def apply_blur(img, params):
+    """The clip's anisotropic or isotropic Gaussian, jittered per frame (``add_blur_fixed``)."""
     wd2 = 4.0 + 4
     wd = 2.0 + 0.2 * 4
-
+    ksize = 2 * params["shape_value"] + 3
     if params["type_value"] < 0.5:
-        l1 = wd2 * float(
-            np.clip(params["l1_value"] + (random.random() - 0.5) / 10.0, 1e-8, 1 - 1e-8)
-        )
-        l2 = wd2 * float(
-            np.clip(params["l2_value"] + (random.random() - 0.5) / 10.0, 1e-8, 1 - 1e-8)
-        )
-        theta = (
-            float(
-                np.clip(
-                    params["angle_value"] + (random.random() - 0.5) / 5.0,
-                    1e-8,
-                    1 - 1e-8,
-                )
-            )
-            * np.pi
-        )
-        kernel = anisotropic_gaussian_kernel(
-            ksize=2 * params["shape_value"] + 3, theta=theta, l1=l1, l2=l2
-        )
+        l1 = wd2 * _jitter(params["l1_value"], 10.0)
+        l2 = wd2 * _jitter(params["l2_value"], 10.0)
+        k = anisotropic_gaussian(ksize=ksize, theta=_jitter(params["angle_value"], 5.0) * np.pi, l1=l1, l2=l2)
     else:
-        sigma = wd * float(
-            np.clip(params["l1_value"] + (random.random() - 0.5) / 10.0, 1e-8, 1 - 1e-8)
-        )
-        kernel = fspecial_gaussian(2 * params["shape_value"] + 3, sigma)
-
-    kernel_tensor = torch.tensor(kernel, dtype=torch.float32, device=device)
-    kernel_tensor = kernel_tensor.view(
-        1, 1, kernel_tensor.shape[0], kernel_tensor.shape[1]
-    )
-    kernel_tensor = kernel_tensor.repeat(img_tensor.shape[1], 1, 1, 1)
-
-    # Mirrored borders, as MambaOFR's ndimage.convolve(mode="mirror"): zero
-    # padding would darken a band as wide as the kernel radius.
-    padding = kernel_tensor.shape[-1] // 2
-    padded = F.pad(img_tensor, (padding, padding, padding, padding), mode="reflect")
-    return F.conv2d(padded, kernel_tensor, groups=img_tensor.shape[1])
+        k = fspecial_gaussian(ksize, wd * _jitter(params["l1_value"], 10.0))
+    x = ndimage.convolve(np.asarray(img, np.float32) / 255.0, k, mode="mirror")
+    return Image.fromarray(np.clip(x * 255, 0, 255).astype(np.uint8))
 
 
-def apply_color_jitter(img_tensor):
-    # Every frame: MambaOFR's A.ColorJitter(always_apply=True, p=0.5) always applies.
-    jitter = T.ColorJitter(
-        brightness=[0.8, 1.2], contrast=[0.9, 1.0], saturation=[1.0, 1.0], hue=0.0
-    )
-    return jitter(img_tensor)
+def apply_noise(img, std):
+    """Gaussian or speckle noise, the clip's std jittered per frame
+    (``gaussian_noise_artifact_v2`` / ``speckle_noise_artifact_v2``)."""
+    speckle = random.choice([1, 2]) == 2
+    x = np.asarray(img, np.float32) / 255.0
+    std = np.clip(std + random.uniform(-0.5, 0.5) / 255.0, 5.0 / 255.0, 10.0 / 255.0)
+    gauss = np.random.normal(loc=0.0, scale=std, size=x.shape)
+    noisy = x + gauss * x if speckle else x + gauss
+    noisy = np.clip(noisy, 0, 1).astype(np.float32)
+    return Image.fromarray(np.clip(noisy * 255, 0, 255).astype(np.uint8))
 
 
-def apply_tone(img_tensor, black: float, white: float, gamma: float):
-    """Faded print / transfer tone curve on [0, 1]: ``black + (white - black) * x ** gamma``."""
-    return black + (white - black) * img_tensor.clamp(0.0, 1.0) ** gamma
+def apply_jpeg(img, quality):
+    """JPEG round trip at the clip's quality +- 15 (``jpeg_artifact_v2``)."""
+    q = int(np.clip(quality + random.randint(-15, 15), 40, 100))
+    with BytesIO() as f:
+        img.save(f, format="JPEG", quality=q)
+        f.seek(0)
+        return Image.open(f).convert("L")
 
 
-_FFMPEG = shutil.which(os.environ.get("REVIVID_FFMPEG", "ffmpeg"))
-if _FFMPEG is None:
-    warnings.warn("ffmpeg not found: the H.264 upload stage of the degradation falls back to per-frame JPEG")
-
-
-def apply_video_codec(frames: np.ndarray, crf: int, deblock: int = 0, fallback_quality: int = 50) -> np.ndarray:
-    """H.264 round trip of a greyscale clip (T, H, W) uint8, as the 360p uploads
-    the real films come from: block artefacts on the frame's own pixel grid,
-    flattened grain, smeared fine texture; ``deblock`` is x264's loop-filter
-    offset (higher = smoother block edges). Uses the ``ffmpeg`` binary
-    (``REVIVID_FFMPEG`` overrides the name); without it, per-frame JPEG."""
-    t, h, w = frames.shape
-    if _FFMPEG is None:
-        return np.stack([apply_jpeg_artifact(f, fallback_quality) for f in frames])
-    # yuv420p needs even sizes: replicate the last row / column, crop it off again
-    ph, pw = h + h % 2, w + w % 2
-    x = np.pad(frames, ((0, 0), (0, ph - h), (0, pw - w)), mode="edge") if (ph, pw) != (h, w) else frames
-    enc = subprocess.run(
-        [_FFMPEG, "-v", "error", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{pw}x{ph}", "-r", "25",
-         "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(int(crf)), "-deblock", f"{int(deblock)}:{int(deblock)}",
-         "-pix_fmt", "yuv420p", "-f", "h264", "-"],
-        input=np.ascontiguousarray(x).tobytes(), capture_output=True, check=True,
-    ).stdout
-    dec = subprocess.run(
-        [_FFMPEG, "-v", "error", "-f", "h264", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
-        input=enc, capture_output=True, check=True,
-    ).stdout
-    out = np.frombuffer(dec, np.uint8).reshape(-1, ph, pw)[:t, :h, :w]
-    if len(out) < t:  # the decoder never drops frames, but stay total
-        out = np.concatenate([out, np.repeat(out[-1:], t - len(out), 0)])
-    return out.copy()
-
-
-def apply_noise(img_tensor, std, noise_type="gaussian", grain_size=0.0):
-    """Additive (gaussian) or signal-proportional (speckle) noise of ``std``;
-    ``grain_size`` > 0 (px) clumps it like film grain, at the same std."""
-    noise = torch.randn_like(img_tensor)
-    if grain_size > 0:
-        k = 2 * int(math.ceil(3 * grain_size)) + 1
-        noise = TF.gaussian_blur(noise, [k, k], [grain_size, grain_size])
-        noise = noise / noise.std().clamp(min=1e-6)
-    noise = noise * std
-
-    if noise_type == "gaussian":
-        noisy_img = img_tensor + noise
-    else:
-        noisy_img = img_tensor + noise * img_tensor
-
-    return torch.clamp(noisy_img, 0.0, 1.0)
+def apply_color_jitter(img):
+    """MambaOFR's ``A.ColorJitter(brightness=[0.8, 1.2], contrast=[0.9, 1.0],
+    saturation=1, hue=0, always_apply=True)`` on a grey frame, as in its
+    albumentations 1.4.14: applied to every frame, brightness and contrast in
+    random order (saturation and hue are identities here). Implemented here
+    because albumentations 2 drops ``always_apply`` and would jitter only half
+    of the frames."""
+    x = np.asarray(img)
+    brightness = random.uniform(0.8, 1.2)
+    contrast = random.uniform(0.9, 1.0)
+    for op in random.sample(("brightness", "contrast"), 2):
+        if op == "brightness":
+            lut = np.arange(256) * brightness
+        else:
+            lut = np.arange(256) * contrast + x.mean() * (1 - contrast)
+        x = np.clip(lut, 0, 255).astype(np.uint8)[x]
+    return Image.fromarray(x)

@@ -1,28 +1,30 @@
 # REVIVID — old film restoration + 2x SR + inpainting of holes burned through
 # the whole window, aimed at REALISM: a viewer should not tell what was repaired.
 #
-# Training in two phases, picked by training.stage; each phase is its own run
-# (python src/trainer/train.py). A value written as {restore: a, inpaint: b}
+# One network, trained in two phases picked by training.stage; each phase is
+# its own run (python src/trainer/train.py), resumed automatically from its
+# <exp_dir>/checkpoints/latest.pth. A value written as {restore: a, inpaint: b}
 # takes the one of the current phase.
 #   PHASE 1 — stage: restore
-#       removal of all degradations (dirt, scratches, blur, noise, flicker,
-#       compression) + 2x SR. MambaOFR's backbone and training recipe; the
-#       target is at least MambaOFR's quality. No holes, the model has no hole
-#       machinery switched on.
+#       removal of all degradations (dirt, scratches, blur, noise, compression)
+#       + 2x SR. MambaOFR's network and training recipe, trained from scratch;
+#       the target is at least MambaOFR's quality. No holes, the phase-2
+#       modules are off.
 #   PHASE 2 — stage: inpaint
-#       fine-tuning of the phase-1 model (training.init_from): it finds the
-#       burned-in holes itself and fills them (diffusion refiner) so that the
-#       repair cannot be seen. Before it, recreate the validation pairs with
-#       holes:  PYTHONPATH=src python -m dataset.create_dataset valid --valid <sources>
+#       fine-tuning of the whole phase-1 model (training.init_from): it finds
+#       the burned-in holes itself and fills them (propagation from the frames
+#       where the content is visible + the Mamba inpainter for what no frame
+#       shows), with a stronger GAN so that no repair can be seen. Before it,
+#       recreate the validation pairs with holes:
+#           PYTHONPATH=src python -m dataset.create_dataset valid --valid <sources>
 #
 # Data (dataset.create_dataset): data/training/train/*.mp4, data/training/valid/{gt,degraded}/*.mp4
 
 seed: 2026
 
 model:
-  # Backbone = MambaOFR's RNN_Swin_4 one to one (3.48 M params without RAFT) on
-  # the LR input, + 2x SR in its tail (PixelShuffle up1 and bilinear global
-  # residual, which MambaOFR has at scale 1). Trained from scratch.
+  # MambaOFR's RNN_Swin_4 one to one (3.48 M params without RAFT) on the LR
+  # input; the SR is done by its BasicVSR-style tail. Trained from scratch.
   num_feat: 16            # propagated state channels
   embed_dim: 64           # Mamba restorer width, one restorer per propagation direction
   depths: [2, 2, 2]       # VSS blocks per residual group
@@ -30,30 +32,23 @@ model:
   ssm_expand: 1.2         # SS2D inner expansion (MambaOFR's mlp_ratio)
   dyn_kernels: 8          # degradation-aware prompt: kernels mixed per frame
   drop_path: 0.1          # stochastic depth (MambaIR default, inherited by MambaOFR)
-  sr_scale: 2             # SR factor of the tail; GT / degraded size of the datasets
   # Optical flow, torchvision RAFT: sintel = MambaOFR's raft-sintel.pth | large | small
   raft: sintel
   raft_iters: 24          # MambaOFR: 24
+  # Tail: fusion of both directions -> conv + PixelShuffle x sr_scale -> convs
+  # at HR, + the bilinear-upsampled input. MambaOFR's tail is 16 wide (made for
+  # scale 1); 64 as BasicVSR's gives the HR detail capacity. Out of memory: 32.
+  sr_scale: 2             # SR factor; GT / degraded size of the datasets
+  tail_feat: 64
 
-  # ---- phase 2 (inpainting); built in phase 1 too, so every checkpoint holds
-  # the whole model. model.use_holes is set by the trainer from training.stage.
-  cond_dim: 64            # backbone features handed to the refiner
-  refiner_base: 48
-  channel_mult: [1, 2, 3]
-  num_res_blocks: 2
-  refiner_temporal_levels: [1, 2]   # UNet levels with attention across the frames
-  num_timesteps: 1000
-  refine_steps: 8         # DDIM steps at inference
-  min_snr_gamma: 5.0      # Min-SNR weighting of the diffusion loss (0 = off)
-  # The diffusion target is (gt - coarse) / running std of it inside the holes.
-  residual_std_init: 0.15
-  residual_std_momentum: 0.99
-  residual_std_warmup: 200
-  residual_std_min: 0.001
-  # Detector probability above which a pixel is a hole. hole_pos_weight = 10
-  # inflates the probabilities: 0.9 ~ a true 50 %.
+  # ---- phase 2; built in phase 1 too, so every checkpoint holds the whole
+  # model. model.use_holes is set by the trainer from training.stage.
+  inpaint_dim: 64         # Mamba inpainter: width and VSS blocks per group
+  inpaint_depths: [2, 2, 2]
+  # Detector probability above which the input is pre-filled. hole_pos_weight
+  # = 10 inflates the probabilities: 0.9 ~ a true 50 %.
   hole_threshold: 0.9
-  refine_mask_dilate: 8   # refiner region = detected holes dilated by this (HR px)
+  inpaint_dilate: 4       # the inpainter acts on the hole probability dilated by this (LR px)
   hole_prob: 0.25         # prob. a window gets holes burned in (phase 2 training + its valid pairs)
 
 training:
@@ -62,7 +57,7 @@ training:
   epochs: {restore: 2000, inpaint: 500}
   # Phase 2 starts from these weights (EMA) when its exp_dir has no latest.pth.
   init_from: experiments/revivid_p1_mambaofr/checkpoints/best.pth
-  backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 backbone; detector, flow completion, refiner train at lr
+  backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 part; detector, flow completion, inpainter train at lr
   batch_size: 2           # as your MambaOFR run (1 GPU x 2)
   num_frame: 7
   # Random GT crop [w, h]; the LQ crop is gt_size / sr_scale = what the backbone
@@ -76,28 +71,22 @@ training:
   # threshold 10): crisper output instead of the average of what the input
   # allows. 0 = off. Validation always compares with the unsharpened GT.
   gt_usm: 0.5
-  # Degradation mode of each training clip (dataset/degradation/pipeline.py):
-  # realistic = calibrated on old film uploads (dust on few frames), heavy = past
-  # their p90, dirty = MambaOFR's damage density (dirt on every frame). Without
-  # the dirty clips the model saw too little dirt to learn to remove it.
-  degradation_modes: {realistic: 0.4, heavy: 0.2, dirty: 0.4}
 
-  # MambaOFR: Adam(0.9, 0.999), lr 2e-4 constant for half of the run, then a
-  # linear decay; phase 2 fine-tunes at half of it.
+  # MambaOFR's schedule (your run's log): Adam(0.9, 0.999), lr 2e-4 for the
+  # first 60 % of the run, then 8 equal steps down, one per 12k iterations
+  # (100 epochs here): 1.8e-4, 1.6e-4 ... the last 12k iterations at 4e-5 =
+  # 0.2 * lr. The discriminator follows in proportion. Phase 2 fine-tunes at
+  # half of it, with the same shape.
   lr: {restore: 0.0002, inpaint: 0.0001}
-  lr_min: 0.000001
-  lr_steady: 0.5
+  lr_min: {restore: 0.00004, inpaint: 0.00002}   # lr of the last step
+  lr_steady: 0.6          # fraction of the epochs at the full lr
+  lr_steps: 8             # equal steps from lr down to lr_min
   beta1: 0.9
   beta2: 0.999
   # Optimizer steps every grad_accum batches (effective batch = batch_size * grad_accum).
   grad_accum: 1
   grad_clip: 0            # max gradient norm, 0 = off (MambaOFR); the log shows gnorm
   ema_decay: 0.999        # EMA weights are used for validation and inference
-
-  # RAFT is frozen for the first N iterations, then fine-tuned at lr * flow_lr_mul
-  # (-1 = always frozen). MambaOFR's code keeps it frozen (its flow runs under no_grad).
-  raft_unfreeze_iter: -1
-  flow_lr_mul: 0.125
 
   hole_loss_boost: 3.0    # true-hole pixels weigh 1 + this in `pix` (phase 2)
   hole_pos_weight: 10.0   # BCE weight of the hole class (phase 2)
@@ -107,33 +96,31 @@ training:
   loss_weights:
     pix: 1.0              # Charbonnier(out, gt)            MambaOFR: L1, 1.0
     perceptual: 1.0       # VGG19 relu1_1..relu5_1          MambaOFR: 1.0
-    gan: 0.01             # hinge, see gan:                 MambaOFR: 0.01
-    temporal: 0.0         # flicker vs the GT's own motion (not in MambaOFR)
-    # Off in phase 1: L1 on Sobel gradients favours flat patches with sharp
-    # edges where the input leaves detail uncertain, and the phase-free FFT
-    # amplitude loss rewards any high-frequency energy - together the
-    # "watercolour" look of run v8. Sharpness comes from gt_usm + GAN instead.
-    fft: 0.0
-    grad: 0.0
+    # Hinge vs MambaOFR's 3-D clip discriminator (MambaOFR: 0.01). Phase 2
+    # pushes realism - filled holes and the places of removed dirt must not
+    # look painted; a starting point to tune by eye.
+    gan: {restore: 0.01, inpaint: 0.05}
     detect: 0.05          # phase 2: hole detector BCE vs the true mask
-    v: 1.0                # phase 2: refiner diffusion loss inside the true holes
 
   gan:
-    type: temporal        # temporal = MambaOFR's 3-D clip discriminator | projected = VGG patch heads
     start_iter: 0         # MambaOFR trains the GAN from the first iteration
     d_lr: 0.0002          # decays together with lr
     beta1: 0.9
     beta2: 0.999
 
 validation:
-  # The phase's inference path on the stored valid pairs (data/training/valid;
-  # phase 2: the model finds the holes itself); LPIPS, flicker, sharpness,
-  # PSNR, SSIM; best.pth = lowest LPIPS. gt_size [w, h] is the size
-  # dataset.create_dataset writes the valid clips at (LQ = gt_size / sr_scale).
+  # The model on the stored valid pairs (data/training/valid; phase 2: it
+  # finds the holes itself): PSNR, SSIM, the same at LR (psnr_lr / ssim_lr =
+  # output and GT downscaled to the input size: MambaOFR's task on the same
+  # input, comparable with MambaOFR run on the degraded clips), LPIPS,
+  # flicker, sharpness. gt_size [w, h] is the size dataset.create_dataset
+  # writes the valid clips at (LQ = gt_size / sr_scale).
   gt_size: [640, 360]
+  # best.pth: phase 1 the highest PSNR (fidelity), phase 2 the lowest LPIPS
+  # (realism). Any validation metric: psnr, ssim, psnr_lr, ssim_lr, lpips, flicker.
+  best_metric: {restore: psnr, inpaint: lpips}
   # Frames per window. The model is recurrent: a longer window gives every frame
-  # more neighbours to take detail from (7-frame windows left the frames at their
-  # ends with one-sided context). MambaOFR tests with 20.
+  # more neighbours to take detail from. MambaOFR tests with 20.
   window: 20
   val_every: 10           # epochs
   max_clips: 0            # 0 = all
@@ -141,8 +128,9 @@ validation:
   num_workers: 5
 
 logging:
-  # revivid_p1 (the earlier 32-channel backbone) does not fit this model.
   exp_dir: {restore: ./experiments/revivid_p1_mambaofr, inpaint: ./experiments/revivid_p2}
   log_every: 120          # iterations
-  # `python src/trainer/train.py` continues from <exp_dir>/checkpoints/latest.pth automatically.
-  save_checkpoint_every: 10   # epochs (numbered + latest.pth)
+  # latest.pth (what training resumes from) every this many epochs; numbered
+  # snapshots epochNNNN.pth every keep_checkpoint_every epochs (0 = none).
+  save_checkpoint_every: 1
+  keep_checkpoint_every: 100

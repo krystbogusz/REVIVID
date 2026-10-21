@@ -1,11 +1,12 @@
-"""Restoration + 2x SR backbone: MambaOFR (CVPR 2025) one to one plus 2x SR,
-prepared for the inpainting of persistent holes (burned-in regions that stay
-for the whole clip).
+"""REVIVID: MambaOFR (CVPR 2025) one to one + 2x SR + inpainting of holes
+burned through the whole window. One network for both training phases;
+``use_holes`` (from ``training.stage``) switches the phase-2 modules on.
 
-The network is MambaOFR's ``RNN_Swin_4.Video_Backbone`` - same modules, same
-forward, run on the LR input - with the SR its own tail is built for: that tail
-comes from BasicVSR, with the PixelShuffle upsampler ``up1`` and the global
-residual ``img_up`` set to scale 1; here they are set to ``sr_scale``.
+The restoration is MambaOFR's ``RNN_Swin_4.Video_Backbone`` - same modules,
+same forward, run on the LR input - with the SR its own tail is built for: that
+tail comes from BasicVSR, with the PixelShuffle upsampler ``up1`` and the
+global residual ``img_up`` set to scale 1; here they are set to ``sr_scale``
+and the tail is ``tail_feat`` wide (MambaOFR: 16 = ``num_feat``).
 
 Per clip ``lrs`` (N, T, 3, h, w) in [-1, 1]:
 
@@ -19,38 +20,44 @@ Per clip ``lrs`` (N, T, 3, h, w) in [-1, 1]:
                    warped previous M); state = M * aligned + (1 - M) * latent -
                    keeps scratches / dirt of single frames from propagating
      ``restorer``  MambaIR with the degradation-aware prompt blocks
-3. Reconstruction (MambaOFR's tail): fuse both directions, ``up1`` conv +
-   PixelShuffle x ``sr_scale``, two convs, + the bilinear-upsampled input, tanh.
+3. Reconstruction (MambaOFR's tail): fuse both directions (``concate``),
+   ``up1`` conv + PixelShuffle x ``sr_scale``, two convs, + the
+   bilinear-upsampled input, tanh.
 
-Inpainting (phase 2, ``use_holes``; off in phase 1, where the model is exactly
-the above) adds no weights to MambaOFR's modules: ``HoleDetector`` finds the
-holes at LR (nobody tells the model where they are), ``push_pull_fill``
-pre-fills them so the flow is not pinned to 0, ``FlowCompletion`` re-estimates
-the flow inside them, the mask M is floored at the hole probability (the state
-is carried over the hole, content seen in other frames survives until it is
-used) and a validity map tracks how much of the state comes from real
-observations - conditioning of the refiner.
+Phase 2 (``use_holes``; off in phase 1, where the model is exactly the above).
+Nobody tells the model where the holes are:
+    * ``hole_detector``   hole logits at LR from the frame and the clip's
+                          temporal min / max / std of luma (a burned hole is
+                          constant in time, dark content moves or has grain)
+    * ``push_pull_fill``  pre-fills the detected holes of the input, so the
+                          flow and the features are not pinned to black
+    * ``flow_completion`` re-estimates the flow inside the holes
+    * M is floored at the hole probability: inside a hole the state is carried
+      over, so content seen in other frames (camera motion) propagates into
+      it; a validity map tracks how much of the state comes from real
+      observations
+    * ``inpainter``       MambaIR on both directions' states + hole probability
+                          + validity: invents what no frame shows (global
+                          receptive field of the 2-D scan). Its output is
+                          added to the fused feature inside the dilated holes,
+                          and it is zero-initialised: phase 2 starts from
+                          exactly the phase-1 output.
 
-Outputs (HR = h * sr_scale unless noted):
-    * ``coarse``      (N, T, 3, H, W) restored frames
-    * ``cond``        (N, T, cond_dim, H, W) features for the refiner
-    * ``hole_logits`` (N, T, 1, h, w) hole detector logits at LR (-20 = no hole
-                      when ``use_holes`` is off)
-    * ``validity``    (N, T, 1, H, W) share of the state from real observations
-    * ``flow_fwd``    (N, T-1, 2, h, w) flow at LR, ``[:, k]`` maps frame k+1
-                      onto frame k
+Outputs: ``out`` (N, T, 3, h * sr_scale, w * sr_scale) restored clip and,
+with ``use_holes``, ``hole_logits`` (N, T, 1, h, w).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import deform_conv2d
 
+from .config import ModelConfig
 from .flow import build_flow_estimator, flow_warp
 from .mamba_blocks import MambaRestorer
 
@@ -202,51 +209,44 @@ class MaskGenerator(nn.Module):
 _DIRS = ("bwd", "fwd")  # "forward" would clash with nn.Module.forward
 
 
-class ConditioningBackbone(nn.Module):
-    def __init__(
-        self,
-        num_feat: int = 16,
-        embed_dim: int = 64,
-        depths: Sequence[int] = (2, 2, 2),
-        d_state: int = 16,
-        ssm_expand: float = 1.2,
-        dyn_kernels: int = 8,
-        drop_path: float = 0.1,
-        cond_dim: int = 64,
-        sr_scale: int = 2,
-        hole_threshold: float = 0.9,
-        raft: str = "sintel",
-        raft_iters: int = 24,
-        use_holes: bool = False,
-    ):
+class Video_Backbone(nn.Module):
+    def __init__(self, config: Optional[ModelConfig] = None):
         super().__init__()
-        self.sr_scale = sr_scale
-        self.hole_threshold = hole_threshold
-        # Phase 2 switch (not saved in the state dict, set from ModelConfig).
-        self.use_holes = use_holes
-        c = num_feat
+        self.cfg = cfg = config or ModelConfig()
+        # Phase 2 switch (not saved in the state dict; stored in the checkpoint's model_config).
+        self.use_holes = cfg.use_holes
+        c, f, s = cfg.num_feat, cfg.tail_feat, cfg.sr_scale
 
-        self.hole_detector = HoleDetector()
-        self.flow_net = build_flow_estimator(raft, raft_iters)
-        self.flow_completion = FlowCompletion()
-
+        self.flow_net = build_flow_estimator(cfg.raft, cfg.raft_iters)
         self.proj = nn.ModuleDict({d: nn.Conv2d(3, c, 3, 1, 1) for d in _DIRS})
         self.align = nn.ModuleDict({d: FlowGuidedDCN(c) for d in _DIRS})
         self.agg = nn.ModuleDict({d: MaskGenerator(c) for d in _DIRS})
-        self.restorer = nn.ModuleDict(
-            {d: MambaRestorer(c, embed_dim, tuple(depths), d_state, ssm_expand, dyn_kernels, drop_path) for d in _DIRS}
-        )
+        self.restorer = nn.ModuleDict({
+            d: MambaRestorer(c, cfg.embed_dim, tuple(cfg.depths), cfg.d_state, cfg.ssm_expand,
+                             cfg.dyn_kernels, cfg.drop_path)
+            for d in _DIRS
+        })
         for d in _DIRS:
             nn.init.kaiming_normal_(self.proj[d].weight)
 
-        self.concate = nn.Conv2d(2 * c, c, 3, 1, 1)
-        # MambaOFR's PSUpsample(c, c, scale): conv to c * scale^2 + PixelShuffle.
-        self.up1 = nn.Sequential(nn.Conv2d(c, c * sr_scale**2, 3, 1, 1), nn.PixelShuffle(sr_scale))
-        self.up2 = nn.Conv2d(c, c, 3, 1, 1)
-        self.conv_hr = nn.Conv2d(c, c, 3, 1, 1)
-        self.conv_last = nn.Conv2d(c, 3, 3, 1, 1)
-        self.cond_head = nn.Conv2d(c, cond_dim, 3, 1, 1)
+        self.concate = nn.Conv2d(2 * c, f, 3, 1, 1)
+        # MambaOFR's PSUpsample(f, f, scale): conv to f * scale^2 + PixelShuffle.
+        self.up1 = nn.Sequential(nn.Conv2d(f, f * s**2, 3, 1, 1), nn.PixelShuffle(s))
+        self.up2 = nn.Conv2d(f, f, 3, 1, 1)
+        self.conv_hr = nn.Conv2d(f, f, 3, 1, 1)
+        self.conv_last = nn.Conv2d(f, 3, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(0.1, inplace=True)
+
+        # ---- phase 2
+        self.hole_detector = HoleDetector()
+        self.flow_completion = FlowCompletion()
+        # Input: both directions' states, hole probability, validity.
+        self.inpainter = MambaRestorer(
+            2 * c + 2, cfg.inpaint_dim, tuple(cfg.inpaint_depths), cfg.d_state, cfg.ssm_expand,
+            cfg.dyn_kernels, cfg.drop_path, out_ch=f,
+        )
+        nn.init.zeros_(self.inpainter.conv_last.weight)
+        nn.init.zeros_(self.inpainter.conv_last.bias)
 
     def _comp_flow(self, frames: torch.Tensor, m: torch.Tensor):
         """(forward_flow, backward_flow), each (N, T-1, 2, h, w).
@@ -293,23 +293,22 @@ class ConditioningBackbone(nn.Module):
         return self.restorer[d](feat), mask, validity
 
     def forward(self, lrs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            lrs: (N, T, 3, h, w) LQ input.
-
-        Returns ``coarse``, ``cond``, ``validity`` at the output resolution and
-        ``hole_logits``, ``flow_fwd`` at the input (LR) resolution.
-        """
+        """``lrs`` (N, T, 3, h, w) LQ input -> ``out`` and, with ``use_holes``,
+        ``hole_logits`` (see the module docstring)."""
         n, t, c, h, w = lrs.size()
+        out = {}
 
         if self.use_holes:
             hole_logits = self.hole_detector(lrs)
+            out["hole_logits"] = hole_logits
             m = torch.sigmoid(hole_logits).detach()
             x = push_pull_fill(
-                lrs.reshape(n * t, c, h, w), 1.0 - (m > self.hole_threshold).to(lrs.dtype).reshape(n * t, 1, h, w)
+                lrs.reshape(n * t, c, h, w),
+                1.0 - (m > self.cfg.hole_threshold).to(lrs.dtype).reshape(n * t, 1, h, w),
             ).view(n, t, c, h, w)
+            k = int(self.cfg.inpaint_dilate)
+            gate = F.max_pool2d(m.reshape(n * t, 1, h, w), 2 * k + 1, 1, k).view(n, t, 1, h, w)
         else:
-            hole_logits = lrs.new_full((n, t, 1, h, w), -20.0)
             m = lrs.new_zeros(n, t, 1, h, w)
             x = lrs
 
@@ -322,27 +321,29 @@ class ConditioningBackbone(nn.Module):
             back[i] = self._step("bwd", x[:, i], m[:, i], prev)
 
         # ---- forward propagation (0 -> t-1), reconstructing each frame on the fly
-        coarse_out, cond_out, val_out = [], [], []
+        frames = []
         state = None
         for i in range(t):
             prev = (*state, x[:, i - 1], fwd_flow[:, i - 1]) if i > 0 else None
             state = self._step("fwd", x[:, i], m[:, i], prev)
             (b_feat, _, b_val), (f_feat, _, f_val) = back[i], state
 
-            y = self.lrelu(self.concate(torch.cat([b_feat, f_feat], dim=1)))
+            feats = torch.cat([b_feat, f_feat], dim=1)
+            y = self.concate(feats)
+            if self.use_holes:
+                validity = torch.maximum(b_val, f_val)
+                y = y + gate[:, i] * self.inpainter(torch.cat([feats, m[:, i], validity], dim=1))
+            y = self.lrelu(y)
             y = self.lrelu(self.up1(y))
             y = self.lrelu(self.up2(y))
             y = self.lrelu(self.conv_hr(y))
-            hr = y.shape[-2:]
-            base = F.interpolate(x[:, i], size=hr, mode="bilinear", align_corners=False)  # MambaOFR's img_up
-            coarse_out.append(torch.tanh(self.conv_last(y) + base))
-            cond_out.append(self.cond_head(y))
-            val_out.append(F.interpolate(torch.maximum(b_val, f_val), size=hr, mode="bilinear", align_corners=False))
+            base = F.interpolate(x[:, i], size=y.shape[-2:], mode="bilinear", align_corners=False)  # MambaOFR's img_up
+            frames.append(torch.tanh(self.conv_last(y) + base))
 
-        return {
-            "coarse": torch.stack(coarse_out, dim=1),
-            "cond": torch.stack(cond_out, dim=1),
-            "hole_logits": hole_logits,
-            "validity": torch.stack(val_out, dim=1),
-            "flow_fwd": fwd_flow,
-        }
+        out["out"] = torch.stack(frames, dim=1)
+        return out
+
+    @torch.no_grad()
+    def restore(self, lq: torch.Tensor) -> torch.Tensor:
+        """(N, T, 3, h, w) LQ -> (N, T, 3, H, W) restored clip in [-1, 1]."""
+        return self.forward(lq)["out"]

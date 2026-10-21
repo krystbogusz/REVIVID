@@ -1,8 +1,7 @@
-"""Optical-flow estimation (torchvision RAFT) and warping.
+"""Optical-flow estimation (torchvision RAFT, frozen) and warping.
 
-The backbone's RAFT starts frozen and is fine-tuned on degraded frames after a
-warmup (``training.raft_unfreeze_iter``) at a reduced learning rate; the
-trainer's GT-flow RAFT (flicker loss / metric) stays frozen.
+The backbone's RAFT is frozen as in MambaOFR (its flow runs under no_grad);
+the trainer's GT-flow RAFT (flicker metric) is frozen too.
 """
 
 from __future__ import annotations
@@ -42,15 +41,14 @@ def flow_warp(
 
 
 class RAFTFlow(nn.Module):
-    """torchvision RAFT returning flow_{a->b} as (n, 2, h, w) in pixels; inputs
-    in [-1, 1]. Variants: ``large`` (C_T_SKHT_V2), ``sintel`` (large with
-    C_T_SKHT_V1 = the original ``raft-sintel.pth`` MambaOFR uses), ``small``.
-    ``iters`` = refinement iterations (MambaOFR: 24, torchvision default 12).
+    """Frozen torchvision RAFT returning flow_{a->b} as (n, 2, h, w) in pixels;
+    inputs in [-1, 1]. Variants: ``large`` (C_T_SKHT_V2), ``sintel`` (large
+    with C_T_SKHT_V1 = the original ``raft-sintel.pth`` MambaOFR uses),
+    ``small``. ``iters`` = refinement iterations (MambaOFR: 24, torchvision
+    default 12).
 
-    Frozen by default; :meth:`set_trainable` enables fine-tuning. Batch-norm
-    statistics (RAFT large's context encoder) always stay frozen — the small
-    training batches would corrupt the pretrained ones (as in RAFT's own
-    fine-tuning, ``freeze_bn``).
+    Always in eval mode: the batch-norm statistics of RAFT large's context
+    encoder stay the pretrained ones.
     """
 
     MIN_SIZE = 128  # RAFT works at >= 128 px; smaller inputs are upsampled
@@ -68,20 +66,13 @@ class RAFTFlow(nn.Module):
         else:
             raise ValueError(f"unknown RAFT variant {variant!r} (large | sintel | small)")
         self.iters = int(iters)
-        self.set_trainable(False)
+        self.raft.requires_grad_(False)
         self.eval()
 
-    def set_trainable(self, flag: bool = True) -> None:
-        self._trainable = bool(flag)
-        self.raft.requires_grad_(self._trainable)
-
     def train(self, mode: bool = True):
-        super().train(mode)
-        for m in self.raft.modules():
-            if isinstance(m, nn.modules.batchnorm._BatchNorm):
-                m.eval()
-        return self
+        return super().train(False)
 
+    @torch.no_grad()
     def forward(self, frame_a: torch.Tensor, frame_b: torch.Tensor) -> torch.Tensor:
         h, w = frame_a.shape[-2:]
         H = max(self.MIN_SIZE, math.ceil(h / 8) * 8)
@@ -91,8 +82,7 @@ class RAFTFlow(nn.Module):
             a = F.interpolate(a, size=(H, W), mode="bilinear", align_corners=False)
             b = F.interpolate(b, size=(H, W), mode="bilinear", align_corners=False)
 
-        with torch.set_grad_enabled(self._trainable and torch.is_grad_enabled()):
-            flow = self.raft(a.contiguous(), b.contiguous(), num_flow_updates=self.iters)[-1]
+        flow = self.raft(a.contiguous(), b.contiguous(), num_flow_updates=self.iters)[-1]
 
         if (H, W) != (h, w):
             flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)

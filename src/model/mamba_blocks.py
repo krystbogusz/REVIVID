@@ -11,6 +11,8 @@
     MambaRestorer:   MambaIR in its denoising configuration, as MambaOFR applies
                      it to the propagated feature of every frame:
                      conv_first -> LN -> groups -> LN -> conv + skip -> conv_last + skip.
+                     With ``out_ch`` it maps to other channels without the global
+                     skip (REVIVID's hole inpainter).
 
 Differences from the previous REVIVID blocks, which produced flat "watercolour"
 regions: LayerNorm per pixel instead of GroupNorm (spatial statistics + FiLM is
@@ -234,7 +236,9 @@ class ResidualGroup(nn.Module):
 class MambaRestorer(nn.Module):
     """MambaIR in its denoising configuration on a ``in_ch``-channel feature,
     as MambaOFR runs it on the propagated state of every frame (one per
-    propagation direction): (B, in_ch, H, W) -> (B, in_ch, H, W), residual."""
+    propagation direction): (B, in_ch, H, W) -> (B, in_ch, H, W), residual.
+    ``out_ch`` other than ``in_ch``: (B, in_ch, H, W) -> (B, out_ch, H, W),
+    no global skip."""
 
     def __init__(
         self,
@@ -246,8 +250,10 @@ class MambaRestorer(nn.Module):
         num_kernels: int = 8,
         drop_path: float = 0.1,
         use_checkpoint: bool = True,
+        out_ch: int | None = None,
     ):
         super().__init__()
+        self.residual = out_ch is None or out_ch == in_ch
         self.conv_first = nn.Conv2d(in_ch, embed_dim, 3, 1, 1)
         self.norm_in = nn.LayerNorm(embed_dim)
         dpr = torch.linspace(0, drop_path, sum(depths)).tolist()
@@ -260,7 +266,7 @@ class MambaRestorer(nn.Module):
             start += depth
         self.norm_out = nn.LayerNorm(embed_dim)
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        self.conv_last = nn.Conv2d(embed_dim, in_ch, 3, 1, 1)
+        self.conv_last = nn.Conv2d(embed_dim, out_ch or in_ch, 3, 1, 1)
         self.apply(self._init_weights)
 
     @staticmethod
@@ -284,4 +290,5 @@ class MambaRestorer(nn.Module):
         for group in self.groups:
             h = group(h)
         h = self._ln(self.norm_out, h)
-        return x + self.conv_last(self.conv_after_body(h) + first)
+        y = self.conv_last(self.conv_after_body(h) + first)
+        return x + y if self.residual else y

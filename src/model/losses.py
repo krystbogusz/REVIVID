@@ -1,27 +1,18 @@
-"""Losses of REVIVID training — only what the realism objective needs.
+"""Losses of REVIVID training.
 
-Generator (coarse output = the final image everywhere outside holes):
-    * ``CharbonnierLoss``         — fidelity to GT (robust L1); keeps content right.
-    * ``VGGFeatures.perceptual``  — MambaOFR's VGG19 feature distance; keeps texture/structure right.
-    * ``HingeGANLoss.generator``  — realism: the discriminator (MambaOFR's 3-D clip
-                                    critic or the projected patch heads) must not
-                                    tell the output from real footage.
-    * ``TemporalConsistencyLoss`` — no flicker: frame-to-frame change must follow
-                                    the GT's own change along the GT motion.
-    * ``FrequencyLoss``, ``GradientLoss`` — sharpness: pixel / VGG losses settle on
-                                    the blurry average of what the degraded input
-                                    allows; these penalise the missing high
-                                    frequencies and soft edges directly. Off in
-                                    phase 1: where detail is uncertain they favour
-                                    flat patches with sharp edges ("watercolour").
-Hole detector:
-    * ``HoleDetectionLoss``       — BCE against the true hole mask.
-Refiner: its v-prediction loss lives in ``GaussianDiffusion.training_loss``.
+Generator (MambaOFR's loss; phase 2 adds the detector term):
+    * ``CharbonnierLoss``         — fidelity to GT (robust L1); pixels can be re-weighted
+                                    (phase 2: true-hole pixels weigh more).
+    * ``VGGFeatures.perceptual``  — MambaOFR's VGG19 feature distance.
+    * ``HingeGANLoss.generator``  — realism against MambaOFR's 3-D clip discriminator.
+    * ``HoleDetectionLoss``       — BCE of the hole detector against the true mask.
+Validation:
+    * ``TemporalConsistencyLoss`` — the flicker metric.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -37,95 +28,64 @@ class CharbonnierLoss(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         loss = torch.sqrt((pred - target) ** 2 + self.eps * self.eps)
+        if weight is None:
+            return loss.mean()
         w = weight.expand_as(loss)
         return (loss * w).sum() / w.sum().clamp(min=1.0)
 
 
 class VGGFeatures(nn.Module):
-    """Frozen VGG19 of images in [-1, 1]; one forward per step feeds both users:
+    """Frozen VGG19 of images in [-1, 1]: relu1_1 … relu5_1, MambaOFR's
+    perceptual loss (``VGGLoss_torch``: same layers, weights ``WEIGHTS``,
+    the [-1, 1] input fed as is)."""
 
-    * ``"perc"`` relu1_1 … relu5_1 — MambaOFR's perceptual loss (``VGGLoss_torch``:
-      same layers, weights ``PERC_WEIGHTS``, the [-1, 1] input fed as is);
-    * ``"disc"`` relu1_2, relu2_2, relu3_4, relu4_4 — the projected discriminator.
-    """
-
-    PERC_LAYERS = (1, 6, 11, 20, 29)
-    PERC_WEIGHTS = (1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0)
-    DISC_LAYERS = (3, 8, 17, 26)
-    CHANNELS = (64, 128, 256, 512)  # of the "disc" maps
+    LAYERS = (1, 6, 11, 20, 29)
+    WEIGHTS = (1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0)
 
     def __init__(self):
         super().__init__()
         from torchvision import models
 
         vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
-        self.layers = vgg[: max(self.PERC_LAYERS + self.DISC_LAYERS) + 1]
+        self.layers = vgg[: max(self.LAYERS) + 1]
         for m in self.layers:
             if isinstance(m, nn.ReLU):
                 m.inplace = False  # a tapped map must not be overwritten by the next ReLU
         self.requires_grad_(False)
         self.eval()
 
-    def forward(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         x = x.float()
-        feats = {"perc": [], "disc": []}
+        feats = []
         for i, layer in enumerate(self.layers):
             x = layer(x)
-            if i in self.PERC_LAYERS:
-                feats["perc"].append(x)
-            if i in self.DISC_LAYERS:
-                feats["disc"].append(x)
+            if i in self.LAYERS:
+                feats.append(x)
         return feats
 
     @classmethod
     def perceptual(cls, fake: List[torch.Tensor], real: List[torch.Tensor]) -> torch.Tensor:
-        return sum(w * F.l1_loss(a, b.detach()) for w, a, b in zip(cls.PERC_WEIGHTS, fake, real))
-
-
-class FrequencyLoss(nn.Module):
-    """L1 between the FFT amplitude spectra of prediction and target — a blurry
-    output lacks high-frequency amplitude, which this penalises directly."""
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        p = torch.fft.rfft2(pred.float(), norm="ortho").abs()
-        t = torch.fft.rfft2(target.float(), norm="ortho").abs()
-        return F.l1_loss(p, t)
-
-
-class GradientLoss(nn.Module):
-    """L1 between Sobel gradients of prediction and target — a soft edge is
-    only slightly wrong per pixel, but has a much weaker gradient than a sharp one."""
-
-    def __init__(self):
-        super().__init__()
-        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
-        self.register_buffer("kernel", torch.stack([kx, kx.t()])[:, None])  # (2, 1, 3, 3)
-
-    def _grad(self, x: torch.Tensor) -> torch.Tensor:
-        c = x.shape[1]
-        return F.conv2d(x, self.kernel.repeat(c, 1, 1, 1), padding=1, groups=c)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # = L1(dx) + L1(dy): x and y maps are equally many, so twice their joint mean
-        return 2.0 * F.l1_loss(self._grad(pred), self._grad(target))
+        return sum(w * F.l1_loss(a, b.detach()) for w, a, b in zip(cls.WEIGHTS, fake, real))
 
 
 class HingeGANLoss:
-    """Hinge adversarial loss over a list of patch-logit maps (one per scale)."""
+    """MambaOFR's hinge adversarial loss on patch-logit maps."""
 
     @staticmethod
-    def discriminator(real: List[torch.Tensor], fake: List[torch.Tensor]) -> torch.Tensor:
-        return sum(F.relu(1.0 - r).mean() + F.relu(1.0 + f).mean() for r, f in zip(real, fake)) / len(real)
+    def discriminator(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (F.relu(1.0 - real).mean() + F.relu(1.0 + fake).mean())
 
     @staticmethod
-    def generator(fake: List[torch.Tensor]) -> torch.Tensor:
-        return sum(-f.mean() for f in fake) / len(fake)
+    def generator(fake: torch.Tensor) -> torch.Tensor:
+        return -fake.mean()
 
 
 class TemporalConsistencyLoss(nn.Module):
-    """Penalises flicker against the GT's own motion.
+    """Flicker against the GT's own motion.
 
     With ``W`` = warp of frame t-1 onto frame t by the GT flow:
     ``|(out_t - W out_{t-1}) - (gt_t - W gt_{t-1})|`` — the restoration error may

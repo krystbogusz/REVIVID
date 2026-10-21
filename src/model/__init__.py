@@ -1,6 +1,6 @@
-"""REVIVID — restoration + 2x SR + inpainting of persistent holes."""
+"""REVIVID — MambaOFR restoration + 2x SR + inpainting of persistent holes."""
 
+from .backbone import Video_Backbone
 from .config import ModelConfig
-from .video_diffusion_model import Video_Backbone
 
 __all__ = ["ModelConfig", "Video_Backbone"]

@@ -1,6 +1,5 @@
 import os
 import cv2
-import torch
 import argparse
 from tqdm import tqdm
 from dataset.degradation import (
@@ -17,7 +16,7 @@ def main():
     parser.add_argument("-t", "--textures", type=str, default="./data/raw/noise_data")
     parser.add_argument("-b", "--batch_size", type=int, default=30)
     parser.add_argument("--downscale_factor", type=int, default=1)
-    parser.add_argument("--hole-prob", type=float, default=0.25, help="chance of a persistent hole per window")
+    parser.add_argument("--hole-prob", type=float, default=0.25, help="chance of a persistent hole per window, 0 = no holes")
     parser.add_argument("--hole-window", type=int, default=7, help="frames sharing one hole mask")
 
     args = parser.parse_args()
@@ -25,8 +24,6 @@ def main():
     output_dir = os.path.dirname(args.output)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     build_texture_mmap(args.textures)
     texture_cache = get_texture_cache(args.textures)
@@ -64,8 +61,7 @@ def main():
                 degraded_batch = process_video_frames(
                     frame_batch,
                     texture_cache,
-                    downscale_factor=args.downscale_factor,
-                    device=device,
+                    out_size=(target_height, target_width),
                     hole_prob=args.hole_prob,
                     hole_window=args.hole_window,
                 )
@@ -78,8 +74,7 @@ def main():
             degraded_batch = process_video_frames(
                 frame_batch,
                 texture_cache,
-                downscale_factor=args.downscale_factor,
-                device=device,
+                out_size=(target_height, target_width),
                 hole_prob=args.hole_prob,
                 hole_window=args.hole_window,
             )

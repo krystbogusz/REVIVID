@@ -1,5 +1,5 @@
-"""``Trainer`` — training of REVIVID (restoration + 2x SR + hole inpainting),
-aimed at REALISM: a viewer should not be able to tell what was repaired.
+"""``Trainer`` — training of REVIVID (MambaOFR restoration + 2x SR + inpainting
+of holes burned through the whole window).
 
 Started from ``trainer/train.py`` (``python src/trainer/train.py``).
 
@@ -9,37 +9,33 @@ Data (fixed layout, built by ``dataset.create_dataset``):
 
 Two phases (``training.stage`` in config/REVIVID.yaml), each its own experiment;
 a config value written as ``{restore: a, inpaint: b}`` takes the phase's one:
-    restore  phase 1: restoration of all degradations + SR; MambaOFR's
-             backbone and recipe, trained from scratch. No holes in the data,
-             the model has no hole machinery switched on (``model.use_holes`` off)
-    inpaint  phase 2: fine-tuning from the phase-1
-             weights (``training.init_from``): holes burned in with
-             ``model.hole_prob``; detector + flow completion + refiner train, the
-             phase-1 backbone at ``backbone_lr_mult``; validation on the full
-             inference path (the model finds the holes itself)
+    restore  phase 1: removal of all degradations + SR; MambaOFR's network and
+             recipe, trained from scratch. No holes in the data, the phase-2
+             modules are off (``model.use_holes``)
+    inpaint  phase 2: fine-tuning of the whole phase-1 model
+             (``training.init_from``): holes burned in with ``model.hole_prob``;
+             hole detector, flow completion and inpainter train at ``lr``, the
+             phase-1 part at ``backbone_lr_mult``; the model finds the holes itself
 
 Generator loss (weights: ``training.loss_weights``; a 0 weight skips the term):
-    pix        Charbonnier(coarse, gt), true-hole pixels weighted 1 + hole_loss_boost
-    perceptual MambaOFR's VGG19 loss(coarse, gt): relu1_1..relu5_1 weighted 1/32..1
-    gan        hinge; ``gan.type`` temporal = MambaOFR's 3-D clip discriminator,
-               projected = patch heads on the VGG features of the same pass
-               (from ``training.gan.start_iter``)
-    temporal   flicker of coarse vs the GT's own motion
-    fft        L1 of FFT amplitude(coarse, gt) — missing high frequencies
-    grad       L1 of Sobel gradients(coarse, gt) — soft edges
-    detect     BCE of the hole detector vs the true hole mask        (inpaint)
-    v          diffusion v-loss of the refiner inside the true holes (inpaint)
-Discriminator: hinge, GT vs coarse, own Adam.
+    pix        Charbonnier(out, gt)              MambaOFR: L1; phase 2: true-hole
+                                                 pixels weigh 1 + hole_loss_boost
+    perceptual MambaOFR's VGG19 loss(out, gt)    relu1_1..relu5_1 weighted 1/32..1
+    gan        hinge vs MambaOFR's 3-D clip discriminator (from ``gan.start_iter``)
+    detect     BCE of the hole detector vs the true hole mask (phase 2)
+Discriminator: hinge, GT vs out, own Adam.
 
 The true hole mask of a training sample is a TARGET only — the model never
-receives it. Validation runs the full inference path on the stored .mp4 pairs
-and reports LPIPS / flicker / sharpness / PSNR / SSIM of the output; best.pth
-is the lowest LPIPS.
+receives it. Validation runs the model on the stored .mp4 pairs and reports
+PSNR / SSIM, the same at LR (``psnr_lr`` / ``ssim_lr``: output and GT
+downscaled to the input size - MambaOFR's task on the same input), LPIPS,
+flicker and sharpness; best.pth = best ``validation.best_metric``.
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -56,12 +52,10 @@ from tqdm import tqdm
 from dataset import dataset_loader as data
 from evaluator.metrics import evaluate_clip
 from model import ModelConfig, Video_Backbone
-from model.discriminator import ProjectedPatchDiscriminator, TemporalPatchDiscriminator
+from model.discriminator import TemporalPatchDiscriminator
 from model.flow import build_flow_estimator
 from model.losses import (
     CharbonnierLoss,
-    FrequencyLoss,
-    GradientLoss,
     HingeGANLoss,
     HoleDetectionLoss,
     TemporalConsistencyLoss,
@@ -73,15 +67,13 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "REVIVID.yaml"
 DATA_DIR = PROJECT_ROOT / "data" / "training"
 
 # MambaOFR: L1 1.0, perceptual 1.0, adversarial 0.01.
-DEFAULT_WEIGHTS = {
-    "pix": 1.0, "perceptual": 1.0, "gan": 0.01, "temporal": 0.0,
-    "fft": 0.0, "grad": 0.0, "detect": 0.05, "v": 1.0,
-}
+DEFAULT_WEIGHTS = {"pix": 1.0, "perceptual": 1.0, "gan": 0.01, "detect": 0.05}
 STAGES = ("restore", "inpaint")
 # Modules that only phase 2 trains (full lr there); the rest is the phase-1
-# backbone (backbone_lr_mult). cond_head only feeds the refiner, so phase 1
-# leaves it untrained.
-INPAINT_MODULES = ("backbone.hole_detector.", "backbone.flow_completion.", "backbone.cond_head.", "refine_unet.")
+# model (backbone_lr_mult).
+INPAINT_MODULES = ("hole_detector.", "flow_completion.", "inpainter.")
+FROZEN = "flow_net."  # the frozen RAFT: not averaged by the EMA
+HIGHER_IS_BETTER = ("psnr", "ssim", "psnr_lr", "ssim_lr")
 
 
 def load_config(path=None) -> dict:
@@ -114,7 +106,7 @@ class ModelEMA:
         self.shadow = {
             k: v.detach().clone().float()
             for k, v in model.state_dict().items()
-            if v.dtype.is_floating_point
+            if v.dtype.is_floating_point and not k.startswith(FROZEN)
         }
 
     @torch.no_grad()
@@ -146,7 +138,7 @@ class ModelEMA:
 class Trainer:
     def __init__(self, config=None):
         cfg = config if isinstance(config, dict) else load_config(config)
-        self.stage = str((cfg.get("training") or {}).get("stage", "inpaint"))
+        self.stage = str((cfg.get("training") or {}).get("stage", "restore"))
         if self.stage not in STAGES:
             raise ValueError(f"training.stage must be one of {STAGES}, got {self.stage!r}")
         self.inpaint = self.stage == "inpaint"
@@ -170,35 +162,27 @@ class Trainer:
         self.model_cfg = ModelConfig.from_dict(cfg.get("model"))
         self.model_cfg.use_holes = self.inpaint  # stored with the checkpoints' model_config
         self.net = Video_Backbone(self.model_cfg).to(dev)
-        gan = self.tc.get("gan") or {}
-        self.gan_type = str(gan.get("type", "temporal"))
-        if self.gan_type == "temporal":
-            self.net_d = TemporalPatchDiscriminator().to(dev)
-        elif self.gan_type == "projected":
-            self.net_d = ProjectedPatchDiscriminator().to(dev)
-        else:
-            raise ValueError(f"training.gan.type must be temporal | projected, got {self.gan_type!r}")
+        self.net_d = TemporalPatchDiscriminator().to(dev)
         self.ema = ModelEMA(self.net, float(self.tc.get("ema_decay", 0.999)))
 
         # ---- losses
         self.w = {**DEFAULT_WEIGHTS, **(self.tc.get("loss_weights") or {})}
         self.vgg = VGGFeatures().to(dev)
         self.pix_loss = CharbonnierLoss()
-        self.temporal_loss = TemporalConsistencyLoss()
-        self.fft_loss = FrequencyLoss()
-        self.grad_loss = GradientLoss().to(dev)
         self.gan_loss = HingeGANLoss()
         self.detect_loss = HoleDetectionLoss(float(self.tc.get("hole_pos_weight", 10.0))).to(dev)
         self.hole_loss_boost = float(self.tc.get("hole_loss_boost", 3.0))
+        # Validation metrics.
+        self.temporal_loss = TemporalConsistencyLoss()
         self.gt_flow = build_flow_estimator("large").to(dev)  # frozen RAFT large: motion of the GT
         self.lpips = lpips.LPIPS(net="alex", verbose=False).to(dev).eval()
 
         # ---- optimisation
         self.lr = float(self.tc.get("lr", 2e-4))
-        self.lr_min = float(self.tc.get("lr_min", 1e-6))
-        self.lr_steady = float(self.tc.get("lr_steady", 0.0))
-        # Adam without weight decay, as MambaOFR (AdamW's default decay also pulled
-        # the SSM's A_logs / Ds, which Mamba keeps out of the decay).
+        self.lr_min = float(self.tc.get("lr_min", 4e-5))
+        self.lr_steady = float(self.tc.get("lr_steady", 0.6))
+        self.lr_steps = max(1, int(self.tc.get("lr_steps", 8)))
+        # Adam without weight decay, as MambaOFR.
         betas = (float(self.tc.get("beta1", 0.9)), float(self.tc.get("beta2", 0.999)))
         new, old = [], []
         for name, p in self.net.named_parameters():
@@ -208,6 +192,7 @@ class Trainer:
         self.opt_g = torch.optim.Adam(
             [{"params": old, "lr_mult": backbone_mult}, {"params": new, "lr_mult": 1.0}], lr=self.lr, betas=betas
         )
+        gan = self.tc.get("gan") or {}
         self.gan_start_iter = int(gan.get("start_iter", 0))
         self.d_lr = float(gan.get("d_lr", 2e-4))
         self.opt_d = torch.optim.Adam(
@@ -217,15 +202,12 @@ class Trainer:
         )
         self.grad_accum = max(1, int(self.tc.get("grad_accum", 1)))
         self.grad_clip = float(self.tc.get("grad_clip", 0.0))  # 0 = off (MambaOFR)
-        # RAFT starts frozen and is fine-tuned after a warmup (-1 = never).
-        self.raft_unfreeze_iter = int(self.tc.get("raft_unfreeze_iter", 20000))
-        self.flow_lr_mul = float(self.tc.get("flow_lr_mul", 0.125))
-        self.raft_unfrozen = False
 
         # ---- state
         self.iteration = 0
         self._accum = 0
-        self.best_lpips = float("inf")
+        self.best_metric = str(self.vc.get("best_metric", "lpips"))
+        self.best_value = float("-inf") if self.best_metric in HIGHER_IS_BETTER else float("inf")
         self.best_epoch = 0
         self.history: list[dict] = []
 
@@ -233,9 +215,12 @@ class Trainer:
 
     def _set_lr(self, epoch: int, epochs: int) -> float:
         """Constant ``lr`` over the first ``lr_steady`` fraction of the epochs, then
-        a linear decay to ``lr_min`` at the last epoch (MambaOFR: half and half)."""
+        down to ``lr_min`` in ``lr_steps`` equal steps, the last one over the
+        final epochs. MambaOFR: 60 % at 2e-4, then -2e-5 per 12k iterations
+        (8 steps, the last at 4e-5); D follows in proportion."""
         steady = int(round(self.lr_steady * epochs))
-        frac = min(max((epoch - 1 - steady) / max(epochs - 1 - steady, 1), 0.0), 1.0)
+        step = math.ceil(max(epoch - steady, 0) * self.lr_steps / max(epochs - steady, 1))
+        frac = min(step / self.lr_steps, 1.0)
         lr = self.lr + (self.lr_min - self.lr) * frac
         for g in self.opt_g.param_groups:
             g["lr"] = lr * g["lr_mult"]
@@ -243,86 +228,41 @@ class Trainer:
             g["lr"] = self.d_lr * lr / self.lr
         return lr
 
-    def _unfreeze_raft(self) -> None:
-        flow = self.net.backbone.flow_net
-        flow.set_trainable(True)
-        g0 = self.opt_g.param_groups[0]
-        lr = g0["lr"] / g0["lr_mult"]
-        self.opt_g.add_param_group(
-            {"params": list(flow.parameters()), "lr": lr * self.flow_lr_mul, "lr_mult": self.flow_lr_mul}
-        )
-        self.raft_unfrozen = True
-        print(f"[iter {self.iteration}] RAFT unfrozen (lr x{self.flow_lr_mul})")
-
     # ---------------------------------------------------------------- train
 
     def train_step(self, batch: dict) -> dict:
         self.net.train()
-        if not self.raft_unfrozen and 0 <= self.raft_unfreeze_iter <= self.iteration:
-            self._unfreeze_raft()
         dev = self.device
         lq = batch["lq"].to(dev, non_blocking=True)
         gt = batch["gt"].to(dev, non_blocking=True)
-        hole = batch["hole_mask"].to(dev, non_blocking=True)  # TRUE mask: a target only
         n, t, c, H, W = gt.shape
         gt_f = gt.reshape(n * t, c, H, W)
-        hole_lr = hole.reshape(n * t, 1, *hole.shape[-2:])
-        hole_hr = F.interpolate(hole_lr, size=(H, W), mode="nearest")
 
         out = self.net(lq)
-        coarse, coarse_f = out["coarse"], out["coarse_f"]
+        pred = out["out"]
+        pred_f = pred.reshape(n * t, c, H, W)
         w = self.w
         losses = {}
 
-        losses["pix"] = self.pix_loss(coarse_f, gt_f, 1.0 + self.hole_loss_boost * hole_hr)
-        if w["fft"] > 0:
-            losses["fft"] = self.fft_loss(coarse_f, gt_f)
-        if w["grad"] > 0:
-            losses["grad"] = self.grad_loss(coarse_f, gt_f)
+        weight = None
+        if self.inpaint:
+            hole = batch["hole_mask"].to(dev, non_blocking=True)  # TRUE mask: a target only
+            hole_lr = hole.reshape(n * t, 1, *hole.shape[-2:])
+            weight = 1.0 + self.hole_loss_boost * F.interpolate(hole_lr, size=(H, W), mode="nearest")
+            losses["detect"] = self.detect_loss(out["hole_logits"].reshape(hole_lr.shape), hole_lr)
+        losses["pix"] = self.pix_loss(pred_f, gt_f, weight)
 
-        fake_feats = self.vgg(coarse_f)
         with torch.no_grad():
             real_feats = self.vgg(gt_f)
-        losses["perceptual"] = VGGFeatures.perceptual(fake_feats["perc"], real_feats["perc"])
+        losses["perceptual"] = VGGFeatures.perceptual(self.vgg(pred_f), real_feats)
 
-        # What the discriminator judges: the clip (temporal) or VGG maps (projected).
-        if self.gan_type == "temporal":
-            d_fake_in, d_real_in = coarse, gt
-            d_fake_detached = coarse.detach()
-        else:
-            d_fake_in, d_real_in = fake_feats["disc"], real_feats["disc"]
-            d_fake_detached = [f.detach() for f in d_fake_in]
         gan_on = w["gan"] > 0 and self.iteration >= self.gan_start_iter
         if gan_on:
             # D's parameters are frozen while this graph is built, so the
             # generator loss sends them no gradient.
             self.net_d.requires_grad_(False)
-            losses["gan"] = self.gan_loss.generator(self.net_d(d_fake_in))
+            losses["gan"] = self.gan_loss.generator(self.net_d(pred))
             self.net_d.requires_grad_(True)
-
-        if t > 1 and w["temporal"] > 0:
-            with torch.no_grad():
-                flow = self.gt_flow(
-                    gt[:, 1:].reshape(-1, c, H, W), gt[:, :-1].reshape(-1, c, H, W)
-                ).view(n, t - 1, 2, H, W)
-            losses["temporal"] = self.temporal_loss(coarse, gt, flow)
-
-        if self.inpaint:
-            losses["detect"] = self.detect_loss(out["hole_logits_f"], hole_lr)
-
-        # Refiner: diffusion inside the TRUE holes; batches without holes skip it.
-        gen = self.net.generation_mask(hole_hr)
-        if self.inpaint and bool((gen > 0).any()):
-            residual = gt_f - coarse_f.detach()
-            std = self.net.update_residual_std(residual, gen)
-            # One timestep per clip: the temporal attention mixes its frames.
-            t_diff = torch.randint(
-                0, self.net.diffusion.num_timesteps, (n,), device=dev
-            ).repeat_interleave(t)
-            losses["v"] = self.net.diffusion.training_loss(
-                self.net.refine_unet, residual / std, t_diff, gen,
-                cond=out["refine_cond"], num_frames=t,
-            )
 
         total = sum(w[k] * v for k, v in losses.items())
         if not torch.isfinite(total):
@@ -338,13 +278,13 @@ class Trainer:
         log["total"] = float(total.detach())
 
         if gan_on:
-            d_real = self.net_d(d_real_in)
-            d_fake = self.net_d(d_fake_detached)
+            d_real = self.net_d(gt)
+            d_fake = self.net_d(pred.detach())
             loss_d = self.gan_loss.discriminator(d_real, d_fake)
             (loss_d / self.grad_accum).backward()
             log["d"] = float(loss_d.detach())
-            log["d_real"] = float(sum(r.detach().mean() for r in d_real)) / len(d_real)
-            log["d_fake"] = float(sum(f.detach().mean() for f in d_fake)) / len(d_fake)
+            log["d_real"] = float(d_real.detach().mean())
+            log["d_fake"] = float(d_fake.detach().mean())
 
         self._accum += 1
         if self._accum == self.grad_accum:
@@ -370,6 +310,13 @@ class Trainer:
         lq = data.to_tensor(item["lq"][:n]).unsqueeze(0)
         gt = data.to_tensor(item["gt"][:n], gray=True)
         return lq, gt
+
+    @staticmethod
+    def _down(x: torch.Tensor, size) -> torch.Tensor:
+        """Bicubic downscale (antialiased, as PIL's resize that made the LQ input)."""
+        if tuple(x.shape[-2:]) == tuple(size):
+            return x
+        return F.interpolate(x, size=tuple(size), mode="bicubic", antialias=True, align_corners=False).clamp(-1, 1)
 
     @torch.no_grad()
     def _lpips(self, out: torch.Tensor, gt: torch.Tensor, chunk: int = 8) -> float:
@@ -413,43 +360,37 @@ class Trainer:
         return energy(out) / max(energy(gt), 1e-8)
 
     @torch.no_grad()
-    def _restore_window(self, lq: torch.Tensor):
-        """The stage's output for one window and where the refiner acted (None
-        in the restore stage, whose output is the coarse restoration)."""
-        if not self.inpaint:
-            return self.net(lq)["coarse"][0].clamp(-1.0, 1.0), None
-        r = self.net.restore_full(lq)
-        return r["refined"][0], r["generation_mask"][0]
-
-    @torch.no_grad()
     def validate(self, loader, epoch: int) -> dict:
-        """The stage's inference path on the stored .mp4 pairs (inpaint: the model
-        finds the holes itself), in windows of ``validation.window`` frames;
-        metrics of the output."""
+        """The model on the stored .mp4 pairs (inpaint: it finds the holes
+        itself), in windows of ``validation.window`` frames; metrics of the output."""
         self.net.eval()
         win = int(self.vc.get("window", self.tc.get("num_frame", 7)))
         max_clips = int(self.vc.get("max_clips", 0))
         max_frames = int(self.vc.get("max_frames", 0))
+        thr = self.model_cfg.hole_threshold
         sums, count = {}, 0
         with self.ema.applied(self.net):
             for item in tqdm(loader, desc=f"Val {epoch}", unit="clip", leave=False, dynamic_ncols=True):
                 if max_clips and count >= max_clips:
                     break
                 lq, gt = self._val_clip(item, max_frames)
-                outs, masks = [], []
+                outs, holes = [], []
                 for i in range(0, lq.shape[1], win):
-                    o, gen = self._restore_window(lq[:, i : i + win].to(self.device))
-                    outs.append(o.cpu())
-                    if gen is not None:
-                        masks.append((gen > 0).float().cpu())
+                    r = self.net(lq[:, i : i + win].to(self.device))
+                    outs.append(r["out"][0].cpu())
+                    if "hole_logits" in r:
+                        holes.append((torch.sigmoid(r["hole_logits"][0]) > thr).float().cpu())
                 out = torch.cat(outs)
                 m = evaluate_clip(out, gt)
                 m["psnr"] = min(m["psnr"], 100.0)
+                lr_size = lq.shape[-2:]
+                m_lr = evaluate_clip(self._down(out, lr_size), self._down(gt, lr_size))
+                m["psnr_lr"], m["ssim_lr"] = min(m_lr["psnr"], 100.0), m_lr["ssim"]
                 m["lpips"] = self._lpips(out, gt)
                 m["flicker"] = self._flicker(out, gt)
                 m["sharpness"] = self._sharpness(out, gt)
-                if masks:
-                    m["hole_frac"] = float(torch.cat(masks).mean())  # where the refiner acted
+                if holes:
+                    m["hole_frac"] = float(torch.cat(holes).mean())  # detected holes, share of LR pixels
                 for k, v in m.items():
                     sums[k] = sums.get(k, 0.0) + v
                 count += 1
@@ -457,48 +398,44 @@ class Trainer:
 
     @torch.no_grad()
     def save_sample(self, loader, epoch: int, tag: str) -> None:
-        """First validation window: rows LQ / coarse / refined / GT / refiner mask
-        (restore stage: LQ / coarse / GT)."""
+        """First validation window: rows LQ / output / GT (+ detected holes in phase 2)."""
         self.net.eval()
         lq, gt = self._val_clip(next(iter(loader)), int(self.tc.get("num_frame", 7)))
         size = gt.shape[-2:]
-        lq_up = F.interpolate(lq[0], size=size, mode="bilinear", align_corners=False)
         with self.ema.applied(self.net):
-            if self.inpaint:
-                r = self.net.restore_full(lq.to(self.device))
-                rows = [
-                    lq_up,
-                    r["coarse"][0].cpu(),
-                    r["refined"][0].cpu(),
-                    gt,
-                    r["generation_mask"][0].cpu().expand(-1, 3, -1, -1) * 2 - 1,
-                ]
-            else:
-                rows = [lq_up, self.net(lq.to(self.device))["coarse"][0].cpu(), gt]
+            r = self.net(lq.to(self.device))
+        rows = [F.interpolate(lq[0], size=size, mode="bilinear", align_corners=False), r["out"][0].cpu(), gt]
+        if "hole_logits" in r:
+            hole = F.interpolate(torch.sigmoid(r["hole_logits"][0]).cpu(), size=size, mode="nearest")
+            rows.append(hole.expand(-1, 3, -1, -1) * 2 - 1)
         grid = torch.cat([x.float().clamp(-1, 1).add(1).div(2) for x in rows])
         save_image(grid, self.exp_dir / "samples" / f"epoch{epoch:04d}_{tag}.png", nrow=lq.shape[1], padding=2)
 
     # ------------------------------------------------------------------ fit
 
-    def _validate_epoch(self, val_loader, epoch: int, entry: dict) -> None:
-        """Validate, add the metrics to ``entry``, keep best.pth (lowest LPIPS)."""
+    def _validate_epoch(self, val_loader, epoch: int, entry: dict) -> bool:
+        """Validate, add the metrics to ``entry``, save a sample; True when this
+        epoch is the best so far (``validation.best_metric``)."""
         m = self.validate(val_loader, epoch)
         entry.update({f"val_{k}": v for k, v in m.items()})
         print(
-            f"[epoch {epoch}] VAL lpips {m['lpips']:.4f} | flicker {m['flicker']:.4f} | "
-            f"sharpness {100 * m['sharpness']:.0f}% of GT | "
-            f"psnr {m['psnr']:.3f} ssim {m['ssim']:.4f}"
-            + (f" | refiner on {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
+            f"[epoch {epoch}] VAL psnr {m['psnr']:.3f} ssim {m['ssim']:.4f} | "
+            f"LR psnr {m['psnr_lr']:.3f} ssim {m['ssim_lr']:.4f} | lpips {m['lpips']:.4f} | "
+            f"flicker {m['flicker']:.4f} | sharpness {100 * m['sharpness']:.0f}% of GT"
+            + (f" | holes {100 * m['hole_frac']:.2f}% px" if "hole_frac" in m else "")
         )
-        if m["lpips"] < self.best_lpips:
-            self.best_lpips, self.best_epoch = m["lpips"], epoch
-            self._save("best.pth", epoch)
-            self.save_sample(val_loader, epoch, "best")
+        v = m[self.best_metric]
+        best = v > self.best_value if self.best_metric in HIGHER_IS_BETTER else v < self.best_value
+        if best:
+            self.best_value, self.best_epoch = v, epoch
+        self.save_sample(val_loader, epoch, "best" if best else "val")
+        return best
 
     def fit(self, train_loader, val_loader=None, start_epoch: int = 1) -> None:
-        epochs = int(self.tc.get("epochs", 4000))
+        epochs = int(self.tc.get("epochs", 2000))
         val_every = max(1, int(self.vc.get("val_every", 10)))
-        save_every = max(1, int(self.lc.get("save_checkpoint_every", 10)))
+        save_every = max(1, int(self.lc.get("save_checkpoint_every", 1)))
+        keep_every = int(self.lc.get("keep_checkpoint_every", 0))
         log_every = max(1, int(self.lc.get("log_every", 100)))
 
         for epoch in range(start_epoch, epochs + 1):
@@ -518,16 +455,18 @@ class Trainer:
                     bar.write(f"[iter {self.iteration}] " + " ".join(f"{k}:{v:.4f}" for k, v in log.items()))
             entry = {"epoch": epoch, "lr": lr, **{k: sums[k] / counts[k] for k in sums}}
 
+            best = False
             if val_loader is not None and (epoch % val_every == 0 or epoch == epochs):
-                self._validate_epoch(val_loader, epoch, entry)
+                best = self._validate_epoch(val_loader, epoch, entry)
             self.history.append(entry)
             self._write_history()
 
+            if best:
+                self._save("best.pth", epoch)
             if epoch % save_every == 0 or epoch == epochs:
-                self._save(f"epoch{epoch:04d}.pth", epoch)
                 self._save("latest.pth", epoch)
-                if val_loader is not None:
-                    self.save_sample(val_loader, epoch, "checkpoint")
+            if keep_every > 0 and (epoch % keep_every == 0 or epoch == epochs):
+                self._save(f"epoch{epoch:04d}.pth", epoch)
             print(f"[epoch {epoch}] done in {time.time() - t0:.1f}s")
 
     # ---------------------------------------------------------- checkpoints
@@ -546,8 +485,8 @@ class Trainer:
                 "net_d": self.net_d.state_dict(),
                 "opt_g": self.opt_g.state_dict(),
                 "opt_d": self.opt_d.state_dict(),
-                "raft_unfrozen": self.raft_unfrozen,
-                "best_lpips": self.best_lpips,
+                "best_metric": self.best_metric,
+                "best_value": self.best_value,
                 "best_epoch": self.best_epoch,
                 "history": self.history,
                 "model_config": self.model_cfg.to_dict(),
@@ -559,25 +498,21 @@ class Trainer:
 
     def init_from(self, path: str | Path) -> None:
         """Start from the weights of another run (phase 2 from phase 1): its EMA
-        weights where it has them, for the model and the new EMA alike. Modules
-        the source lacks keep their init; optimizer and schedule start fresh."""
+        weights where it has them, for the model and the new EMA alike, and its
+        discriminator. Optimizers and schedule start fresh."""
         path = Path(path)
         if not path.is_absolute():
             path = PROJECT_ROOT / path
         s = torch.load(path, map_location=self.device, weights_only=False)
-        weights = {**s["model"], **((s.get("ema") or {}).get("shadow") or {})}
+        weights = {**s["model"], **s["ema"]["shadow"]}
         own = self.net.state_dict()
         weights = {k: v.to(own[k].dtype) for k, v in weights.items() if k in own and own[k].shape == v.shape}
-        missing = [k for k in own if k not in weights]
+        missing = sorted({k.split(".")[0] for k in own if k not in weights})
         self.net.load_state_dict(weights, strict=False)
         self.ema = ModelEMA(self.net, self.ema.decay)
-        d_state = s.get("net_d")
-        own_d = self.net_d.state_dict()
-        if d_state and d_state.keys() == own_d.keys() and all(d_state[k].shape == own_d[k].shape for k in own_d):
-            self.net_d.load_state_dict(d_state)  # same discriminator type: keep its training
+        self.net_d.load_state_dict(s["net_d"])
         print(f"[trainer] initialised from {path} ({len(weights)} tensors"
-              + (f"; fresh: {sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in missing})}" if missing else "")
-              + ")")
+              + (f"; fresh: {missing}" if missing else "") + ")")
 
     def resume(self, path: Optional[str] = None) -> int:
         """Continue from ``path`` or <exp_dir>/checkpoints/latest.pth (a checkpoint
@@ -594,15 +529,16 @@ class Trainer:
         self.net.load_state_dict(s["model"])
         self.ema.load_state_dict(s["ema"])
         self.net_d.load_state_dict(s["net_d"])
-        if s["raft_unfrozen"]:
-            self._unfreeze_raft()  # recreate the param group before loading opt_g
         self.opt_g.load_state_dict(s["opt_g"])
         self.opt_d.load_state_dict(s["opt_d"])
         self.iteration = s["iteration"]
-        self.best_lpips, self.best_epoch = s["best_lpips"], s["best_epoch"]
         self.history = s["history"]
+        if s["best_metric"] == self.best_metric:
+            self.best_value, self.best_epoch = s["best_value"], s["best_epoch"]
+        else:
+            print(f"[trainer] best metric changed {s['best_metric']} -> {self.best_metric}: best.pth starts over")
         print(f"[trainer] resumed from {path} (next epoch {s['epoch'] + 1}, iter {self.iteration}, "
-              f"best lpips {self.best_lpips:.4f} @ epoch {self.best_epoch})")
+              f"best {self.best_metric} {self.best_value:.4f} @ epoch {self.best_epoch})")
         return s["epoch"] + 1
 
     def save_config(self) -> None:
@@ -621,8 +557,8 @@ class Trainer:
 
     def build_loaders(self):
         """Train clips (degraded on the fly, with their true hole masks; no holes
-        in the restore stage) and the stored validation pairs (no masks; ``None``
-        when there are none)."""
+        in the restore stage) and the stored validation pairs (``None`` when
+        there are none)."""
         tc = self.tc
         train = data.train_loader(
             DATA_DIR / "train",
@@ -634,7 +570,6 @@ class Trainer:
             num_workers=int(tc.get("num_workers", 0)),
             augment=bool(tc.get("augment", True)),
             gt_usm=float(tc.get("gt_usm", 0.0)),
-            degradation_modes=tc.get("degradation_modes"),
         )
         val_dir = DATA_DIR / "valid"
         try:

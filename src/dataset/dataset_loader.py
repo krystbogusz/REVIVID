@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from .augment import augment_frames
 from .degradation.cache import get_texture_cache
-from .degradation.pipeline import process_video_frames, sample_frame_ids
+from .degradation.pipeline import process_video_frames
 
 
 def list_mp4(folder: str | Path) -> List[Path]:
@@ -100,7 +100,6 @@ class TrainDataset(Dataset):
         augment: bool = True,
         texture_cache_dir: str | Path | None = None,
         gt_usm: float = 0.0,
-        degradation_modes: Optional[dict] = None,
     ):
         self.clips = list_mp4(clips_dir)
         if not self.clips:
@@ -111,13 +110,11 @@ class TrainDataset(Dataset):
         self.augment = augment
         self.texture_cache_dir = texture_cache_dir
         self.gt_usm = float(gt_usm)
-        self.degradation_modes = degradation_modes
         self.crop = None  # (h, w) in GT pixels
         if crop_size:
             w, h = int(crop_size[0]), int(crop_size[1])
-            m = sr_scale * 4  # LQ stays a multiple of 4 for the refiner UNet
-            if w % m or h % m:
-                raise ValueError(f"crop_size {w}x{h} must be a multiple of sr_scale*4 = {m}")
+            if w % sr_scale or h % sr_scale:
+                raise ValueError(f"crop_size {w}x{h} must be a multiple of sr_scale = {sr_scale}")
             self.crop = (h, w)
 
     def __len__(self) -> int:
@@ -126,26 +123,21 @@ class TrainDataset(Dataset):
     def __getitem__(self, index: int):
         path = self.clips[index]
         start = random.randint(0, max(0, frame_count(path) - self.num_frame))
-        # Repeated frames as in real transfers: GT and input repeat together.
-        ids = sample_frame_ids(self.num_frame)
-        frames = read_mp4(path, start, ids[-1] + 1)
+        frames = read_mp4(path, start, self.num_frame)
 
         sr = self.sr
         h, w = frames[0].shape[0] // sr * sr, frames[0].shape[1] // sr * sr
         ph, pw = (min(self.crop[0], h), min(self.crop[1], w)) if self.crop else (h, w)
         y = random.randint(0, h - ph) // sr * sr
         x = random.randint(0, w - pw) // sr * sr
-        gt = [frames[i][y : y + ph, x : x + pw] for i in ids]
+        gt = [f[y : y + ph, x : x + pw] for f in frames]
 
         lq, masks = process_video_frames(
             gt,
             get_texture_cache(cache_dir=self.texture_cache_dir),
-            device=torch.device("cpu"),
             out_size=(ph // sr, pw // sr),
             hole_prob=self.hole_prob,
             return_masks=True,
-            frame_ids=ids,
-            mode_probs=self.degradation_modes,
         )
         if self.gt_usm > 0:
             gt = [usm_sharpen(f, self.gt_usm) for f in gt]
@@ -203,11 +195,9 @@ def train_loader(
     augment: bool = True,
     texture_cache_dir: str | Path | None = None,
     gt_usm: float = 0.0,
-    degradation_modes: Optional[dict] = None,
 ) -> DataLoader:
     dataset = TrainDataset(
-        clips_dir, num_frame, sr_scale, crop_size, hole_prob, augment, texture_cache_dir,
-        gt_usm, degradation_modes,
+        clips_dir, num_frame, sr_scale, crop_size, hole_prob, augment, texture_cache_dir, gt_usm,
     )
     return DataLoader(
         dataset,

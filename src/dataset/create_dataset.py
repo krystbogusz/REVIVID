@@ -9,6 +9,15 @@ Sources are video files, frame folders, or directories containing them.
 Evaluation reuses the texture cache built by the train mode.
 Defaults for scale, window, hole probability, textures and validation size
 come from config/REVIVID.yaml (hole probability: 0 while training.stage is restore).
+
+A degraded clip is its GT degraded by MambaOFR's degradation at GT / --scale
+(--scale 1: no SR); --hole-prob is the share of --num-frame windows that get
+a burned hole, e.g.:
+
+    # without holes / a hole in every window / 4x SR
+    PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x2_clean --hole-prob 0
+    PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x2_holes --hole-prob 1
+    PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x4 --scale 4 --hole-prob 0
 """
 
 import argparse
@@ -39,7 +48,8 @@ def parse_args(model_cfg, train_cfg, val_cfg):
     restore = train_cfg.get("stage", "inpaint") == "restore"
     common.add_argument("--hole-prob", type=float,
                         default=0.0 if restore else model_cfg.get("hole_prob", 0.15),
-                        help="0 in the restore stage, else model.hole_prob")
+                        help="share of windows with a burned hole, 0 = none "
+                             "(default: 0 in the restore stage, else model.hole_prob)")
     common.add_argument("--fps", type=float, default=24.0, help="fps for frame folders")
 
     train = sub.add_parser("train", parents=[common], help="build data/training")
@@ -62,7 +72,7 @@ def parse_args(model_cfg, train_cfg, val_cfg):
     va.add_argument("--output", default=str(ROOT / "data" / "training" / "valid"), help="folder of the pairs")
 
     ev = sub.add_parser("eval", parents=[common], help="build data/evaluation/<name>")
-    ev.add_argument("--scale", type=int, default=2, help="GT size / degraded size")
+    ev.add_argument("--scale", type=int, default=2, help="GT size / degraded size (1 = no SR)")
     ev.add_argument("--source", nargs="+", required=True, help="evaluation sources")
     ev.add_argument("--name", required=True, help="dataset name")
     ev.add_argument("--gt-size", type=int, nargs=2, metavar=("W", "H"),

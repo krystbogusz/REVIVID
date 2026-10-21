@@ -92,8 +92,8 @@ def main():
         "-c",
         "--checkpoint",
         type=str,
-        default="./experiments/revivid/checkpoints/latest.pth",
-        help="Path to the model checkpoint (.pth).",
+        default="./experiments/revivid_p2/checkpoints/best.pth",
+        help="Path to the model checkpoint (.pth); phase 1 or phase 2.",
     )
     parser.add_argument(
         "--config",
@@ -112,15 +112,6 @@ def main():
         type=int,
         default=3,
         help="Frame overlap between consecutive clips (reduces boundary artefacts).",
-    )
-    parser.add_argument(
-        "--refine-steps",
-        type=int,
-        default=25,
-        help=(
-            "DDIM denoising steps for the final render (default: 25 — more "
-            "than the fast validation default, for crisper residual detail)."
-        ),
     )
     parser.add_argument(
         "--downscale-factor",
@@ -154,8 +145,7 @@ def main():
     print(f"[restore_video] loading model from: {checkpoint}")
     net = _load_model(str(checkpoint), args.config, device)
     sr_scale = net.cfg.sr_scale
-    steps = args.refine_steps or net.cfg.refine_steps
-    print(f"[restore_video] sr_scale={sr_scale}, refine_steps={steps}")
+    print(f"[restore_video] sr_scale={sr_scale}, hole inpainting {'on' if net.use_holes else 'off'}")
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -219,7 +209,7 @@ def main():
             tensors = [_to_tensor(f) for f in frames_clip]
             lq = torch.stack(tensors, dim=0).unsqueeze(0).to(device)
 
-            restored = net.restore(lq, refine_steps=args.refine_steps)
+            restored = net.restore(lq)
 
             for clip_i, frame_i in enumerate(indices):
                 r_frame = restored[0, clip_i].cpu().float()

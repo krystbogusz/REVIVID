@@ -1,22 +1,25 @@
-"""Texture generation and manipulation for film-grain simulation.
+"""Film-damage textures (MambaOFR's ``texture_augmentation.py``, one to one) and
+the burned-hole masks.
 
-Functions produce greyscale textures (uint8 NumPy arrays) that are blended
-over degraded frames by ``pipeline.process_video_frames``.
+The textures are greyscale PIL images ("L"), dark marks on a light ground,
+blended over the frames by ``pipeline.process_video_frames``.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import random
 
 import cv2
 import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
 
-MAX_TILT = 3.0  # degrees a texture may lean off vertical
+DILATION_FOLDERS = ("002", "003", "004", "005", "006", "007", "009", "012")
 
 
 def rotated_rect_with_max_area(w, h, angle):
+    """Width and height of the largest axis-aligned rectangle inside a w x h
+    rectangle rotated by ``angle`` (radians)."""
     if w <= 0 or h <= 0:
         return 0, 0
 
@@ -35,183 +38,73 @@ def rotated_rect_with_max_area(w, h, angle):
 
 
 def center_crop(img, new_width, new_height):
-    height, width = img.shape[:2]
-    left = int((width - new_width) / 2)
-    top = int((height - new_height) / 2)
-    right = left + new_width
-    bottom = top + new_height
-    return img[top:bottom, left:right]
+    width, height = img.size
+    left = (width - new_width) / 2
+    top = (height - new_height) / 2
+    return img.crop((left, top, left + new_width, top + new_height))
 
 
-def generate_texture(texture_input, folder_name, target_h=256, target_w=256):
-    random_prob = random.uniform(0.0, 1.0)
-    dilation_group = ["002", "003", "004", "005", "006", "007", "009", "012"]
-    dilation_flag = folder_name in dilation_group
-    img_h_orig, img_w_orig = texture_input.shape[:2]
+def _crop_around_mark(texture, darker_by):
+    """A random 150-360 px square of ``texture`` holding a pixel darker than
+    its mean by ``darker_by`` (none within 40 px of the left / right edge);
+    ``None`` when there is no such pixel."""
+    arr = np.asarray(texture)
+    mask = arr < arr.mean() - darker_by
+    mask[:, :40] = False
+    mask[:, -40:] = False
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return None
+    i = random.randrange(len(ys))
+    anchor_y, anchor_x = int(ys[i]), int(xs[i])
 
-    if random_prob < 0.15 or folder_name == "008":
-        if img_h_orig != target_h or img_w_orig != target_w:
-            return cv2.resize(
-                texture_input, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-            )
-        return texture_input
+    W, H = texture.size
+    box = random.randint(150, 360)
+    shift_x = random.randint(max(box - W + anchor_x, 0), min(anchor_x, box))
+    shift_y = random.randint(max(box - H + anchor_y, 0), min(anchor_y, box))
+    left, top = anchor_x - shift_x, anchor_y - shift_y
+    return texture.crop((left, top, left + box, top + box))
 
-    texture_mean = np.mean(texture_input)
-    texture_mask = (texture_input < (texture_mean - 15)).astype(np.float32)
 
-    texture_mask[:, :40] = 0.0
-    texture_mask[:, -40:] = 0.0
+def texture_generator(texture, folder_name, target_h, target_w):
+    """A per-frame texture at the frame size: the whole template (p 0.15, and
+    always for 008), else a crop around a mark, rotated by any angle; dilated
+    marks for some folders, a contrast boost with p 0.7."""
+    if random.uniform(0.0, 1.0) < 0.15 or folder_name == "008":
+        return texture.resize((target_w, target_h), resample=Image.LANCZOS)
 
-    if np.sum(texture_mask) < 1:
-        if img_h_orig != target_h or img_w_orig != target_w:
-            return cv2.resize(
-                texture_input, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-            )
-        return texture_input
+    cropped = _crop_around_mark(texture, 15)
+    if cropped is None:
+        return texture.resize((target_w, target_h), resample=Image.LANCZOS)
 
-    y_indices, x_indices = np.where(texture_mask > 0)
-    idx = random.randint(0, len(y_indices) - 1)
-    anchor_y, anchor_x = y_indices[idx], x_indices[idx]
+    box = cropped.size[0]
+    angle = random.randint(0, 360)
+    rotated = cropped.rotate(angle=angle, expand=True, resample=Image.BILINEAR)
+    max_w, max_h = rotated_rect_with_max_area(box, box, math.radians(angle))
+    final = center_crop(rotated, max_w, max_h).resize((target_w, target_h), resample=Image.LANCZOS)
 
-    bounding_box_size = random.randint(150, 360)
-
-    shift_x = random.randint(
-        max(bounding_box_size - img_w_orig + anchor_x, 0),
-        min(anchor_x, bounding_box_size),
-    )
-    shift_y = random.randint(
-        max(bounding_box_size - img_h_orig + anchor_y, 0),
-        min(anchor_y, bounding_box_size),
-    )
-
-    left_up_x = anchor_x - shift_x
-    left_up_y = anchor_y - shift_y
-
-    padded_texture = cv2.copyMakeBorder(
-        texture_input,
-        max(0, -left_up_y),
-        max(0, left_up_y + bounding_box_size - img_h_orig),
-        max(0, -left_up_x),
-        max(0, left_up_x + bounding_box_size - img_w_orig),
-        cv2.BORDER_REFLECT,
-    )
-
-    crop_x1 = max(0, left_up_x)
-    crop_y1 = max(0, left_up_y)
-    cropped_texture = padded_texture[
-        crop_y1 : crop_y1 + bounding_box_size, crop_x1 : crop_x1 + bounding_box_size
-    ]
-
-    # Scratches run along the film, i.e. vertically: only a slight tilt (or the
-    # strip upside down). MambaOFR rotates by any angle, which makes diagonal
-    # scratches the real footage does not have.
-    rotation_angle = random.uniform(-MAX_TILT, MAX_TILT) + random.choice((0.0, 180.0))
-    center = (bounding_box_size // 2, bounding_box_size // 2)
-    rot_mat = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-
-    abs_cos = abs(rot_mat[0, 0])
-    abs_sin = abs(rot_mat[0, 1])
-    bound_w = int(bounding_box_size * abs_cos + bounding_box_size * abs_sin)
-    bound_h = int(bounding_box_size * abs_sin + bounding_box_size * abs_cos)
-    rot_mat[0, 2] += bound_w / 2 - center[0]
-    rot_mat[1, 2] += bound_h / 2 - center[1]
-
-    rotated_texture = cv2.warpAffine(
-        cropped_texture, rot_mat, (bound_w, bound_h), flags=cv2.INTER_LINEAR
-    )
-    max_w, max_h = rotated_rect_with_max_area(
-        bounding_box_size, bounding_box_size, math.radians(rotation_angle)
-    )
-
-    final_texture = center_crop(rotated_texture, int(max_w), int(max_h))
-
-    h_final, w_final = final_texture.shape[:2]
-    if h_final != target_h or w_final != target_w:
-        final_texture = cv2.resize(
-            final_texture, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-        )
-
-    if dilation_flag:
-        dilation_kernel_size = random.randint(0, 1) * 2 + 1
-        kernel = np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8)
-        final_texture = cv2.erode(final_texture, kernel, iterations=1)
-
+    if folder_name in DILATION_FOLDERS:
+        final = final.filter(ImageFilter.MinFilter(random.randint(0, 1) * 2 + 1))
     if random.uniform(0.0, 1.0) < 0.7:
-        alpha_contrast = random.uniform(2.0, 4.0)
-        final_texture = cv2.convertScaleAbs(
-            final_texture, alpha=alpha_contrast, beta=128 * (1 - alpha_contrast)
-        )
-
-    return final_texture
+        final = ImageEnhance.Contrast(final).enhance(random.uniform(2.0, 4.0))
+    return final
 
 
-def generate_moving_line_texture(
-    texture_input, last_texture, target_h=256, target_w=256
-):
+def moving_line_texture_generator(texture, last_texture, target_h, target_w):
+    """Scratches that stay over the clip: on the first frame a crop of a 001
+    template around a line, then the previous frame's texture shifted
+    sideways by 5-15 px (the edge columns repeated)."""
     if last_texture is None:
-        img_h, img_w = texture_input.shape[:2]
-        texture_mean = np.mean(texture_input)
-        texture_mask = (texture_input < (texture_mean - 25)).astype(np.float32)
+        return _crop_around_mark(texture, 25).resize((target_w, target_h), resample=Image.LANCZOS)
 
-        texture_mask[:, :40] = 0.0
-        texture_mask[:, -40:] = 0.0
-
-        y_indices, x_indices = np.where(texture_mask > 0)
-        if len(y_indices) > 0:
-            idx = random.randint(0, len(y_indices) - 1)
-            anchor_y, anchor_x = y_indices[idx], x_indices[idx]
-        else:
-            anchor_y, anchor_x = img_h // 2, img_w // 2
-
-        bounding_box_size = random.randint(150, 360)
-
-        shift_x = random.randint(
-            max(bounding_box_size - img_w + anchor_x, 0),
-            min(anchor_x, bounding_box_size),
-        )
-        shift_y = random.randint(
-            max(bounding_box_size - img_h + anchor_y, 0),
-            min(anchor_y, bounding_box_size),
-        )
-
-        left_up_x = anchor_x - shift_x
-        left_up_y = anchor_y - shift_y
-
-        padded_texture = cv2.copyMakeBorder(
-            texture_input,
-            max(0, -left_up_y),
-            max(0, left_up_y + bounding_box_size - img_h),
-            max(0, -left_up_x),
-            max(0, left_up_x + bounding_box_size - img_w),
-            cv2.BORDER_REFLECT,
-        )
-
-        crop_x1 = max(0, left_up_x)
-        crop_y1 = max(0, left_up_y)
-        cropped_texture = padded_texture[
-            crop_y1 : crop_y1 + bounding_box_size, crop_x1 : crop_x1 + bounding_box_size
-        ]
-
-        h_crop, w_crop = cropped_texture.shape[:2]
-        if h_crop != target_h or w_crop != target_w:
-            final_texture = cv2.resize(
-                cropped_texture, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-            )
-        else:
-            final_texture = cropped_texture
+    x = np.asarray(last_texture)
+    leftwards = random.uniform(0, 1) > 0.5
+    d = random.randint(5, 15)
+    if leftwards:
+        x = np.hstack((x[:, d:], x[:, -d:]))
     else:
-        random_direction = random.uniform(0, 1) > 0.5
-        # A scratch drifts slowly along the gate; MambaOFR's 5-15 px per frame
-        # makes it jump, which the real footage does not show.
-        random_distance = random.randint(0, 3)
-        texture_np = last_texture.copy()
-
-        if random_direction:
-            final_texture = np.roll(texture_np, -random_distance, axis=1)
-        else:
-            final_texture = np.roll(texture_np, random_distance, axis=1)
-
-    return final_texture, final_texture
+        x = np.hstack((x[:, :d], x[:, : target_w - d]))
+    return Image.fromarray(np.uint8(x), "L")
 
 
 def generate_persistent_hole_mask(h, w):

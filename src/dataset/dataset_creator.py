@@ -23,11 +23,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 from tqdm import tqdm
 
 from .degradation.cache import build_texture_mmap, get_texture_cache
-from .degradation.pipeline import process_video_frames, sample_frame_ids
+from .degradation.pipeline import process_video_frames
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -109,7 +108,7 @@ class DatasetCreator:
         textures_dir=None,
         sr_scale=2,
         num_frame=7,
-        hole_prob=0.15,
+        hole_prob=0.0,
         gt_size=None,
         fps=24.0,
     ):
@@ -150,7 +149,6 @@ class DatasetCreator:
     def create_degraded(self, source, dest):
         """Every clip in ``source`` -> ``dest/gt/<name>.mp4`` + ``dest/degraded/<name>.mp4``."""
         textures = get_texture_cache(cache_dir=self.textures_dir)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         for clip, name in tqdm(self._clips(source), desc=f"degrade -> {dest}"):
             frames, fps = read_clip(clip, self.fps)
@@ -158,18 +156,14 @@ class DatasetCreator:
                 continue
 
             size = self.gt_size or self._round_size(frames[0].shape[:2])
-            # Repeated frames as in real transfers: GT and degraded repeat together.
-            ids = sample_frame_ids(len(frames))
-            gt = [to_gray(resize(frames[i], size)) for i in ids]
+            gt = [to_gray(resize(f, size)) for f in frames]
 
             degraded = process_video_frames(
                 gt,
                 textures,
-                device=device,
                 out_size=(size[0] // self.sr_scale, size[1] // self.sr_scale),
                 hole_prob=self.hole_prob,
                 hole_window=self.num_frame,
-                frame_ids=ids,
             )
 
             write_video(dest / "gt" / f"{name}.mp4", gt, fps)
