@@ -3,16 +3,21 @@
 Every folder in the models directory that contains ``inference.py`` is one
 self-contained model (code + weights). Its ``load_restorer(checkpoint, device,
 **options)`` must return an object with ``restore(frames) -> frames``
-(lists of BGR uint8 arrays).
+(lists of BGR uint8 arrays; the output may be larger than the input, e.g. x2 SR).
 
 Optional ``model.yaml`` (relative paths are resolved against the model folder)::
 
     checkpoint: weights/net_G_240000.pth
-    dataset: path/to/gt_set        # this model's GT set: degraded/ + gt/
     options:                       # passed to load_restorer
       temporal_length: 20
 
-Without ``checkpoint:`` the folder's ``inference.py`` uses its own default.
+or several checkpoints of the same model, each evaluated as ``<folder>_<key>``::
+
+    checkpoints:
+      best: ../../experiments/revivid/best.pth
+      latest: ../../experiments/revivid/latest.pth
+
+Without a checkpoint the folder's ``inference.py`` uses its own default.
 """
 
 from __future__ import annotations
@@ -38,7 +43,6 @@ class ModelSpec:
     checkpoint: Path | None
     type: str = "package"  # "package" or "input"
     options: dict = field(default_factory=dict)
-    dataset: Path | None = None
     package: Path | None = None
 
 
@@ -52,15 +56,14 @@ def discover_models(models_dir: Path) -> List[ModelSpec]:
             continue
         desc = entry / "model.yaml"
         cfg = (yaml.safe_load(desc.read_text(encoding="utf-8")) or {}) if desc.exists() else {}
-        specs.append(
-            ModelSpec(
-                name=entry.name,
-                checkpoint=(entry / cfg["checkpoint"]).resolve() if cfg.get("checkpoint") else None,
-                options=dict(cfg.get("options") or {}),
-                dataset=(entry / cfg["dataset"]).resolve() if cfg.get("dataset") else None,
-                package=entry.resolve(),
-            )
-        )
+        options = dict(cfg.get("options") or {})
+        if cfg.get("checkpoints"):
+            for key, path in cfg["checkpoints"].items():
+                specs.append(ModelSpec(f"{entry.name}_{key}", (entry / path).resolve(), options=options,
+                                       package=entry.resolve()))
+        else:
+            ckpt = (entry / cfg["checkpoint"]).resolve() if cfg.get("checkpoint") else None
+            specs.append(ModelSpec(entry.name, ckpt, options=options, package=entry.resolve()))
     return specs
 
 

@@ -107,7 +107,7 @@ class DatasetCreator:
         output_dir,
         textures_dir=None,
         sr_scale=2,
-        num_frame=7,
+        hole_window=None,
         hole_prob=0.0,
         gt_size=None,
         fps=24.0,
@@ -115,7 +115,7 @@ class DatasetCreator:
         self.output_dir = Path(output_dir)
         self.textures_dir = textures_dir
         self.sr_scale = sr_scale
-        self.num_frame = num_frame
+        self.hole_window = hole_window  # frames of a fragment with its own hole; None = the whole clip
         self.hole_prob = hole_prob
         self.gt_size = gt_size  # (height, width) or None = keep source size
         self.fps = fps
@@ -163,7 +163,7 @@ class DatasetCreator:
                 textures,
                 out_size=(size[0] // self.sr_scale, size[1] // self.sr_scale),
                 hole_prob=self.hole_prob,
-                hole_window=self.num_frame,
+                hole_window=self.hole_window,
             )
 
             write_video(dest / "gt" / f"{name}.mp4", gt, fps)

@@ -7,14 +7,16 @@
 
 Sources are video files, frame folders, or directories containing them.
 Evaluation reuses the texture cache built by the train mode.
-Defaults for scale, window, hole probability, textures and validation size
+Defaults for scale, hole window, hole probability, textures and validation size
 come from config/REVIVID.yaml (hole probability: 0 while training.stage is restore).
 
 A degraded clip is its GT degraded by MambaOFR's degradation at GT / --scale
-(--scale 1: no SR); --hole-prob is the share of --num-frame windows that get
-a burned hole, e.g.:
+(--scale 1: no SR). A clip is cut into fragments of --hole-window frames (by
+default validation.window, what the model sees at once); --hole-prob is the
+share of fragments that get a hole, burned through all their frames, a
+different one in each fragment, e.g.:
 
-    # without holes / a hole in every window / 4x SR
+    # without holes / a hole in every fragment / 4x SR
     PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x2_clean --hole-prob 0
     PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x2_holes --hole-prob 1
     PYTHONPATH=src python -m dataset.create_dataset eval --source DIR --name x4 --scale 4 --hole-prob 0
@@ -42,13 +44,13 @@ def parse_args(model_cfg, train_cfg, val_cfg):
     sub = parser.add_subparsers(dest="mode", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--num-frame", type=int, default=train_cfg.get("num_frame", 7),
-                        help="window length for holes")
+    common.add_argument("--hole-window", type=int, default=val_cfg.get("window"),
+                        help="frames of a fragment, each with its own hole (default: validation.window)")
     # The restore stage trains without holes, so its validation pairs have none either.
     restore = train_cfg.get("stage", "inpaint") == "restore"
     common.add_argument("--hole-prob", type=float,
                         default=0.0 if restore else model_cfg.get("hole_prob", 0.15),
-                        help="share of windows with a burned hole, 0 = none "
+                        help="share of fragments with a hole through all their frames, 0 = none "
                              "(default: 0 in the restore stage, else model.hole_prob)")
     common.add_argument("--fps", type=float, default=24.0, help="fps for frame folders")
 
@@ -94,7 +96,7 @@ def main():
     creator = DatasetCreator(
         output,
         sr_scale=args.scale,
-        num_frame=args.num_frame,
+        hole_window=args.hole_window,
         hole_prob=args.hole_prob,
         gt_size=gt_size,
         fps=args.fps,
