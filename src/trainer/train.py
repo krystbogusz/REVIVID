@@ -4,11 +4,13 @@ No arguments needed — run it from anywhere (or from an IDE):
 
     python src/trainer/train.py                       # phase of training.stage in config/REVIVID.yaml
     python src/trainer/train.py --resume path.pth     # continue from a given checkpoint
+    python src/trainer/train.py --init best.pth       # fine-tune: a new run starts from these weights
     python src/trainer/train.py --config my.yaml      # another config
 
 Training continues automatically from the phase's
 <logging.exp_dir>/p1|p2/checkpoints/latest.pth when it exists; a phase-2 run
-without one starts from <logging.exp_dir>/p1/checkpoints/best.pth.
+without one starts from <logging.exp_dir>/p1/checkpoints/best.pth. ``--init``
+only acts when there is no latest.pth yet, so the same command also resumes.
 """
 
 from __future__ import annotations
@@ -32,10 +34,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Train REVIVID.")
     p.add_argument("--config", default=None, help="YAML config (default: config/REVIVID.yaml)")
     p.add_argument("--resume", default=None, help="checkpoint (default: <exp_dir>/p1|p2/checkpoints/latest.pth)")
+    p.add_argument("--init", default=None,
+                   help="a new run (no latest.pth yet) starts from this checkpoint's EMA weights and "
+                        "discriminator, optimizer and schedule fresh - fine-tuning")
     args = p.parse_args()
 
     trainer = Trainer(args.config)
-    start_epoch = trainer.resume(args.resume)
+    start_epoch = trainer.resume(args.resume, init=args.init)
     trainer.save_config()
     train_loader, val_loader = trainer.build_loaders()
     trainer.fit(train_loader, val_loader, start_epoch)

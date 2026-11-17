@@ -11,7 +11,8 @@ Two phases (``training.stage`` in config/REVIVID.yaml), each its own run, both i
 one experiment folder: <logging.exp_dir>/p1 and <logging.exp_dir>/p2. A config
 value written as ``{restore: a, inpaint: b}`` takes the phase's one:
     restore  phase 1: removal of all degradations + SR; MambaOFR's network and
-             recipe, trained from scratch. No holes in the data, the phase-2
+             recipe, trained from scratch or fine-tuned from an own run
+             (``train.py --init``). No holes in the data, the phase-2
              modules are off (``model.use_holes``)
     inpaint  phase 2: fine-tuning of the whole phase-1 model (from phase 1's
              best.pth): holes burned in with ``model.hole_prob``;
@@ -516,13 +517,16 @@ class Trainer:
         print(f"[trainer] initialised from {path} ({len(weights)} tensors"
               + (f"; fresh: {missing}" if missing else "") + ")")
 
-    def resume(self, path: Optional[str] = None) -> int:
+    def resume(self, path: Optional[str] = None, init: Optional[str] = None) -> int:
         """Continue from ``path`` or this phase's <exp_dir>/pN/checkpoints/latest.pth
         (a checkpoint of this same model); returns the next epoch, 1 when
-        starting fresh - phase 2 then starts from <exp_dir>/p1/checkpoints/best.pth."""
+        starting fresh - from ``init`` when given (fine-tuning), else phase 1
+        from scratch and phase 2 from <exp_dir>/p1/checkpoints/best.pth."""
         path = Path(path) if path else self.exp_dir / "checkpoints" / "latest.pth"
         if not path.exists():
-            if self.inpaint:
+            if init:
+                self.init_from(init)
+            elif self.inpaint:
                 p1_best = self.exp_root / STAGE_DIRS["restore"] / "checkpoints" / "best.pth"
                 if not p1_best.exists():
                     raise FileNotFoundError(f"phase 2 starts from phase 1's best.pth, not found: {p1_best}")

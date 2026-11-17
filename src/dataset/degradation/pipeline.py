@@ -1,12 +1,17 @@
 """Degradation pipeline for REVIVID datasets: MambaOFR's training degradation
 (``degradation_video_list_4`` in VP_code/data/Data_Degradation/util.py) one to
-one, with REVIVID's SR downscale before it and burned holes after it.
+one, with burned holes after it.
+
+As MambaOFR, every step runs on the clean frame at its own (GT) resolution, so
+blur, resampling, noise and JPEG act on the scene as they do in MambaOFR. The
+only SR change is the size of MambaOFR's last resize: it goes back to the input
+size there, to the output size (GT / sr_scale) here - the SR downscale. With
+sr_scale 1 nothing changes. (Degrading after the SR downscale instead applies
+MambaOFR's pixel-sized blur to a frame of half the size: twice the blur per
+scene detail, a training input blurrier than real old films.)
 
 Per clip MambaOFR draws one set of parameters (``sample_clip_params``) and
 whether it gets moving lines; per frame, on one grey channel:
-    0. SR: the clean frame resized (bicubic) to the output size, GT / sr_scale.
-       MambaOFR's steps then run at that size, so the input is degraded as
-       MambaOFR's training crops are; with sr_scale 1 nothing changes.
     1. Texture, opacity 0.6-1, blended by addition / subtract / multiply:
        80 % of the clips a new texture on every frame, from any folder;
        20 % moving lines - one 001 template over the clip, shifted 5-15 px
@@ -15,7 +20,7 @@ whether it gets moving lines; per frame, on one grey channel:
     3. Resample  the clip's factor: down 0.125-1 (p 0.7), up 1-2 (p 0.2), else none
     4. Noise     Gaussian or speckle, std 5-10 / 255
     5. JPEG      the clip's quality 40-100, +-15 per frame
-    6. Resize back to the output size (random bicubic / bilinear / lanczos)
+    6. Resize to the output size (random bicubic / bilinear / lanczos)
     7. ColorJitter: brightness 0.8-1.2, contrast 0.9-1.0
 Per window of ``hole_window`` frames:
     8. Burned holes, with probability ``hole_prob`` (0 = a dataset without holes)
@@ -129,7 +134,8 @@ def process_video_frames(
     if not frames_bgr:
         return ([], []) if return_masks else []
 
-    h, w = out_size if out_size is not None else frames_bgr[0].shape[:2]
+    fh, fw = frames_bgr[0].shape[:2]  # steps 1-5 run at the frames' (GT) size
+    h, w = out_size if out_size is not None else (fh, fw)
     h, w = int(h), int(w)
 
     params = sample_clip_params()
@@ -144,23 +150,21 @@ def process_video_frames(
     frames = []
     for frame in frames_bgr:
         x = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        # 0. SR
-        if x.size != (w, h):
-            x = x.resize((w, h), Image.BICUBIC)
 
         # 1. texture
         if moving_line:
-            line = moving_line_texture_generator(line_template, line, h, w)
+            line = moving_line_texture_generator(line_template, line, fh, fw)
             x = _blend(x, line, line_mode, random.uniform(*OPACITY))
         else:
             template, folder = texture_cache.get_texture(random.choice(keys))
-            texture = texture_generator(Image.fromarray(template), folder, h, w)
+            texture = texture_generator(Image.fromarray(template), folder, fh, fw)
             mode = random.randint(0, 2)
             if folder == "011":
                 mode = 0
             x = _blend(x, texture, mode, random.uniform(*OPACITY))
 
-        # 2.-6. MambaOFR's degradation_v3, in its order
+        # 2.-6. MambaOFR's degradation_v3, in its order; its last resize goes
+        # to the output size (with SR: the SR downscale)
         x = apply_blur(x, params)
         x = apply_downsampling(x, params)
         x = apply_noise(x, params["noise_std"])

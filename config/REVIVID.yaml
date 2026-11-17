@@ -50,14 +50,23 @@ model:
   # = 10 inflates the probabilities: 0.9 ~ a true 50 %.
   hole_threshold: 0.9
   inpaint_dilate: 4       # the inpainter acts on the hole probability dilated by this (LR px)
-  hole_prob: 0.25         # prob. a window gets holes burned in (phase 2 training + its valid pairs)
+  # Phase 2: every fragment gets a hole through all its frames, a different one per
+  # fragment. Fragment = the num_frame window in training, validation.window in the
+  # valid pairs. (Phase 1 has no holes, whatever this says.)
+  hole_prob: 1.0
 
 training:
   stage: restore          # restore = phase 1 | inpaint = phase 2
-  # x 120 batches (240 clips / batch 2): 240k iterations as MambaOFR | 60k fine-tuning
-  epochs: {restore: 2000, inpaint: 500}
-  backbone_lr_mult: 0.1   # phase 2: lr of the phase-1 part; detector, flow completion, inpainter train at lr
-  batch_size: 2           # as your MambaOFR run (1 GPU x 2)
+  # x 120 optimizer steps (240 clips / effective batch 2): 48k fine-tuning (from scratch: 2000 = 240k iterations as MambaOFR) | 60k fine-tuning
+  epochs: {restore: 400, inpaint: 500}
+  # Phase 2: lr of the phase-1 part. It has to really learn, phase 2 also sharpens
+  # the whole image: x 0.5 = 5e-5, above the 4e-5 phase 1 ended at (x 0.1 = 1e-5
+  # would barely move it). Detector, flow completion, inpainter train at lr.
+  backbone_lr_mult: 0.5
+  # Effective batch 2 as your MambaOFR run (1 GPU x 2), as 1 clip x grad_accum 2:
+  # the same gradient (no batch norm in the model or D) at half the memory - at
+  # GT 512 one clip needs ~12 GB (model ~5.7, VGG loss at HR ~5.6, D ~1).
+  batch_size: 1
   num_frame: 7
   # Random GT crop [w, h]; the LQ crop is gt_size / sr_scale = what the backbone
   # sees: 256 x 256 as in MambaOFR (a 256 GT crop gave it only 128 x 128 - a
@@ -75,15 +84,15 @@ training:
   # first 60 % of the run, then 8 equal steps down, one per 12k iterations
   # (100 epochs here): 1.8e-4, 1.6e-4 ... the last 12k iterations at 4e-5 =
   # 0.2 * lr. The discriminator follows in proportion. Phase 2 fine-tunes at
-  # half of it, with the same shape.
-  lr: {restore: 0.0002, inpaint: 0.0001}
-  lr_min: {restore: 0.00004, inpaint: 0.00002}   # lr of the last step
+  # half of it, with the same shape; phase 1 now too (fine-tuning; from scratch: 2e-4 / 4e-5).
+  lr: {restore: 0.0001, inpaint: 0.0001}
+  lr_min: {restore: 0.00002, inpaint: 0.00002}   # lr of the last step
   lr_steady: 0.6          # fraction of the epochs at the full lr
   lr_steps: 8             # equal steps from lr down to lr_min
   beta1: 0.9
   beta2: 0.999
   # Optimizer steps every grad_accum batches (effective batch = batch_size * grad_accum).
-  grad_accum: 1
+  grad_accum: 2
   grad_clip: 0            # max gradient norm, 0 = off (MambaOFR); the log shows gnorm
   ema_decay: 0.999        # EMA weights are used for validation and inference
 
@@ -103,7 +112,7 @@ training:
 
   gan:
     start_iter: 0         # MambaOFR trains the GAN from the first iteration
-    d_lr: 0.0002          # decays together with lr
+    d_lr: 0.0001          # decays together with lr
     beta1: 0.9
     beta2: 0.999
 
@@ -131,6 +140,6 @@ logging:
   # checkpoints/, samples/, loss_history.csv, config.yaml). Phase 2 starts from
   # <exp_dir>/p1/checkpoints/best.pth (its EMA weights and discriminator).
   exp_dir: ./experiments/revivid
-  log_every: 120          # iterations
+  log_every: 120          # batches; the log's iter counts batches
   # Every this many epochs: epochNNNN.pth + latest.pth (what training resumes from).
   save_checkpoint_every: 10
